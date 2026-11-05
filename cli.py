@@ -35,12 +35,30 @@ else:
 
 MODEL = "gemini-3.5-flash-lite-withtools"
 
+console = Console()
+
+
+def ensure_api_key() -> str:
+    """Returns the API key, prompting once and saving it to ~/.eustace/.env if it is missing."""
+    key = os.environ.get("STARK_API_KEY")
+    if key:
+        return key
+    console.print("[bold yellow]No API key found.[/bold yellow] Paste your GenAI.mil key (input hidden):")
+    key = console.input("> ", password=True).strip()
+    if not key:
+        raise SystemExit("An API key is required.")
+    os.makedirs(os.path.dirname(global_env_path), exist_ok=True)
+    with open(global_env_path, "w", encoding="utf-8") as f:
+        f.write(f"STARK_API_KEY={key}\n")
+    os.environ["STARK_API_KEY"] = key
+    console.print(f"[dim]Saved to {global_env_path}[/dim]")
+    return key
+
+
 client = OpenAI(
     base_url="https://api.genai.mil/v1",
-    api_key=os.environ.get("STARK_API_KEY"),
+    api_key=ensure_api_key(),
 )
-
-console = Console()
 
 # =====================================================================
 # 1. LOCAL FILE SYSTEM TOOLS (Plaintext + Excel, PDF, Word, PowerPoint)
@@ -437,21 +455,51 @@ AVAILABLE_FUNCTIONS = {
 # 2. SYSTEM PROMPT & AGENT STREAMING LOOP
 # =====================================================================
 
-def build_system_prompt() -> str:
-    """Loads global system_prompt.md from ~/.eustace/ and optional local AGENT.md."""
-    cwd = os.getcwd()
-    
-    # Check global config directory first, fallback to script directory
-    global_prompt_file = os.path.join(os.path.expanduser("~"), ".eustace", "system_prompt.md")
-    local_prompt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.md")
-    
-    prompt_file = global_prompt_file if os.path.exists(global_prompt_file) else local_prompt_file
+DEFAULT_SYSTEM_PROMPT = """# Identity & Role
+Your name is **Eustace** (**E**lectronic **U**tility for **S**cripting, **T**asking, and **A**utomated **C**ommand **E**xecution). You are a sharp, personable, and collaborative CLI coding and operational sidekick running locally on the user's Windows workstation.
 
-    if os.path.exists(prompt_file):
-        with open(prompt_file, "r", encoding="utf-8") as f:
+# Personality & Tone
+- **Warm & Approachable:** Be conversational, natural, and friendly, like a trusted teammate at the next desk. A little dry wit is welcome.
+- **Action-Oriented on Tasks:** When writing code, debugging, or answering technical questions, be clear, structured, and get straight to the solution (BLUF).
+
+# Core Directives
+1. **Use Local Tools Proactively:** You have direct access to the user's PC via `list_directory` and `read_file`. Inspect files yourself rather than asking the user to paste them.
+2. **Environment Awareness:** The user is on Windows with PowerShell. Tailor shell commands for PowerShell.
+3. **Write and Edit Files Safely:** You have `write_file` and `edit_file`. Explain what you are about to change before calling them. The user must manually approve every write/edit, so keep changes precise.
+4. **Run Commands Deliberately:** You can execute PowerShell via `run_powershell`. The user must approve every command, so prefer single, purposeful commands and state your intent first. Secrets files (`.env`, keys, certificates) are blocked from `read_file`; do not try to work around that.
+"""
+
+GLOBAL_PROMPT_PATH = os.path.join(EUSTACE_HOME, "system_prompt.md")
+
+
+def _ensure_global_prompt() -> str:
+    """Makes sure ~/.eustace/system_prompt.md exists.
+
+    Seeds it from the repo's system_prompt.md when running from source, or from the
+    built-in default when installed via pip/pipx (where only cli.py ships).
+    """
+    if not os.path.exists(GLOBAL_PROMPT_PATH):
+        os.makedirs(EUSTACE_HOME, exist_ok=True)
+        local_prompt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.md")
+        if os.path.exists(local_prompt_file):
+            shutil.copyfile(local_prompt_file, GLOBAL_PROMPT_PATH)
+        else:
+            with open(GLOBAL_PROMPT_PATH, "w", encoding="utf-8") as f:
+                f.write(DEFAULT_SYSTEM_PROMPT)
+        console.print(f"[dim]Created persona file at {escape(GLOBAL_PROMPT_PATH)} (edit it to customize Eustace)[/dim]")
+    return GLOBAL_PROMPT_PATH
+
+
+def build_system_prompt() -> str:
+    """Loads global system_prompt.md from ~/.eustace/ (creating it if needed) and optional local AGENT.md."""
+    cwd = os.getcwd()
+
+    try:
+        with open(_ensure_global_prompt(), "r", encoding="utf-8") as f:
             base_prompt = f.read().strip()
-    else:
-        base_prompt = "You are a local CLI coding and operational assistant running on Windows."
+    except OSError as e:
+        console.print(f"[dim yellow]Could not load persona file ({escape(str(e))}); using built-in default.[/dim yellow]")
+        base_prompt = DEFAULT_SYSTEM_PROMPT.strip()
 
     env_context = (
         f"\n\n# Runtime Environment\n"

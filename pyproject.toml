@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+
+[project]
+name = "genai-cli"
+version = "0.1.0"
+description = "CLI agent for GenAI.mil models with local file and shell tools"
+requires-python = ">=3.11"
+dependencies = [
+    "openai",
+    "python-dotenv",
+    "truststore",
+    "rich",
+    "openpyxl",
+    "pypdf",
+    "python-docx",
+    "python-pptx"
+]
+
+[project.scripts]
+eustace = "cli:main"
+
+[tools.setuptools]
+py-models = ["cli"]
