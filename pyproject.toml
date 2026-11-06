@@ -1,10 +1,11 @@
 [build-system]
 requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "genai-cli"
-version = "0.1.0"
-description = "CLI agent for GenAI.mil models with local file and shell tools"
+version = "1.0.0"
+description = "CLI agent for GenAI.mil models with local file, Office, and Outlook tools"
 requires-python = ">=3.11"
 dependencies = [
     "openai",
@@ -14,11 +15,12 @@ dependencies = [
     "openpyxl",
     "pypdf",
     "python-docx",
-    "python-pptx"
+    "python-pptx",
+    "pywin32"
 ]
 
 [project.scripts]
 eustace = "cli:main"
 
-[tools.setuptools]
-py-models = ["cli"]
+[tool.setuptools]
+py-modules = ["cli"]
