@@ -25,7 +25,7 @@ cd genai-cli
    cd "$HOME\Documents\genai-cli"
    ```
 
-**Option C - Manual Copy & Paste (if Git and ZIP downloads are blocked)
+**Option C - Manual Copy & Paste (if Git and ZIP downloads are blocked)**
 Open PowerShell and run this command to create the folder and empty files:
 ```powershell
 mkdir "$HOME\Documents\genai-cli" -Force; cd "$HOME\Documents\genai-cli"
