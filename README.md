@@ -10,14 +10,14 @@ A local CLI agent powered by **GenAI.mil** models with built-in tools for local 
 ## Installation
 
 ### 1. Download Eustace
-**Option A — Using Git:**
+**Option A - Using Git:**
 Open PowerShell and run:
 ```powershell
 git clone <YOUR_GITHUB_REPO_URL>
 cd genai-cli
 ```
 
-**Option B — Without Git (ZIP Download):**
+**Option B - Without Git (ZIP Download):**
 1. Click the green **Code** button on GitHub and select **Download ZIP**.
 2. Extract the ZIP folder to your computer (e.g., `Documents\genai-cli`).
 3. Open **PowerShell** and navigate into that folder:
@@ -25,6 +25,14 @@ cd genai-cli
    cd "$HOME\Documents\genai-cli"
    ```
 
+**Option C - Manual Copy & Paste (if Git and ZIP downloads are blocked)
+Open PowerShell and run this command to create the folder and empty files:
+```powershell
+mkdir "$HOME\Documents\genai-cli" -Force; cd "$HOME\Documents\genai-cli"
+"cli.py","pyproject.toml","setup.ps1","system_prompt.md" | ForEach-Object { New-Item $_ -ItemType File -Force }
+```
+
+On GitHub, click into each of those four files, clikc the "Copy Raw File" button (top-right, next to "Raw"), paste the contents into the matching local file you created, and save. 
 ---
 
 ### 2. Run the Installer Script
@@ -36,6 +44,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 * Checks for **Python 3.11+** (and installs Python via `winget` in user-scope if missing).
 * Installs `pipx` and registers the `eustace` command globally for your user account.
 * Creates your user config folder at `C:\Users\<YourUsername>\.eustace\`.
+
 
 ---
 
