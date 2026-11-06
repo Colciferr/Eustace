@@ -3,7 +3,7 @@ A local CLI agent powered by **GenAI.mil** models with built-in tools for local 
 
 ## Prerequisites
 * **Windows Workstation** (No administrator rights required)
-* **GenAI.mil API Key** (Wait until first launch—Eustace will prompt you for it)
+* **GenAI.mil API Key** (Wait until first launch; Eustace will prompt you for it)
 
 ---
 
