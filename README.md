@@ -32,7 +32,8 @@ mkdir "$HOME\Documents\genai-cli" -Force; cd "$HOME\Documents\genai-cli"
 "cli.py","pyproject.toml","setup.ps1","system_prompt.md" | ForEach-Object { New-Item $_ -ItemType File -Force }
 ```
 
-On GitHub, click into each of those four files, click the "Copy Raw File" button (top-right, next to "Raw"), paste the contents into the matching local file you created, and save. 
+On GitHub, click into each of those four files, click the "Copy Raw File" button (top-right, next to "Raw"), paste the contents into the matching local file you created, and save.
+
 ---
 
 ### 2. Run the Installer Script
