@@ -13,7 +13,7 @@ A local CLI agent powered by **GenAI.mil** models with built-in tools for local 
 **Option A - Using Git:**
 Open PowerShell and run:
 ```powershell
-git clone github.com/Colciferr/genai-cli
+git clone github.com/Colciferr/eustace
 cd genai-cli
 ```
 
