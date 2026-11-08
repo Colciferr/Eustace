@@ -340,5 +340,31 @@ class ToolCallExtraTests(unittest.TestCase):
         self.assertIsNone(cli._tool_call_extra(SimpleNamespace(extra_content="not-a-dict")))
 
 
+class ApiErrorFormattingTests(unittest.TestCase):
+    def test_gemini_quota_error_is_summarized(self):
+        class FakeErr(Exception):
+            status_code = 429
+            body = [{"error": {
+                "code": 429,
+                "message": "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://example",
+                "details": [
+                    {"violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier", "quotaValue": "20"}]},
+                    {"retryDelay": "1592s"},
+                ],
+            }}]
+        line = cli._format_api_error(FakeErr("Error code: 429 - [huge json]"))
+        self.assertIn("API error 429", line)
+        self.assertIn("You exceeded your current quota", line)
+        self.assertNotIn("For more information", line)
+        self.assertIn("GenerateRequestsPerDayPerProjectPerModel-FreeTier = 20", line)
+        self.assertIn("retry after 1592s", line)
+        self.assertIn("/model", line)
+
+    def test_plain_exception_falls_back_to_its_text(self):
+        line = cli._format_api_error(RuntimeError("socket closed"))
+        self.assertIn("RuntimeError", line)
+        self.assertIn("socket closed", line)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -69,7 +69,7 @@ if DEV_MODE:
     BACKEND_NAME = "Gemini API (DEV)"
     BACKEND_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
     API_KEY_ENV = "GEMINI_API_KEY"
-    DEFAULT_MODEL = os.environ.get("EUSTACE_DEV_MODEL", "").strip() or "gemini-3-flash-preview"
+    DEFAULT_MODEL = os.environ.get("EUSTACE_DEV_MODEL", "").strip() or "gemini-3.1-flash-lite"
     AVAILABLE_MODELS = [
         (DEFAULT_MODEL, "Dev-mode default (override with EUSTACE_DEV_MODEL); /model lists live IDs"),
     ]
@@ -239,6 +239,39 @@ def _tool_call_extra(tc) -> dict | None:
     if extra is None:
         extra = (getattr(tc, "model_extra", None) or {}).get("extra_content")
     return extra if isinstance(extra, dict) and extra else None
+
+
+def _format_api_error(e: Exception) -> str:
+    """One readable line for an API failure: HTTP status, the provider's message, and (for quota errors)
+    the quota id and retry delay, instead of the raw JSON blob the SDK puts in str(e)."""
+    status = getattr(e, "status_code", None)
+    body = getattr(e, "body", None)
+    err = {}
+    if isinstance(body, list) and body and isinstance(body[0], dict):   # Gemini: [{"error": {...}}]
+        err = body[0].get("error") or {}
+    elif isinstance(body, dict):                                         # OpenAI-style: {"error": {...}} or {...}
+        err = body.get("error") or body
+    if not isinstance(err, dict):
+        err = {}
+    msg = str(err.get("message") or "").strip()
+    for cut in (" For more information", " * Quota exceeded", " Please refer to"):
+        msg = msg.split(cut)[0].strip()
+    parts = [f"API error {status}" if status else f"API error ({type(e).__name__})"]
+    if msg:
+        parts.append(msg[:300])
+    for d in err.get("details") or []:
+        if not isinstance(d, dict):
+            continue
+        for v in d.get("violations") or []:
+            if isinstance(v, dict) and v.get("quotaId"):
+                parts.append(f"quota {v['quotaId']} = {v.get('quotaValue', '?')}")
+        if d.get("retryDelay"):
+            parts.append(f"retry after {d['retryDelay']}")
+    if status == 429:
+        parts.append("Switch models with /model" + (" or set EUSTACE_DEV_MODEL." if DEV_MODE else ", or wait and retry."))
+    if len(parts) == 1:
+        parts.append(str(e)[:300])
+    return " | ".join(parts)
 
 
 def _live_models() -> list[tuple[str, str]]:
@@ -2518,7 +2551,7 @@ def run_agent_turn(messages: list[dict]):
         del messages[turn_start_len:]
         messages.append({"role": "assistant", "content": "(Response interrupted by the user before completion.)"})
     except Exception as e:
-        console.print(f"\n[bold red]System Loop Error:[/bold red] {escape(str(e))}")
+        console.print(f"\n[bold red]System Loop Error:[/bold red] {escape(_format_api_error(e))}")
         if partial_reply:
             console.print(Markdown(_sanitize_for_display(partial_reply)))
             console.print("[dim](partial reply)[/dim]")

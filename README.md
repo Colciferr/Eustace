@@ -77,8 +77,8 @@ eustace --devmode
 ```
 * Uses the OpenAI-compatible Gemini endpoint with a **`GEMINI_API_KEY`** (prompted on first run and saved to `~/.eustace-dev/.env`).
 * Keeps **everything separate** in `~/.eustace-dev\` (config, sessions, audit log, persona), so your GenAI.mil key, model choice and sessions are never touched. Both `~/.eustace` and `~/.eustace-dev` are unreadable by the model in either mode.
-* Default model is `gemini-3-flash-preview`; override with the `EUSTACE_DEV_MODEL` environment variable or pick from the live list with `/model`. Avoid `gemini-flash-latest` (Gemini 2.5 Flash) for tool use: as of Nov 2026 the OpenAI-compatible endpoint intermittently returns 503 or stalls on its tool calls.
-* Gemini 3 models attach a `thought_signature` to each tool call and reject the follow-up request with a 400 if it is missing; Eustace echoes it back automatically. On a free-tier key the preview models rate-limit quickly (429); `EUSTACE_DEV_MODEL=gemini-3.1-flash-lite-preview` is a lighter alternative.
+* Default model is `gemini-3.1-flash-lite`; override with the `EUSTACE_DEV_MODEL` environment variable or pick from the live list with `/model`. On a free-tier key, preview models such as `gemini-3-flash-preview` allow only 20 requests per day, and `gemini-flash-latest` (2.5 Flash) intermittently 503s or stalls on tool calls.
+* Gemini 3 models attach a `thought_signature` to each tool call and reject the follow-up request with a 400 if it is missing; Eustace echoes it back automatically.
 * The banner turns yellow and the system prompt tells the model it is in dev mode. **Use synthetic test data only. Never process CUI, PII or PHI through the public API.**
 * `eustace --help` and `eustace --version` are also available.
 
