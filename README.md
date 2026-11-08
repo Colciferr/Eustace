@@ -63,29 +63,5 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 * **Custom Persona:** You can edit `~/.eustace/system_prompt.md` at any time to customize Eustace's instructions or tone.
 * **Updating:** Pull or download the latest files from GitHub and re-run `powershell -ExecutionPolicy Bypass -File .\setup.ps1`.
 
-## Security Behaviour Worth Knowing
-* **Reads outside your working directory prompt for approval.** `read_file` and `search_files` stay approval-free inside the folder you launched `eustace` from; anywhere else shows the same approval panel as a write. Press `A` to approve all for the turn.
-* **Project `AGENT.md` files are trusted explicitly.** Only `~/.eustace/AGENT.md` loads silently. An `AGENT.md` in your project (or any parent folder up to the git root) is shown once with its size and hash, and loads only after you answer `y`. The decision is remembered in `~/.eustace/config.json` until the file changes.
-* **Paths are canonicalized.** UNC paths (`\\server\share`), device paths (`\\?\`, `\\.\pipe\`), alternate data streams (`file.txt:stream`), 8.3 short names and junctions are resolved or rejected before any guard runs, and re-checked after you approve a write.
-* **PowerShell runs from a fixed host path** (`pwsh.exe` under Program Files, else `powershell.exe` under System32), shown in the approval panel, with the API key removed from the child environment. Commands containing hidden control characters are refused.
-* **`open_file` launches only known document types** (txt, md, csv, log, json, xml, pdf, docx, xlsx, pptx, common images) and folders. Word and Excel files Eustace creates carry the Mark-of-the-Web so Office opens them in Protected View.
-
-## Testing at Home: `--devmode`
-GenAI.mil is reachable only from DODIN/AFNET domain-joined machines. To exercise Eustace's tools elsewhere, run it against Google's public Gemini API:
-```powershell
-eustace --devmode
-```
-* Uses the OpenAI-compatible Gemini endpoint with a **`GEMINI_API_KEY`** (prompted on first run and saved to `~/.eustace-dev/.env`).
-* Keeps **everything separate** in `~/.eustace-dev\` (config, sessions, audit log, persona), so your GenAI.mil key, model choice and sessions are never touched. Both `~/.eustace` and `~/.eustace-dev` are unreadable by the model in either mode.
-* Default model is `gemini-3.1-flash-lite`; override with the `EUSTACE_DEV_MODEL` environment variable or pick from the live list with `/model`. On a free-tier key, preview models such as `gemini-3-flash-preview` allow only 20 requests per day, and `gemini-flash-latest` (2.5 Flash) intermittently 503s or stalls on tool calls.
-* Gemini 3 models attach a `thought_signature` to each tool call and reject the follow-up request with a 400 if it is missing; Eustace echoes it back automatically.
-* The banner turns yellow and the system prompt tells the model it is in dev mode. **Use synthetic test data only. Never process CUI, PII or PHI through the public API.**
-* `eustace --help` and `eustace --version` are also available.
-
-### Running the unit tests
-```powershell
-& "$env:LOCALAPPDATA\pipx\pipx\venvs\genai-cli\Scripts\python.exe" -I tests\test_guards.py -v
-```
-
 ## AI Disclaimer
 Codebase built with Gemini 4 Argon, with some reviews and edits by Claude Fable 5.1.
