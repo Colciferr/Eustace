@@ -14,21 +14,21 @@ A local CLI agent powered by **GenAI.mil** models with built-in tools for local 
 Open PowerShell and run:
 ```powershell
 git clone github.com/Colciferr/eustace
-cd genai-cli
+cd eustace
 ```
 
 **Option B - Without Git (ZIP Download):**
 1. Click the green **Code** button on GitHub and select **Download ZIP**.
-2. Extract the ZIP folder to your computer (e.g., `Documents\genai-cli`).
+2. Extract the ZIP folder to your computer (e.g., `Documents\eustace`).
 3. Open **PowerShell** and navigate into that folder:
    ```powershell
-   cd "$HOME\Documents\genai-cli"
+   cd "$HOME\Documents\eustace"
    ```
 
 **Option C - Manual Copy & Paste (if Git and ZIP downloads are blocked)**
 Open PowerShell and run this command to create the folder and empty files:
 ```powershell
-mkdir "$HOME\Documents\genai-cli" -Force; cd "$HOME\Documents\genai-cli"
+mkdir "$HOME\Documents\eustace" -Force; cd "$HOME\Documents\eustace"
 "cli.py","pyproject.toml","setup.ps1","system_prompt.md" | ForEach-Object { New-Item $_ -ItemType File -Force }
 ```
 
