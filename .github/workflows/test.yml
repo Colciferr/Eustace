@@ -32,6 +32,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Remove pipx so the installer's bootstrap path is the one tested
+        shell: pwsh
+        run: |
+          python -m pip uninstall -y pipx
+          python -c "import importlib.util, sys; sys.exit(importlib.util.find_spec('pipx') is not None)"
       - name: Run setup.ps1
         shell: powershell
         run: powershell -ExecutionPolicy Bypass -File .\setup.ps1

@@ -84,7 +84,7 @@ class CanonicalPathTests(unittest.TestCase):
 
 class JunctionTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="eustace-test-")
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="eustace-test-"))
         self.plain = os.path.join(self.tmp, "plain")
         os.mkdir(self.plain)
         # Point the junction AT an existing protected home; nothing is ever written through it.
@@ -184,7 +184,7 @@ class OpenFileTests(unittest.TestCase):
     def test_non_document_extension_blocked_before_approval(self):
         saved = cli.APPROVAL_HANDLER
         cli.APPROVAL_HANDLER = cap = _CaptureApproval()
-        tmp = tempfile.mkdtemp(prefix="eustace-test-")
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="eustace-test-"))
         try:
             for name in ("evil.hta", "evil.pif", "evil.msc", "evil.reg", "evil.url", "app.application", "addin.xll", "noext", "evil.hta. "):
                 p = os.path.join(tmp, name.rstrip(" ."))
@@ -207,7 +207,7 @@ class OpenFileTests(unittest.TestCase):
 
 class AgentMdDiscoveryTests(unittest.TestCase):
     def test_stops_at_git_root(self):
-        tmp = tempfile.mkdtemp(prefix="eustace-test-")
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="eustace-test-"))
         try:
             root = os.path.join(tmp, "repo")
             sub = os.path.join(root, "pkg", "sub")
@@ -233,7 +233,7 @@ class PreviewFaithfulnessTests(unittest.TestCase):
     def setUp(self):
         self.saved = cli.APPROVAL_HANDLER
         cli.APPROVAL_HANDLER = self.cap = _CaptureApproval()
-        self.tmp = tempfile.mkdtemp(prefix="eustace-test-")
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="eustace-test-"))
 
     def tearDown(self):
         cli.APPROVAL_HANDLER = self.saved
