@@ -4,6 +4,7 @@ Not a test module itself (unittest discovery only picks up test*.py).
 """
 import contextlib
 import copy
+import io
 import os
 import shutil
 import sys
@@ -73,15 +74,16 @@ class RecordingApproval:
 @contextlib.contextmanager
 def sandbox(client=None, approval=None):
     """Points every Eustace-home path at a temp dir, chdirs into a temp workspace, and swaps in fakes.
-    Yields (workspace_dir, home_dir)."""
+    Console output is captured rather than printed. Yields (workspace_dir, home_dir)."""
     tmp = os.path.realpath(tempfile.mkdtemp(prefix="eustace-test-"))
     home, ws = os.path.join(tmp, "home"), os.path.join(tmp, "ws")
     os.makedirs(home)
     os.makedirs(ws)
-    names = ("EUSTACE_HOME", "CONFIG_PATH", "AUDIT_LOG_PATH", "DENY_LIST_PATH", "SESSIONS_DIR",
+    names = ("console", "EUSTACE_HOME", "CONFIG_PATH", "AUDIT_LOG_PATH", "DENY_LIST_PATH", "SESSIONS_DIR",
              "GLOBAL_PROMPT_PATH", "client", "APPROVAL_HANDLER", "check_user_abort")
     saved = {n: getattr(cli, n) for n in names if hasattr(cli, n)}
     cwd = os.getcwd()
+    cli.console = cli.Console(file=io.StringIO(), width=120)  # keep test logs readable; inspect via cli.console.file
     cli.EUSTACE_HOME = home
     cli.CONFIG_PATH = os.path.join(home, "config.json")
     cli.AUDIT_LOG_PATH = os.path.join(home, "audit.jsonl")

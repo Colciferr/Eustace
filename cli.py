@@ -839,7 +839,7 @@ def read_file(path: str, max_chars: int = 30000) -> str:
         elif ext == ".pptx":
             content = _read_pptx(target)
         else:
-            with open(target, "r", encoding="utf-8", errors="replace") as f:
+            with _open_text_lenient(target) as f:
                 content = f.read(max_chars + 1)
 
         phi_err = _check_phi_guardrail(target, content)
@@ -853,6 +853,55 @@ def read_file(path: str, max_chars: int = 30000) -> str:
         return f"Error reading file '{path}': {e}"
 
 
+# ---------------------------------------------------------------------
+# Exact text I/O: an edit must change only the bytes shown in the approved diff.
+# Text-mode open() would rewrite every line ending and turn undecodable bytes into U+FFFD.
+# ---------------------------------------------------------------------
+
+def _decode_exact(raw: bytes) -> tuple[str, str] | None:
+    """(text, encoding) such that text.encode(encoding) == raw, or None when the bytes are not UTF-8 or
+    BOM-marked UTF-16. A BOM stays in the text as U+FEFF so it survives the round trip."""
+    enc = "utf-16-le" if raw.startswith(b"\xff\xfe") else "utf-16-be" if raw.startswith(b"\xfe\xff") else "utf-8"
+    try:
+        return raw.decode(enc), enc
+    except UnicodeDecodeError:
+        return None
+
+
+def _dominant_newline(text: str) -> str:
+    """The line ending a file mostly uses; the platform default when it has none."""
+    crlf = text.count("\r\n")
+    lf = text.count("\n") - crlf
+    if not crlf and not lf:
+        return os.linesep
+    return "\r\n" if crlf > lf else "\n"
+
+
+def _raw_index(text: str, norm_index: int) -> int:
+    """Index in text that corresponds to norm_index in text.replace('\r\n', '\n')."""
+    i = n = 0
+    while n < norm_index:
+        i += 2 if text.startswith("\r\n", i) else 1
+        n += 1
+    return i
+
+
+def _read_bytes_or_none(path: str) -> bytes | None:
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _open_text_lenient(path: str):
+    """Text stream for reading only: UTF-16 when BOM-marked, otherwise UTF-8 (BOM dropped), bad bytes replaced."""
+    with open(path, "rb") as f:
+        head = f.read(2)
+    enc = "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+    return open(path, "r", encoding=enc, errors="replace")
+
+
 def write_file(path: str, content: str) -> str:
     """Creates a new file or overwrites an existing file with unified diff preview & confirmation."""
     try:
@@ -863,19 +912,23 @@ def write_file(path: str, content: str) -> str:
             return "Security Error: Writing to system folders is strictly prohibited."
         if _is_sensitive_canon(target):
             return f"Security Error: Writing to protected path '{path}' is prohibited."
+        if os.path.isdir(target):
+            return f"Error: '{path}' is a directory."
 
-        old_content = ""
-        is_overwrite = os.path.exists(target)
-        if is_overwrite and os.path.isfile(target):
-            try:
-                with open(target, "r", encoding="utf-8", errors="replace") as f:
-                    old_content = f.read()
-            except OSError:
-                old_content = ""
+        # An existing text file keeps its own encoding, BOM and line endings; a new one gets the platform default.
+        before = _read_bytes_or_none(target) if os.path.isfile(target) else None
+        decoded = _decode_exact(before) if before is not None else None
+        old_text, enc = decoded if decoded else ("", "utf-8")
+        body = content.replace("\r\n", "\n")
+        if old_text.startswith("﻿") and not body.startswith("﻿"):
+            body = "﻿" + body
+        out = body.replace("\n", _dominant_newline(old_text)).encode(enc)
 
-        diff_str = build_unified_diff(old_content, content, target)
-        action = f"Overwrite file: {target}" if is_overwrite else f"Create new file: {target}"
+        action = f"Overwrite file: {target}" if before is not None else f"Create new file: {target}"
         detail = f"[dim]Size: {len(content)} chars ({len(content.splitlines())} lines)[/dim]"
+        if before is not None and decoded is None:
+            detail += "\n  [bold yellow]The existing file is not UTF-8 text; all of it will be replaced.[/bold yellow]"
+        diff_str = build_unified_diff(old_text.replace("\r\n", "\n"), body, target)
 
         if not APPROVAL_HANDLER.request_approval(action, detail_text=detail, diff_text=diff_str):
             return "Operation aborted: User did NOT approve the file write."
@@ -883,9 +936,11 @@ def write_file(path: str, content: str) -> str:
         err = _recheck_after_approval(target)
         if err:
             return err
+        if (_read_bytes_or_none(target) if os.path.isfile(target) else None) != before:
+            return "Security Error: file changed between preview and write; write aborted. Re-run to see the new diff."
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(content)
+        with open(target, "wb") as f:
+            f.write(out)
 
         console.print(f"[bold green]✓ File written: {escape(target)}[/bold green]\n")
         return f"Success: File written successfully to {target}"
@@ -899,19 +954,42 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
         target, err = _resolve_model_path(path)
         if err:
             return err
-        if not os.path.exists(target):
+        if not os.path.isfile(target):
             return f"Error: File not found: {path}"
         if _is_protected_path(target) or _is_sensitive_canon(target):
             return "Security Error: Editing protected or system files is strictly prohibited."
 
-        with open(target, "r", encoding="utf-8", errors="replace") as f:
-            file_content = f.read()
+        before = _read_bytes_or_none(target)
+        decoded = _decode_exact(before) if before is not None else None
+        if decoded is None:
+            return (
+                f"Error: '{path}' is not valid UTF-8 (or BOM-marked UTF-16) text, so it cannot be edited "
+                "without corrupting it. No changes made."
+            )
+        text, enc = decoded
 
-        if old_text not in file_content:
+        # Match with line endings normalized (the model writes \n), then splice into the original text so every
+        # byte outside the replaced span, including each untouched line ending, is preserved.
+        norm = text.replace("\r\n", "\n")
+        old_n = old_text.replace("\r\n", "\n")
+        new_n = new_text.replace("\r\n", "\n")
+        if not old_n:
+            return "Error: 'old_text' is empty. No changes made."
+        if old_n == new_n:
+            return "Error: 'old_text' and 'new_text' are identical. No changes made."
+        hits = norm.count(old_n)
+        if hits == 0:
             return "Error: Target text block ('old_text') was not found in the file. No changes made."
+        if hits > 1:
+            return (
+                f"Error: 'old_text' matches {hits} places in the file. Include more surrounding lines so it "
+                "identifies exactly one. No changes made."
+            )
 
-        updated_content = file_content.replace(old_text, new_text, 1)
-        diff_str = build_unified_diff(file_content, updated_content, target)
+        at = norm.index(old_n)
+        start, end = _raw_index(text, at), _raw_index(text, at + len(old_n))
+        updated = text[:start] + new_n.replace("\n", _dominant_newline(text)) + text[end:]
+        diff_str = build_unified_diff(norm, norm[:at] + new_n + norm[at + len(old_n):], target)
 
         if not APPROVAL_HANDLER.request_approval(f"Edit file: {target}", diff_text=diff_str):
             return "Operation aborted: User did NOT approve the file edit."
@@ -920,12 +998,11 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
         if err:
             return err
         # The approved diff must describe the bytes actually on disk; re-read and compare before writing.
-        with open(target, "r", encoding="utf-8", errors="replace") as f:
-            if f.read() != file_content:
-                return "Security Error: file changed between preview and write; edit aborted. Re-run to see the new diff."
+        if _read_bytes_or_none(target) != before:
+            return "Security Error: file changed between preview and write; edit aborted. Re-run to see the new diff."
 
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(updated_content)
+        with open(target, "wb") as f:
+            f.write(updated.encode(enc))
 
         console.print(f"[bold green]✓ File edited: {escape(target)}[/bold green]\n")
         return f"Success: File edited successfully at {target}"
@@ -1471,7 +1548,7 @@ def search_files(
                 if ext in SEARCHABLE_TEXT_EXTS:
                     files_scanned += 1
                     try:
-                        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                        with _open_text_lenient(full_path) as f:
                             text_to_scan = f.read(200_000)
                     except OSError:
                         pass
