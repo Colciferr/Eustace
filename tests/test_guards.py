@@ -360,6 +360,25 @@ class ApiErrorFormattingTests(unittest.TestCase):
         self.assertIn("retry after 1592s", line)
         self.assertIn("/model", line)
 
+    def test_unparseable_error_shows_start_of_raw_body_not_headers(self):
+        from types import SimpleNamespace
+        class FakeErr(Exception):
+            status_code = 400
+            body = None
+            response = SimpleNamespace(text="<html>Bad Request from proxy</html>", url="https://x/v1", headers={"set-cookie": "s=1"})
+        saved = os.environ.pop("EUSTACE_DEBUG", None)
+        try:
+            line = cli._format_api_error(FakeErr("Error code: 400"))
+            self.assertIn("API error 400", line)
+            self.assertIn("Bad Request from proxy", line)
+            self.assertNotIn("set-cookie", line)
+            os.environ["EUSTACE_DEBUG"] = "1"
+            self.assertIn("set-cookie", cli._format_api_error(FakeErr("Error code: 400")))
+        finally:
+            os.environ.pop("EUSTACE_DEBUG", None)
+            if saved is not None:
+                os.environ["EUSTACE_DEBUG"] = saved
+
     def test_plain_exception_falls_back_to_its_text(self):
         line = cli._format_api_error(RuntimeError("socket closed"))
         self.assertIn("RuntimeError", line)

@@ -246,11 +246,48 @@ def _tool_call_extra(tc) -> dict | None:
 
 
 def _format_api_error(e: Exception) -> str:
+    """One readable line for an API failure: HTTP status, the provider's message, and (for quota errors)
+    the quota id and retry delay. Set EUSTACE_DEBUG=1 to append the full response (URL, headers, body)."""
+    status = getattr(e, "status_code", None)
+    body = getattr(e, "body", None)
+    err = {}
+    if isinstance(body, list) and body and isinstance(body[0], dict):   # Gemini: [{"error": {...}}]
+        err = body[0].get("error") or {}
+    elif isinstance(body, dict):                                         # OpenAI-style: {"error": {...}} or {...}
+        err = body.get("error") or body
+    if not isinstance(err, dict):
+        err = {}
+    msg = str(err.get("message") or "").strip()
+    for cut in (" For more information", " * Quota exceeded", " Please refer to"):
+        msg = msg.split(cut)[0].strip()
+    parts = [f"API error {status}" if status else f"API error ({type(e).__name__})"]
+    if msg:
+        parts.append(msg[:300])
+    for d in err.get("details") or []:
+        if not isinstance(d, dict):
+            continue
+        for v in d.get("violations") or []:
+            if isinstance(v, dict) and v.get("quotaId"):
+                parts.append(f"quota {v['quotaId']} = {v.get('quotaValue', '?')}")
+        if d.get("retryDelay"):
+            parts.append(f"retry after {d['retryDelay']}")
+    if status == 429:
+        parts.append("Switch models with /model" + (" or set EUSTACE_DEV_MODEL." if DEV_MODE else ", or wait and retry."))
     resp = getattr(e, "response", None)
-    if resp is not None:
-        return f"HTTP {resp.status_code} | URL: {resp.url} | Headers: {dict(resp.headers)} | Raw Text: {resp.text!r}"
-    return f"{type(e).__name__}: {e}"
-
+    if not msg:
+        # Nothing parseable: show the start of whatever the server actually sent (HTML error page, proxy text...)
+        raw = ""
+        try:
+            raw = (resp.text if resp is not None else "") or ""
+        except Exception:
+            pass
+        parts.append((raw.strip() or str(e))[:300])
+    if resp is not None and os.environ.get("EUSTACE_DEBUG", "").strip() not in ("", "0"):
+        try:
+            parts.append(f"URL: {resp.url} | Headers: {dict(resp.headers)} | Body: {resp.text!r}")
+        except Exception:
+            pass
+    return " | ".join(parts)
 
 
 def _live_models() -> list[tuple[str, str]]:
