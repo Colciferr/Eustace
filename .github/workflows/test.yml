@@ -1,0 +1,42 @@
+name: Tests
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install dependencies
+        run: python -m pip install .
+      - name: Create an Eustace home so the junction tests have a protected target
+        run: New-Item -ItemType Directory -Force "$HOME\.eustace" | Out-Null
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+  setup-script:
+    # Runs the real installer under Windows PowerShell 5.1 on a Python that has no pipx yet.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run setup.ps1
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File .\setup.ps1
+      - name: Installed command works
+        shell: powershell
+        run: |
+          $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
+          eustace --version
