@@ -14,7 +14,10 @@ A local CLI agent powered by **GenAI.mil** models with built-in tools for local 
 Open PowerShell and run:
 ```powershell
 git clone github.com/Colciferr/eustace
-cd eustace
+```
+or
+```powershell
+git clone gitlab.com/Colciferr/eustace
 ```
 
 **Option B - Without Git (ZIP Download):**
