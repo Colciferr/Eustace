@@ -36,7 +36,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # --- Command-line flags (read before any path or client is derived from them) ---
 _ARGS = sys.argv[1:]
