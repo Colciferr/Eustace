@@ -36,7 +36,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "1.1.0"
+VERSION = "1.1.3"
 
 # --- Command-line flags (read before any path or client is derived from them) ---
 _ARGS = sys.argv[1:]
@@ -136,12 +136,15 @@ def _merge_env_line(path: str, key: str, value: str) -> None:
 
 def ensure_api_key() -> str:
     """Returns the backend API key, prompting once and saving it to <EUSTACE_HOME>/.env if it is missing."""
-    key = os.environ.get(API_KEY_ENV)
-    if key:
+    key = (os.environ.get(API_KEY_ENV) or "").strip()
+    if key and "\x16" not in key and all(32 < ord(c) < 127 for c in key):
         return key
 
-    console.print(f"[bold yellow]No API key found.[/bold yellow] Paste your {BACKEND_NAME} key ({API_KEY_ENV}, input hidden):")
+    console.print(f"[bold yellow]No valid API key found.[/bold yellow] Paste your {BACKEND_NAME} key ({API_KEY_ENV}, input hidden):")
     key = console.input("> ", password=True).strip()
+    if "\x16" in key:
+        key = read_clipboard().strip()
+    key = "".join(c for c in key if 32 < ord(c) < 127)
     if not key:
         raise SystemExit("An API key is required.")
 
@@ -149,6 +152,7 @@ def ensure_api_key() -> str:
     os.environ[API_KEY_ENV] = key
     console.print(f"[dim]Saved to {global_env_path}[/dim]")
     return key
+
 
 
 # The client is created lazily in main() so that importing this module (tests, --help) needs no key.
@@ -242,36 +246,11 @@ def _tool_call_extra(tc) -> dict | None:
 
 
 def _format_api_error(e: Exception) -> str:
-    """One readable line for an API failure: HTTP status, the provider's message, and (for quota errors)
-    the quota id and retry delay, instead of the raw JSON blob the SDK puts in str(e)."""
-    status = getattr(e, "status_code", None)
-    body = getattr(e, "body", None)
-    err = {}
-    if isinstance(body, list) and body and isinstance(body[0], dict):   # Gemini: [{"error": {...}}]
-        err = body[0].get("error") or {}
-    elif isinstance(body, dict):                                         # OpenAI-style: {"error": {...}} or {...}
-        err = body.get("error") or body
-    if not isinstance(err, dict):
-        err = {}
-    msg = str(err.get("message") or "").strip()
-    for cut in (" For more information", " * Quota exceeded", " Please refer to"):
-        msg = msg.split(cut)[0].strip()
-    parts = [f"API error {status}" if status else f"API error ({type(e).__name__})"]
-    if msg:
-        parts.append(msg[:300])
-    for d in err.get("details") or []:
-        if not isinstance(d, dict):
-            continue
-        for v in d.get("violations") or []:
-            if isinstance(v, dict) and v.get("quotaId"):
-                parts.append(f"quota {v['quotaId']} = {v.get('quotaValue', '?')}")
-        if d.get("retryDelay"):
-            parts.append(f"retry after {d['retryDelay']}")
-    if status == 429:
-        parts.append("Switch models with /model" + (" or set EUSTACE_DEV_MODEL." if DEV_MODE else ", or wait and retry."))
-    if len(parts) == 1:
-        parts.append(str(e)[:300])
-    return " | ".join(parts)
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        return f"HTTP {resp.status_code} | URL: {resp.url} | Headers: {dict(resp.headers)} | Raw Text: {resp.text!r}"
+    return f"{type(e).__name__}: {e}"
+
 
 
 def _live_models() -> list[tuple[str, str]]:
