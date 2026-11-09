@@ -2713,6 +2713,25 @@ def compact_messages(messages: list[dict]) -> list[dict]:
 # =====================================================================
 
 SESSIONS_DIR = os.path.join(EUSTACE_HOME, "sessions")
+MAX_AUTOSAVES = 10
+# Each run autosaves to its own file, so starting a new conversation never overwrites the previous one.
+AUTOSAVE_NAME = datetime.now().strftime("auto_%Y%m%d_%H%M%S")
+
+
+def _write_json_atomic(path: str, data) -> None:
+    """Writes JSON through a temp file and os.replace, so a crash mid-write cannot leave a truncated file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _sanitize_session_name(name: str) -> str:
@@ -2720,10 +2739,9 @@ def _sanitize_session_name(name: str) -> str:
     return clean or datetime.now().strftime("session_%Y%m%d_%H%M%S")
 
 
-def save_session(messages: list[dict], name: str = "autosave", quiet: bool = False) -> str:
-    """Saves non-system conversation messages to ~/.eustace/sessions/<name>.json."""
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-    slug = _sanitize_session_name(name)
+def save_session(messages: list[dict], name: str = "", quiet: bool = False) -> str:
+    """Saves non-system conversation messages to ~/.eustace/sessions/<name>.json (default: this run's autosave)."""
+    slug = _sanitize_session_name(name or AUTOSAVE_NAME)
     path = os.path.join(SESSIONS_DIR, f"{slug}.json")
 
     non_sys = [m for m in messages if m.get("role") != "system"]
@@ -2742,12 +2760,23 @@ def save_session(messages: list[dict], name: str = "autosave", quiet: bool = Fal
         "preview": str(first_user)[:100],
         "messages": non_sys,
     }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _write_json_atomic(path, payload)
+    if slug == AUTOSAVE_NAME:
+        _prune_autosaves()
 
     if not quiet:
-        console.print(f"[dim cyan]✓ Session saved as '[bold]{escape(slug)}[/bold]' ({path})[/dim cyan]")
+        console.print(f"[dim cyan]✓ Session saved as '[bold]{escape(slug)}[/bold]' ({escape(path)})[/dim cyan]")
     return path
+
+
+def _prune_autosaves() -> None:
+    """Keeps the newest MAX_AUTOSAVES per-run autosave files; named sessions are never pruned."""
+    try:
+        autos = sorted(f for f in os.listdir(SESSIONS_DIR) if re.fullmatch(r"auto_\d{8}_\d{6}\.json", f))
+        for stale in autos[:-MAX_AUTOSAVES]:  # the timestamped names sort chronologically
+            os.remove(os.path.join(SESSIONS_DIR, stale))
+    except OSError:
+        pass
 
 
 def list_saved_sessions() -> list[dict]:
@@ -2776,8 +2805,9 @@ def list_saved_sessions() -> list[dict]:
     return items
 
 
-def load_session(target: str = "autosave") -> list[dict] | None:
-    """Loads a saved session by name or 1-based index and prepends the fresh system prompt."""
+def load_session(target: str = "") -> list[dict] | None:
+    """Loads a saved session by name or 1-based index (default: the most recent one from an earlier run)
+    and prepends the fresh system prompt."""
     sessions = list_saved_sessions()
     if not sessions:
         console.print("[dim yellow]No saved sessions found.[/dim yellow]")
@@ -2785,7 +2815,12 @@ def load_session(target: str = "autosave") -> list[dict] | None:
 
     chosen = None
     t = target.strip()
-    if t.isdigit():
+    if not t:
+        chosen = next((s for s in sessions if s["name"] != AUTOSAVE_NAME), None)
+        if chosen is None:
+            console.print("[dim yellow]No earlier session to resume.[/dim yellow]")
+            return None
+    elif t.isdigit():
         idx = int(t) - 1
         if 0 <= idx < len(sessions):
             chosen = sessions[idx]
@@ -2950,7 +2985,7 @@ def main():
                 continue
 
             if cmd == "/resume":
-                restored = load_session(cmd_arg or "autosave")
+                restored = load_session(cmd_arg)
                 if restored is not None:
                     messages = restored
                 continue
@@ -2958,7 +2993,7 @@ def main():
             if cmd == "/compact":
                 try:
                     messages = compact_messages(messages)
-                    save_session(messages, name="autosave", quiet=True)
+                    save_session(messages, quiet=True)
                     console.print("[dim cyan]✓ Context compacted into a summary[/dim cyan]")
                 except Exception as e:
                     console.print(f"[bold red]Compact failed:[/bold red] {escape(str(e))}")
@@ -2966,8 +3001,8 @@ def main():
 
             messages.append({"role": "user", "content": user_input})
             run_agent_turn(messages)
-            # Automatically checkpoint every completed turn to autosave.json
-            save_session(messages, name="autosave", quiet=True)
+            # Checkpoint every completed turn to this run's autosave file
+            save_session(messages, quiet=True)
 
         except KeyboardInterrupt:
             console.print("\n[dim yellow]Interrupted. Type /exit to quit, or enter your next prompt.[/dim yellow]")
