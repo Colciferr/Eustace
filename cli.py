@@ -134,23 +134,37 @@ def _merge_env_line(path: str, key: str, value: str) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+def _clean_api_key(raw: str | None) -> str:
+    """Keeps only printable, non-space ASCII; anything else (control codes, stray whitespace) cannot be part of a key."""
+    return "".join(c for c in (raw or "") if 32 < ord(c) < 127)
+
+
 def ensure_api_key() -> str:
-    """Returns the backend API key, prompting once and saving it to <EUSTACE_HOME>/.env if it is missing."""
-    key = (os.environ.get(API_KEY_ENV) or "").strip()
-    if key and "\x16" not in key and all(32 < ord(c) < 127 for c in key):
-        return key
+    """Returns the backend API key, prompting and saving it to <EUSTACE_HOME>/.env if it is missing or malformed."""
+    stored = (os.environ.get(API_KEY_ENV) or "").strip()
+    if stored and _clean_api_key(stored) == stored:
+        return stored
 
     console.print(f"[bold yellow]No valid API key found.[/bold yellow] Paste your {BACKEND_NAME} key ({API_KEY_ENV}, input hidden):")
-    key = console.input("> ", password=True).strip()
-    if "\x16" in key:
-        key = read_clipboard().strip()
-    key = "".join(c for c in key if 32 < ord(c) < 127)
+    key = ""
+    for _ in range(3):
+        typed = console.input("> ", password=True)
+        if "\x16" in typed:
+            # The legacy console host delivers Ctrl+V as a literal 0x16 instead of pasting; fetch the clipboard
+            # ourselves. The raw reader returns None on failure, so an error message can never be saved as a key.
+            typed = _clipboard_text_raw()
+            if typed is None:
+                console.print("[yellow]Could not read the clipboard. Right-click to paste, or type the key.[/yellow]")
+                continue
+        key = _clean_api_key(typed)
+        if key:
+            break
+        console.print("[yellow]That was empty. Try again.[/yellow]")
     if not key:
         raise SystemExit("An API key is required.")
 
     _merge_env_line(global_env_path, API_KEY_ENV, key)
-    os.environ[API_KEY_ENV] = key
-    console.print(f"[dim]Saved to {global_env_path}[/dim]")
+    console.print(f"[dim]Saved to {escape(global_env_path)}[/dim]")
     return key
 
 
@@ -174,6 +188,10 @@ def _init_client() -> None:
         timeout=APITimeout(API_READ_TIMEOUT_SECONDS, connect=API_CONNECT_TIMEOUT_SECONDS),
         max_retries=API_MAX_RETRIES,
     )
+    # The client holds the key from here on. Drop it from the process environment so nothing this process
+    # launches (os.startfile handlers, PowerShell) can inherit it.
+    for name in ("STARK_API_KEY", "GEMINI_API_KEY"):
+        os.environ.pop(name, None)
 
 
 class _StreamWorker:
@@ -1004,23 +1022,32 @@ _CF_UNICODETEXT = 13
 _GMEM_MOVEABLE = 0x0002
 
 
-def read_clipboard(max_chars: int = 30000) -> str:
-    """Reads the current text content from the Windows clipboard."""
+def _clipboard_text_raw() -> str | None:
+    """The clipboard's text exactly as stored ("" when it holds no text), or None if it could not be read."""
     if not _user32.OpenClipboard(None):
-        return "Error: Could not open Windows clipboard (it may be locked by another application)."
+        return None
     try:
         handle = _user32.GetClipboardData(_CF_UNICODETEXT)
         if not handle:
-            return "(Clipboard is empty or does not contain text)"
+            return ""
         ptr = _kernel32.GlobalLock(handle)
         if not ptr:
-            return "Error: Could not lock clipboard memory."
+            return None
         try:
-            text = ctypes.wstring_at(ptr)
+            return ctypes.wstring_at(ptr)
         finally:
             _kernel32.GlobalUnlock(handle)
     finally:
         _user32.CloseClipboard()
+
+
+def read_clipboard(max_chars: int = 30000) -> str:
+    """Reads the current text content from the Windows clipboard."""
+    text = _clipboard_text_raw()
+    if text is None:
+        return "Error: Could not read the Windows clipboard (it may be locked by another application)."
+    if not text:
+        return "(Clipboard is empty or does not contain text)"
 
     phi_err = _check_phi_guardrail("clipboard", text)
     if phi_err:

@@ -385,5 +385,51 @@ class ApiErrorFormattingTests(unittest.TestCase):
         self.assertIn("socket closed", line)
 
 
+class ApiKeyEntryTests(unittest.TestCase):
+    """The Ctrl+V fallback must never save a clipboard error message (or anything unkeylike) as the key."""
+
+    def _run(self, typed, clipboard):
+        saved = (cli.console.input, cli._clipboard_text_raw, cli._merge_env_line, os.environ.pop(cli.API_KEY_ENV, None))
+        written = []
+        answers, clips = list(typed), list(clipboard)
+        cli.console.input = lambda *a, **k: answers.pop(0)
+        cli._clipboard_text_raw = lambda: clips.pop(0)
+        cli._merge_env_line = lambda path, key, value: written.append(value)
+        try:
+            return cli.ensure_api_key(), written
+        finally:
+            cli.console.input, cli._clipboard_text_raw, cli._merge_env_line = saved[:3]
+            os.environ.pop(cli.API_KEY_ENV, None)
+            if saved[3] is not None:
+                os.environ[cli.API_KEY_ENV] = saved[3]
+
+    def test_ctrl_v_reads_clipboard(self):
+        key, written = self._run(["\x16"], [" sk-abc123\r\n"])
+        self.assertEqual(key, "sk-abc123")
+        self.assertEqual(written, ["sk-abc123"])
+
+    def test_unreadable_or_empty_clipboard_reprompts(self):
+        key, written = self._run(["\x16", "\x16", "typed-key"], [None, ""])
+        self.assertEqual(key, "typed-key")
+        self.assertEqual(written, ["typed-key"])
+
+    def test_gives_up_without_saving(self):
+        written = []
+        with self.assertRaises(SystemExit):
+            _, written = self._run(["\x16", "", "  "], [None])
+        self.assertEqual(written, [])
+
+    def test_malformed_stored_key_is_not_used(self):
+        os.environ[cli.API_KEY_ENV] = "bad key\x16"
+        saved_input, saved_merge = cli.console.input, cli._merge_env_line
+        cli.console.input = lambda *a, **k: "good"
+        cli._merge_env_line = lambda *a: None
+        try:
+            self.assertEqual(cli.ensure_api_key(), "good")
+        finally:
+            cli.console.input, cli._merge_env_line = saved_input, saved_merge
+            os.environ.pop(cli.API_KEY_ENV, None)
+
+
 if __name__ == "__main__":
     unittest.main()
