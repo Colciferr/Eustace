@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import difflib
 import fnmatch
 import hashlib
+import inspect
 import json
 import msvcrt
 import os
@@ -15,6 +16,8 @@ import subprocess
 import sys
 import threading
 import time
+import types
+import typing
 
 import truststore
 truststore.inject_into_ssl()
@@ -31,12 +34,19 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.markup import escape
 from rich.panel import Panel
-from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "1.1.3"
+VERSION = "1.2.0"
+
+# When output is redirected to a file or pipe, Windows uses the ANSI code page, which cannot encode the symbols
+# printed here; degrade to "?" instead of crashing mid-turn.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 # --- Command-line flags (read before any path or client is derived from them) ---
 _ARGS = sys.argv[1:]
@@ -84,35 +94,44 @@ else:
     ]
     DEFAULT_MODEL = "gemini-3.5-flash-lite-withtools"
 
-def load_saved_model() -> str:
-    """Loads the user's last selected model from ~/.eustace/config.json."""
+def _write_json_atomic(path: str, data) -> None:
+    """Writes JSON through a temp file and os.replace, so a crash mid-write cannot leave a truncated file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
     try:
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                m = data.get("model", "").strip()
-                if m:
-                    return m
-    except Exception:
-        pass
-    return DEFAULT_MODEL
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
-def save_selected_model(model_name: str):
-    """Persists the selected model to ~/.eustace/config.json."""
+
+def _read_config() -> dict:
+    """<EUSTACE_HOME>/config.json as a dict ({} when missing or unreadable)."""
     try:
-        os.makedirs(EUSTACE_HOME, exist_ok=True)
-        data = {}
-        if os.path.exists(CONFIG_PATH):
-            try:
-                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
-        data["model"] = model_name
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _update_config(**changes) -> None:
+    """Merges the given keys into config.json; a failed write is not fatal (the setting just does not persist)."""
+    try:
+        _write_json_atomic(CONFIG_PATH, {**_read_config(), **changes})
+    except OSError:
         pass
+
+
+def load_saved_model() -> str:
+    """The user's last selected model, or the backend default."""
+    return str(_read_config().get("model") or "").strip() or DEFAULT_MODEL
+
 
 def short_model_label(model_name: str) -> str:
     """Returns a compact badge name like 'gemini-4-argon' for UI headers."""
@@ -134,23 +153,37 @@ def _merge_env_line(path: str, key: str, value: str) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+def _clean_api_key(raw: str | None) -> str:
+    """Keeps only printable, non-space ASCII; anything else (control codes, stray whitespace) cannot be part of a key."""
+    return "".join(c for c in (raw or "") if 32 < ord(c) < 127)
+
+
 def ensure_api_key() -> str:
-    """Returns the backend API key, prompting once and saving it to <EUSTACE_HOME>/.env if it is missing."""
-    key = (os.environ.get(API_KEY_ENV) or "").strip()
-    if key and "\x16" not in key and all(32 < ord(c) < 127 for c in key):
-        return key
+    """Returns the backend API key, prompting and saving it to <EUSTACE_HOME>/.env if it is missing or malformed."""
+    stored = (os.environ.get(API_KEY_ENV) or "").strip()
+    if stored and _clean_api_key(stored) == stored:
+        return stored
 
     console.print(f"[bold yellow]No valid API key found.[/bold yellow] Paste your {BACKEND_NAME} key ({API_KEY_ENV}, input hidden):")
-    key = console.input("> ", password=True).strip()
-    if "\x16" in key:
-        key = read_clipboard().strip()
-    key = "".join(c for c in key if 32 < ord(c) < 127)
+    key = ""
+    for _ in range(3):
+        typed = console.input("> ", password=True)
+        if "\x16" in typed:
+            # The legacy console host delivers Ctrl+V as a literal 0x16 instead of pasting; fetch the clipboard
+            # ourselves. The raw reader returns None on failure, so an error message can never be saved as a key.
+            typed = _clipboard_text_raw()
+            if typed is None:
+                console.print("[yellow]Could not read the clipboard. Right-click to paste, or type the key.[/yellow]")
+                continue
+        key = _clean_api_key(typed)
+        if key:
+            break
+        console.print("[yellow]That was empty. Try again.[/yellow]")
     if not key:
         raise SystemExit("An API key is required.")
 
     _merge_env_line(global_env_path, API_KEY_ENV, key)
-    os.environ[API_KEY_ENV] = key
-    console.print(f"[dim]Saved to {global_env_path}[/dim]")
+    console.print(f"[dim]Saved to {escape(global_env_path)}[/dim]")
     return key
 
 
@@ -174,6 +207,10 @@ def _init_client() -> None:
         timeout=APITimeout(API_READ_TIMEOUT_SECONDS, connect=API_CONNECT_TIMEOUT_SECONDS),
         max_retries=API_MAX_RETRIES,
     )
+    # The client holds the key from here on. Drop it from the process environment so nothing this process
+    # launches (os.startfile handlers, PowerShell) can inherit it.
+    for name in ("STARK_API_KEY", "GEMINI_API_KEY"):
+        os.environ.pop(name, None)
 
 
 class _StreamWorker:
@@ -246,11 +283,48 @@ def _tool_call_extra(tc) -> dict | None:
 
 
 def _format_api_error(e: Exception) -> str:
+    """One readable line for an API failure: HTTP status, the provider's message, and (for quota errors)
+    the quota id and retry delay. Set EUSTACE_DEBUG=1 to append the full response (URL, headers, body)."""
+    status = getattr(e, "status_code", None)
+    body = getattr(e, "body", None)
+    err = {}
+    if isinstance(body, list) and body and isinstance(body[0], dict):   # Gemini: [{"error": {...}}]
+        err = body[0].get("error") or {}
+    elif isinstance(body, dict):                                         # OpenAI-style: {"error": {...}} or {...}
+        err = body.get("error") or body
+    if not isinstance(err, dict):
+        err = {}
+    msg = str(err.get("message") or "").strip()
+    for cut in (" For more information", " * Quota exceeded", " Please refer to"):
+        msg = msg.split(cut)[0].strip()
+    parts = [f"API error {status}" if status else f"API error ({type(e).__name__})"]
+    if msg:
+        parts.append(msg[:300])
+    for d in err.get("details") or []:
+        if not isinstance(d, dict):
+            continue
+        for v in d.get("violations") or []:
+            if isinstance(v, dict) and v.get("quotaId"):
+                parts.append(f"quota {v['quotaId']} = {v.get('quotaValue', '?')}")
+        if d.get("retryDelay"):
+            parts.append(f"retry after {d['retryDelay']}")
+    if status == 429:
+        parts.append("Switch models with /model" + (" or set EUSTACE_DEV_MODEL." if DEV_MODE else ", or wait and retry."))
     resp = getattr(e, "response", None)
-    if resp is not None:
-        return f"HTTP {resp.status_code} | URL: {resp.url} | Headers: {dict(resp.headers)} | Raw Text: {resp.text!r}"
-    return f"{type(e).__name__}: {e}"
-
+    if not msg:
+        # Nothing parseable: show the start of whatever the server actually sent (HTML error page, proxy text...)
+        raw = ""
+        try:
+            raw = (resp.text if resp is not None else "") or ""
+        except Exception:
+            pass
+        parts.append((raw.strip() or str(e))[:300])
+    if resp is not None and os.environ.get("EUSTACE_DEBUG", "").strip() not in ("", "0"):
+        try:
+            parts.append(f"URL: {resp.url} | Headers: {dict(resp.headers)} | Body: {resp.text!r}")
+        except Exception:
+            pass
+    return " | ".join(parts)
 
 
 def _live_models() -> list[tuple[str, str]]:
@@ -270,7 +344,7 @@ def _live_models() -> list[tuple[str, str]]:
         return []
 
 # =====================================================================
-# STEP 1: SECURITY GUARDRAILS, AUDIT LOG, & DIFF APPROVAL HANDLER
+# SECURITY GUARDRAILS, AUDIT LOG, APPROVAL HANDLER
 # =====================================================================
 
 IGNORE_DIRS = {".venv", ".git", "__pycache__", "node_modules"}
@@ -326,6 +400,10 @@ PROTECTED_ROOTS = [
         os.environ.get("ProgramFiles"),
         os.environ.get("ProgramFiles(x86)"),
         os.environ.get("ProgramW6432"),
+        os.path.join(os.environ.get("APPDATA") or os.path.join(_HOME_DIR, "AppData", "Roaming"),
+                     "Microsoft", "Windows", "Start Menu", "Programs", "Startup"),
+        os.path.join(os.environ.get("ProgramData") or r"C:\ProgramData",
+                     "Microsoft", "Windows", "Start Menu", "Programs", "StartUp"),
     ) if p
 ]
 
@@ -439,6 +517,15 @@ def _mark_of_the_web(path: str) -> None:
         pass
 
 
+def _head_lines(text: str, limit: int) -> str:
+    """The first `limit` lines of text, with an explicit count of what was left out. Approval previews use
+    this so a cut-off preview never looks like the whole content."""
+    lines = str(text).replace("\r\n", "\n").split("\n")
+    if len(lines) <= limit:
+        return "\n".join(lines)
+    return "\n".join(lines[:limit]) + f"\n... (+{len(lines) - limit} more lines not shown)"
+
+
 def _trusted_powershell() -> str | None:
     """Locates a PowerShell host by absolute path, never from the current directory."""
     candidates = []
@@ -460,19 +547,26 @@ def _trusted_powershell() -> str | None:
     return None
 
 
-def _load_custom_deny_patterns() -> set[str]:
-    """Loads optional user/unit-defined deny patterns from ~/.eustace/deny_paths.txt."""
-    if not os.path.exists(DENY_LIST_PATH):
-        return set()
+_deny_cache: tuple = (None, None, frozenset())  # (path, mtime, patterns)
+
+
+def _load_custom_deny_patterns() -> frozenset[str]:
+    """Optional user/unit-defined deny patterns from ~/.eustace/deny_paths.txt. Called for every path checked
+    (thousands of times per search), so the parsed file is reused until its modification time changes."""
+    global _deny_cache
     try:
-        with open(DENY_LIST_PATH, "r", encoding="utf-8") as f:
-            return {
-                line.strip()
-                for line in f
-                if line.strip() and not line.strip().startswith("#")
-            }
+        mtime = os.stat(DENY_LIST_PATH).st_mtime_ns
     except OSError:
-        return set()
+        return frozenset()
+    if _deny_cache[:2] != (DENY_LIST_PATH, mtime):
+        try:
+            with open(DENY_LIST_PATH, "r", encoding="utf-8-sig") as f:
+                lines = (line.strip() for line in f)
+                patterns = frozenset(line for line in lines if line and not line.startswith("#"))
+        except OSError:
+            return frozenset()
+        _deny_cache = (DENY_LIST_PATH, mtime, patterns)
+    return _deny_cache[2]
 
 
 def _is_sensitive_canon(canon: str) -> bool:
@@ -488,24 +582,16 @@ def _is_sensitive_canon(canon: str) -> bool:
     return any(_is_under(canon, h) for h in PROTECTED_HOMES)
 
 
-def _is_sensitive(target: str) -> bool:
-    """True for secrets files, deny-list matches, credential directories, or anything inside an Eustace home.
-
-    Canonicalizes first so \\\\?\\ prefixes, ::$DATA streams, 8.3 short names and junctions cannot dodge the
-    match; a spelling that cannot be canonicalized is treated as protected (fail closed)."""
-    try:
-        canon = _canonical_path(target)
-    except ValueError:
-        return True
-    return _is_sensitive_canon(canon)
-
-
 def _is_protected_path(target: str) -> bool:
-    """True if target is inside the Windows or Program Files trees."""
-    return any(_is_under(target, root) for root in PROTECTED_ROOTS)
+    """True if the model must never write here: the Windows and Program Files trees, the Startup folders,
+    and PowerShell profile scripts (the last two run code automatically at logon or shell start)."""
+    if any(_is_under(target, root) for root in PROTECTED_ROOTS):
+        return True
+    folder, name = os.path.split(os.path.normpath(target).lower())
+    return fnmatch.fnmatch(name, "*profile.ps1") and os.path.basename(folder) in ("windowspowershell", "powershell")
 
 
-def _recheck_after_approval(canon: str) -> str | None:
+def _recheck_after_approval(canon: str, writing: bool = True) -> str | None:
     """Re-validates an approved destination immediately before the sink; returns an error string to abort."""
     try:
         again = _canonical_path(canon)
@@ -513,11 +599,35 @@ def _recheck_after_approval(canon: str) -> str | None:
         return f"Security Error: destination no longer canonicalizes after approval ({e}); operation aborted."
     if os.path.normcase(again) != os.path.normcase(canon):
         return "Security Error: destination changed between approval and execution; operation aborted."
-    if _is_protected_path(canon) or _is_sensitive_canon(canon):
+    if (writing and _is_protected_path(canon)) or _is_sensitive_canon(canon):
         return "Security Error: destination became protected after approval; operation aborted."
     if _has_link_component(canon):
         return "Security Error: destination passes through a symlink or junction; operation aborted."
     return None
+
+
+def _guard_write(path: str, ext: tuple[str, ...] = ()) -> tuple[str | None, str | None]:
+    """(canonical target, None) when the model may write to `path`, else (None, error for the model).
+    `ext` lists the accepted extensions; the first is appended when the path has none of them. Every tool
+    that writes goes through here, so they all apply the same checks to the same canonical path."""
+    target, err = _resolve_model_path(path)
+    if not err and ext and not target.lower().endswith(ext):
+        target, err = _resolve_model_path(target + ext[0])  # resolve again: the final name may be a link
+    if err:
+        return None, err
+    if _is_protected_path(target):
+        return None, "Security Error: Writing to system folders is strictly prohibited."
+    if _is_sensitive_canon(target):
+        return None, f"Security Error: Writing to protected path '{path}' is prohibited."
+    return target, None
+
+
+def _approve_and_recheck(target: str, title: str, detail: str = "", diff: str = "", writing: bool = True) -> str | None:
+    """Asks the user, then re-validates the target right before the caller acts on it. Returns None to go
+    ahead or the message to hand back to the model."""
+    if not APPROVAL_HANDLER.request_approval(title, detail_text=detail, diff_text=diff):
+        return "Operation aborted: User did NOT approve this action."
+    return _recheck_after_approval(target, writing)
 
 
 def _confirm_outside_workspace(canon: str, action: str) -> bool:
@@ -528,6 +638,7 @@ def _confirm_outside_workspace(canon: str, action: str) -> bool:
     return APPROVAL_HANDLER.request_approval(
         f"{action} outside the working directory",
         detail_text=f"[dim]Path:      {escape(_visible_controls(canon))}\nWorkspace: {escape(ws)}[/dim]",
+        always_ask=True,
     )
 
 
@@ -539,7 +650,7 @@ def _check_phi_guardrail(target: str, content: str = "") -> str | None:
             f"Security Policy Block: '{name}' matches a Protected Health Information (PHI) "
             "filename pattern. Processing PHI (such as medical records) is strictly prohibited."
         )
-    if content and PHI_CONTENT_REGEX.search(content[:15000]):
+    if content and PHI_CONTENT_REGEX.search(content):
         return (
             f"Security Policy Block: '{name}' contains Protected Health Information (PHI) "
             "markers. While CUI and PII are authorized, processing PHI is strictly prohibited."
@@ -547,19 +658,33 @@ def _check_phi_guardrail(target: str, content: str = "") -> str | None:
     return None
 
 
+_AUDIT_CONTENT_KEYS = {"content", "old_text", "new_text", "text", "html_body", "body"}
+
+
+def _audit_digest(value) -> str:
+    """Size and short hash of a value: enough to correlate log entries without storing the data itself."""
+    if isinstance(value, str):
+        blob, size = value, f"{len(value)} chars"
+    else:
+        blob, size = json.dumps(value, sort_keys=True, default=str), f"{type(value).__name__}, {len(value)} items"
+    return f"<{size}, sha256:{hashlib.sha256(blob.encode('utf-8', errors='replace')).hexdigest()[:12]}>"
+
+
 def log_audit_event(tool_name: str, args: dict, decision: str, result: str):
-    """Appends a structured audit record to ~/.eustace/audit.jsonl."""
+    """Appends a structured audit record to ~/.eustace/audit.jsonl.
+
+    The log records what was done, not the data it touched: file contents, document values and tool output
+    appear only as size + hash. Paths, commands, and error text are kept verbatim."""
     try:
-        os.makedirs(EUSTACE_HOME, exist_ok=True)
         safe_args = {}
         for k, v in args.items():
-            if k in ("content", "old_text", "new_text", "text", "html_body", "body") and isinstance(v, str):
-                digest = hashlib.sha256(v.encode("utf-8", errors="replace")).hexdigest()[:12]
-                safe_args[k] = f"<{len(v)} chars, sha256:{digest}>"
+            if isinstance(v, (dict, list)) or (isinstance(v, str) and (k in _AUDIT_CONTENT_KEYS or (len(v) > 200 and k != "command"))):
+                safe_args[k] = _audit_digest(v)
             else:
                 safe_args[k] = v
 
         res_str = str(result)
+        failed = res_str.startswith(("Error", "Security", "Operation aborted"))
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "backend": BACKEND_NAME,
@@ -568,11 +693,12 @@ def log_audit_event(tool_name: str, args: dict, decision: str, result: str):
             "tool": tool_name,
             "args": safe_args,
             "decision": decision,
-            "status": "error" if res_str.startswith(("Error:", "Security", "Operation aborted")) else "ok",
-            "result_preview": res_str[:200],
+            "status": "error" if failed else "ok",
+            "result_preview": res_str[:200] if failed or res_str.startswith("Success") else _audit_digest(res_str),
         }
+        os.makedirs(EUSTACE_HOME, exist_ok=True)
         with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     except Exception:
         pass
 
@@ -592,62 +718,73 @@ def build_unified_diff(old_text: str, new_text: str, path: str) -> str:
 
 
 class CLIApprovalHandler:
-    """Decoupled approval UX supporting unified diffs and 'yes to all for this turn'."""
+    """Approval prompt with unified diffs. [A] approves further calls of the *same tool* for the rest of the
+    turn; requests marked always_ask (shell commands, access outside the working directory, dev-mode data
+    warnings) are never covered by it."""
 
     def __init__(self):
-        self.approve_all_for_turn = False
+        self.approved_tools: set[str] = set()
+        self.current_tool = ""   # set by the agent loop before each tool runs
         self.last_decision = "auto"
 
     def reset_turn(self):
-        self.approve_all_for_turn = False
+        self.approved_tools.clear()
         self.last_decision = "auto"
 
-    def request_approval(self, action_title: str, detail_text: str = "", diff_text: str = "") -> bool:
-        if self.approve_all_for_turn:
-            self.last_decision = "approved_all_turn"
-            console.print(f"  [dim green]✓ Auto-approved: {escape(action_title)}[/dim green]")
-            return True
-
+    def request_approval(self, action_title: str, detail_text: str = "", diff_text: str = "", always_ask: bool = False) -> bool:
         # Bind the display to the bytes that will act: control characters (CR, ESC, VT, FF...) that rich
         # would silently drop or the terminal would interpret are made visible before anything is rendered.
         action_title = _visible_controls(action_title)
-        if diff_text:
-            diff_text = _visible_controls(diff_text.replace("\r\n", "\n"))
-            lines = diff_text.splitlines()
-            shown_diff = "\n".join(lines[:100])
-            if len(lines) > 100:
-                shown_diff += f"\n... ({len(lines) - 100} more diff lines)"
+        if not always_ask and self.current_tool in self.approved_tools:
+            self.last_decision = "approved_all_turn"
+            console.print(f"  [dim green]✓ Auto-approved ({escape(self.current_tool)} this turn): {escape(action_title)}[/dim green]")
+            return True
+
+        diff_lines = _visible_controls(diff_text.replace("\r\n", "\n")).splitlines() if diff_text else []
+        hidden = len(diff_lines) - DIFF_PREVIEW_LINES
+        shown = diff_lines[:DIFF_PREVIEW_LINES]
+        if hidden > 0:
+            shown.append(f"... ({hidden} more diff lines; press V to view all of them)")
+
+        can_approve_all = not always_ask and bool(self.current_tool)
+        options = ["y", "n"]
+        keys = "[bold yellow]\\[Y][/bold yellow] Approve   [bold yellow]\\[N][/bold yellow] Deny"
+        if can_approve_all:
+            options.append("a")
+            keys += f"   [bold yellow]\\[A][/bold yellow] Approve all {escape(self.current_tool)} this turn"
+        if hidden > 0:
+            options.append("v")
+            keys += "   [bold yellow]\\[V][/bold yellow] View Full Diff"
+        if diff_lines:
+            body = Syntax("\n".join(shown), "diff", theme="monokai", word_wrap=True)
+        else:
+            body = detail_text or escape(action_title)
 
         console.print()
-        if diff_text:
-            if detail_text:
-                console.print(f"  {detail_text}")
-            console.print(
-                Panel(
-                    Syntax(shown_diff, "diff", theme="monokai", word_wrap=True),
-                    title=f"[bold yellow]⚠️  Approval Required: {escape(action_title)}[/bold yellow]",
-                    subtitle="[bold yellow]\\[Y][/bold yellow] Approve   [bold yellow]\\[N][/bold yellow] Deny   [bold yellow]\\[A][/bold yellow] Approve All This Turn",
-                    border_style="yellow",
-                    box=box.ROUNDED,
-                    padding=(0, 1),
-                )
+        if diff_lines and detail_text:
+            console.print(f"  {detail_text}")
+        console.print(
+            Panel(
+                body,
+                title=f"[bold yellow]⚠️  Approval Required: {escape(action_title)}[/bold yellow]",
+                subtitle=keys,
+                border_style="yellow",
+                box=box.ROUNDED,
+                padding=(0, 1),
             )
-        else:
-            console.print(
-                Panel(
-                    detail_text or escape(action_title),
-                    title=f"[bold yellow]⚠️  Approval Required: {escape(action_title)}[/bold yellow]",
-                    subtitle="[bold yellow]\\[Y][/bold yellow] Approve   [bold yellow]\\[N][/bold yellow] Deny   [bold yellow]\\[A][/bold yellow] Approve All This Turn",
-                    border_style="yellow",
-                    box=box.ROUNDED,
-                    padding=(0, 1),
-                )
-            )
+        )
 
-        console.print("  [bold yellow]Choice (y/n/a) \\[default: N]:[/bold yellow] ", end="")
-        choice = input().strip().lower()
-        if choice in ("a", "all"):
-            self.approve_all_for_turn = True
+        while True:
+            console.print(f"  [bold yellow]Choice ({'/'.join(options)}) \\[default: N]:[/bold yellow] ", end="")
+            # Whole-word answers only: stray typed-ahead text that merely starts with "y" must not approve
+            choice = input().strip().lower()
+            if choice in ("v", "view") and hidden > 0:
+                console.print(Syntax("\n".join(diff_lines), "diff", theme="monokai", word_wrap=True))
+                continue
+            break
+
+        if choice in ("a", "all") and can_approve_all:
+            self.approved_tools.add(self.current_tool)
             self.last_decision = "approved_all_turn"
             return True
         if choice in ("y", "yes"):
@@ -658,16 +795,63 @@ class CLIApprovalHandler:
         return False
 
 
+DIFF_PREVIEW_LINES = 100
 
 APPROVAL_HANDLER = CLIApprovalHandler()
 
 
+# ---------------------------------------------------------------------
+# Tool registry: @tool is the single place a tool is declared. The model-facing schema is derived from the
+# function itself (name, docstring, annotations, defaults) plus the per-parameter descriptions given here.
+# Parameters without a description stay internal: they are not in the schema and the model cannot pass them.
+# ---------------------------------------------------------------------
+
+TOOLS: list[dict] = []                    # schemas sent to the model, in declaration order
+AVAILABLE_FUNCTIONS: dict = {}            # tool name -> function
+TOOL_FRIENDLY_LABELS: dict[str, str] = {} # tool name -> short progress label
+_TOOL_SCHEMAS: dict[str, dict] = {}       # tool name -> its JSON-schema "parameters" object
+_JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean", dict: "object"}
+
+
+def _json_type(annotation) -> dict:
+    """JSON-schema fragment for a parameter annotation: X | None is treated as X, list[X] as an array of X."""
+    origin, args = typing.get_origin(annotation), [a for a in typing.get_args(annotation) if a is not type(None)]
+    if origin in (typing.Union, types.UnionType):
+        return _json_type(args[0])
+    if annotation is list or origin is list:
+        return {"type": "array", "items": _json_type(args[0])} if args else {"type": "array"}
+    return {"type": _JSON_TYPES[origin or annotation]}
+
+
+def tool(label: str, **param_docs: str):
+    """Registers the decorated function as a model-callable tool. `label` is the progress text shown while it
+    runs; each keyword documents one parameter and exposes it to the model."""
+    def register(fn):
+        sig, hints = inspect.signature(fn), typing.get_type_hints(fn)
+        unknown = set(param_docs) - set(sig.parameters)
+        if unknown:
+            raise TypeError(f"@tool on {fn.__name__}: no such parameter(s) {sorted(unknown)}")
+        params = {
+            "type": "object",
+            "properties": {n: {**_json_type(hints[n]), "description": d} for n, d in param_docs.items()},
+            "required": [n for n, p in sig.parameters.items() if n in param_docs and p.default is p.empty],
+        }
+        description = " ".join(inspect.getdoc(fn).split())
+        TOOLS.append({"type": "function", "function": {"name": fn.__name__, "description": description, "parameters": params}})
+        _TOOL_SCHEMAS[fn.__name__] = params
+        AVAILABLE_FUNCTIONS[fn.__name__] = fn
+        TOOL_FRIENDLY_LABELS[fn.__name__] = label
+        return fn
+    return register
+
+
 # =====================================================================
-# 1. LOCAL FILE SYSTEM TOOLS (Plaintext + Excel, PDF, Word, PowerPoint)
+# LOCAL FILE SYSTEM TOOLS (plaintext, Excel, PDF, Word, PowerPoint)
 # =====================================================================
 
+@tool("Listing folder", path="Relative or absolute directory path to list (default is '.').")
 def list_directory(path: str = ".") -> str:
-    """Lists files and directories at the given path."""
+    """List files and folders in a directory on the user's local PC. Defaults to current working directory '.'."""
     try:
         target, err = _resolve_model_path(path)
         if err:
@@ -676,6 +860,10 @@ def list_directory(path: str = ".") -> str:
             return f"Error: Path does not exist: {path}"
         if not os.path.isdir(target):
             return f"Error: Path is not a directory: {path}"
+        if _is_sensitive_canon(target):
+            return f"Security Error: '{path}' is a protected location and will not be listed."
+        if not _confirm_outside_workspace(target, "List folder"):
+            return "Operation aborted: User did NOT approve listing a folder outside the working directory."
 
         items = []
         for entry in sorted(os.listdir(target)):
@@ -756,8 +944,13 @@ def _read_pptx(target: str) -> str:
     return "\n".join(out)
 
 
+_DOC_READERS = {".xlsx": _read_excel, ".xlsm": _read_excel, ".pdf": _read_pdf, ".docx": _read_docx, ".pptx": _read_pptx}
+
+
+@tool("Reading file", path="Relative or absolute path to the file to read.")
 def read_file(path: str, max_chars: int = 30000) -> str:
-    """Reads plaintext, code, Excel (.xlsx), PDF (.pdf), Word (.docx), and PowerPoint (.pptx) files."""
+    """Read the contents of a file on the user's local PC. Supports plaintext, code, CSV, Excel (.xlsx/.xlsm),
+    PDF (.pdf), Word (.docx), and PowerPoint (.pptx)."""
     try:
         target, err = _resolve_model_path(path)
         if err:
@@ -774,17 +967,11 @@ def read_file(path: str, max_chars: int = 30000) -> str:
         if not _confirm_outside_workspace(target, "Read file"):
             return "Operation aborted: User did NOT approve reading a file outside the working directory."
 
-        ext = os.path.splitext(target)[1].lower()
-        if ext in {".xlsx", ".xlsm"}:
-            content = _read_excel(target)
-        elif ext == ".pdf":
-            content = _read_pdf(target)
-        elif ext == ".docx":
-            content = _read_docx(target)
-        elif ext == ".pptx":
-            content = _read_pptx(target)
+        reader = _DOC_READERS.get(os.path.splitext(target)[1].lower())
+        if reader:
+            content = reader(target)
         else:
-            with open(target, "r", encoding="utf-8", errors="replace") as f:
+            with _open_text_lenient(target) as f:
                 content = f.read(max_chars + 1)
 
         phi_err = _check_phi_guardrail(target, content)
@@ -798,39 +985,92 @@ def read_file(path: str, max_chars: int = 30000) -> str:
         return f"Error reading file '{path}': {e}"
 
 
-def write_file(path: str, content: str) -> str:
-    """Creates a new file or overwrites an existing file with unified diff preview & confirmation."""
+# ---------------------------------------------------------------------
+# Exact text I/O: an edit must change only the bytes shown in the approved diff.
+# Text-mode open() would rewrite every line ending and turn undecodable bytes into U+FFFD.
+# ---------------------------------------------------------------------
+
+def _decode_exact(raw: bytes) -> tuple[str, str] | None:
+    """(text, encoding) such that text.encode(encoding) == raw, or None when the bytes are not UTF-8 or
+    BOM-marked UTF-16. A BOM stays in the text as U+FEFF so it survives the round trip."""
+    enc = "utf-16-le" if raw.startswith(b"\xff\xfe") else "utf-16-be" if raw.startswith(b"\xfe\xff") else "utf-8"
     try:
-        target, err = _resolve_model_path(path)
+        return raw.decode(enc), enc
+    except UnicodeDecodeError:
+        return None
+
+
+def _dominant_newline(text: str) -> str:
+    """The line ending a file mostly uses; the platform default when it has none."""
+    crlf = text.count("\r\n")
+    lf = text.count("\n") - crlf
+    if not crlf and not lf:
+        return os.linesep
+    return "\r\n" if crlf > lf else "\n"
+
+
+def _raw_index(text: str, norm_index: int) -> int:
+    """Index in text that corresponds to norm_index in text.replace('\r\n', '\n')."""
+    i = n = 0
+    while n < norm_index:
+        i += 2 if text.startswith("\r\n", i) else 1
+        n += 1
+    return i
+
+
+def _read_bytes_or_none(path: str) -> bytes | None:
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _open_text_lenient(path: str):
+    """Text stream for reading only: UTF-16 when BOM-marked, otherwise UTF-8 (BOM dropped), bad bytes replaced."""
+    with open(path, "rb") as f:
+        head = f.read(2)
+    enc = "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+    return open(path, "r", encoding=enc, errors="replace")
+
+
+@tool(
+    "Writing file",
+    path="Relative or absolute path to the file to create/overwrite.",
+    content="The exact plaintext or code content to write into the file.",
+)
+def write_file(path: str, content: str) -> str:
+    """Create a new file or completely overwrite an existing file with content."""
+    try:
+        target, err = _guard_write(path)
         if err:
             return err
-        if _is_protected_path(target):
-            return "Security Error: Writing to system folders is strictly prohibited."
-        if _is_sensitive_canon(target):
-            return f"Security Error: Writing to protected path '{path}' is prohibited."
+        if os.path.isdir(target):
+            return f"Error: '{path}' is a directory."
 
-        old_content = ""
-        is_overwrite = os.path.exists(target)
-        if is_overwrite and os.path.isfile(target):
-            try:
-                with open(target, "r", encoding="utf-8", errors="replace") as f:
-                    old_content = f.read()
-            except OSError:
-                old_content = ""
+        # An existing text file keeps its own encoding, BOM and line endings; a new one gets the platform default.
+        before = _read_bytes_or_none(target) if os.path.isfile(target) else None
+        decoded = _decode_exact(before) if before is not None else None
+        old_text, enc = decoded if decoded else ("", "utf-8")
+        body = content.replace("\r\n", "\n")
+        if old_text.startswith("﻿") and not body.startswith("﻿"):
+            body = "﻿" + body
+        out = body.replace("\n", _dominant_newline(old_text)).encode(enc)
 
-        diff_str = build_unified_diff(old_content, content, target)
-        action = f"Overwrite file: {target}" if is_overwrite else f"Create new file: {target}"
+        action = f"Overwrite file: {target}" if before is not None else f"Create new file: {target}"
         detail = f"[dim]Size: {len(content)} chars ({len(content.splitlines())} lines)[/dim]"
+        if before is not None and decoded is None:
+            detail += "\n  [bold yellow]The existing file is not UTF-8 text; all of it will be replaced.[/bold yellow]"
+        diff_str = build_unified_diff(old_text.replace("\r\n", "\n"), body, target)
 
-        if not APPROVAL_HANDLER.request_approval(action, detail_text=detail, diff_text=diff_str):
-            return "Operation aborted: User did NOT approve the file write."
-
-        err = _recheck_after_approval(target)
+        err = _approve_and_recheck(target, action, detail, diff_str)
         if err:
             return err
+        if (_read_bytes_or_none(target) if os.path.isfile(target) else None) != before:
+            return "Security Error: file changed between preview and write; write aborted. Re-run to see the new diff."
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(content)
+        with open(target, "wb") as f:
+            f.write(out)
 
         console.print(f"[bold green]✓ File written: {escape(target)}[/bold green]\n")
         return f"Success: File written successfully to {target}"
@@ -838,39 +1078,62 @@ def write_file(path: str, content: str) -> str:
         return f"Error writing file '{path}': {e}"
 
 
+@tool(
+    "Editing file",
+    path="Relative or absolute path to the file to edit.",
+    old_text="The exact string block currently in the file that you want to replace.",
+    new_text="The replacement string block to insert.",
+)
 def edit_file(path: str, old_text: str, new_text: str) -> str:
-    """Replaces a specific block of text/code inside an existing file with unified diff preview."""
+    """Search and replace a specific block of text/code within an existing file."""
     try:
-        target, err = _resolve_model_path(path)
+        target, err = _guard_write(path)
         if err:
             return err
-        if not os.path.exists(target):
+        if not os.path.isfile(target):
             return f"Error: File not found: {path}"
-        if _is_protected_path(target) or _is_sensitive_canon(target):
-            return "Security Error: Editing protected or system files is strictly prohibited."
 
-        with open(target, "r", encoding="utf-8", errors="replace") as f:
-            file_content = f.read()
+        before = _read_bytes_or_none(target)
+        decoded = _decode_exact(before) if before is not None else None
+        if decoded is None:
+            return (
+                f"Error: '{path}' is not valid UTF-8 (or BOM-marked UTF-16) text, so it cannot be edited "
+                "without corrupting it. No changes made."
+            )
+        text, enc = decoded
 
-        if old_text not in file_content:
+        # Match with line endings normalized (the model writes \n), then splice into the original text so every
+        # byte outside the replaced span, including each untouched line ending, is preserved.
+        norm = text.replace("\r\n", "\n")
+        old_n = old_text.replace("\r\n", "\n")
+        new_n = new_text.replace("\r\n", "\n")
+        if not old_n:
+            return "Error: 'old_text' is empty. No changes made."
+        if old_n == new_n:
+            return "Error: 'old_text' and 'new_text' are identical. No changes made."
+        hits = norm.count(old_n)
+        if hits == 0:
             return "Error: Target text block ('old_text') was not found in the file. No changes made."
+        if hits > 1:
+            return (
+                f"Error: 'old_text' matches {hits} places in the file. Include more surrounding lines so it "
+                "identifies exactly one. No changes made."
+            )
 
-        updated_content = file_content.replace(old_text, new_text, 1)
-        diff_str = build_unified_diff(file_content, updated_content, target)
+        at = norm.index(old_n)
+        start, end = _raw_index(text, at), _raw_index(text, at + len(old_n))
+        updated = text[:start] + new_n.replace("\n", _dominant_newline(text)) + text[end:]
+        diff_str = build_unified_diff(norm, norm[:at] + new_n + norm[at + len(old_n):], target)
 
-        if not APPROVAL_HANDLER.request_approval(f"Edit file: {target}", diff_text=diff_str):
-            return "Operation aborted: User did NOT approve the file edit."
-
-        err = _recheck_after_approval(target)
+        err = _approve_and_recheck(target, f"Edit file: {target}", diff=diff_str)
         if err:
             return err
         # The approved diff must describe the bytes actually on disk; re-read and compare before writing.
-        with open(target, "r", encoding="utf-8", errors="replace") as f:
-            if f.read() != file_content:
-                return "Security Error: file changed between preview and write; edit aborted. Re-run to see the new diff."
+        if _read_bytes_or_none(target) != before:
+            return "Security Error: file changed between preview and write; edit aborted. Re-run to see the new diff."
 
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(updated_content)
+        with open(target, "wb") as f:
+            f.write(updated.encode(enc))
 
         console.print(f"[bold green]✓ File edited: {escape(target)}[/bold green]\n")
         return f"Success: File edited successfully at {target}"
@@ -882,8 +1145,11 @@ SHELL_TIMEOUT_SECONDS = 120
 MAX_SHELL_OUTPUT_CHARS = 20000
 
 
+@tool("Running PowerShell", command="The PowerShell command line to execute.")
 def run_powershell(command: str) -> str:
-    """Runs a PowerShell command in the current working directory (requires manual user confirmation)."""
+    """Run a PowerShell command on the user's local PC in the current working directory (e.g. git, pytest,
+    builds, dir). Returns exit code, stdout and stderr. The user must manually approve every command, so keep
+    each one purposeful."""
     try:
         # Windows PowerShell treats a bare CR (and other C0 controls rich would drop from the panel) as a
         # statement separator, so a hidden second statement could ride behind the displayed one. Normalize
@@ -902,6 +1168,7 @@ def run_powershell(command: str) -> str:
                 f"[bold cyan]{escape(_visible_controls(command))}[/bold cyan]\n"
                 f"[dim]Interpreter: {escape(shell)}[/dim]"
             ),
+            always_ask=True,  # every command is its own decision; "approve all" never covers the shell
         ):
             return "Operation aborted: User did NOT approve running the command."
 
@@ -937,7 +1204,7 @@ def run_powershell(command: str) -> str:
 
 
 # =====================================================================
-# STEP 2: NATIVE WIN32 CLIPBOARD & OPEN_FILE LAUNCHER
+# WIN32 CLIPBOARD AND OPEN_FILE LAUNCHER
 # =====================================================================
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -967,36 +1234,67 @@ _CF_UNICODETEXT = 13
 _GMEM_MOVEABLE = 0x0002
 
 
-def read_clipboard(max_chars: int = 30000) -> str:
-    """Reads the current text content from the Windows clipboard."""
+def _clipboard_text_raw() -> str | None:
+    """The clipboard's text exactly as stored ("" when it holds no text), or None if it could not be read."""
     if not _user32.OpenClipboard(None):
-        return "Error: Could not open Windows clipboard (it may be locked by another application)."
+        return None
     try:
         handle = _user32.GetClipboardData(_CF_UNICODETEXT)
         if not handle:
-            return "(Clipboard is empty or does not contain text)"
+            return ""
         ptr = _kernel32.GlobalLock(handle)
         if not ptr:
-            return "Error: Could not lock clipboard memory."
+            return None
         try:
-            text = ctypes.wstring_at(ptr)
+            return ctypes.wstring_at(ptr)
         finally:
             _kernel32.GlobalUnlock(handle)
     finally:
         _user32.CloseClipboard()
 
+
+@tool("Reading clipboard")
+def read_clipboard(max_chars: int = 30000) -> str:
+    """Read the text currently copied to the user's Windows clipboard. Ideal when the user copies an email,
+    paragraph, table, or snippet and asks you to summarize, fix, or act on it."""
+    text = _clipboard_text_raw()
+    if text is None:
+        return "Error: Could not read the Windows clipboard (it may be locked by another application)."
+    if not text:
+        return "(Clipboard is empty or does not contain text)"
+
     phi_err = _check_phi_guardrail("clipboard", text)
     if phi_err:
         return phi_err
+
+    # The clipboard often holds something copied for another purpose (a password, a private message), so
+    # the user sees what is about to be sent before the model does.
+    lines = text.splitlines()
+    peek = [ln[:80] + ("..." if len(ln) > 80 else "") for ln in lines[:3]]
+    if len(lines) > 3:
+        peek.append(f"... (+{len(lines) - 3} more lines)")
+    if not APPROVAL_HANDLER.request_approval(
+        "Send clipboard text to the model",
+        detail_text=f"[dim]{len(text)} characters:[/dim]\n[cyan]" + escape(_visible_controls("\n".join(peek))) + "[/cyan]",
+    ):
+        return "Operation aborted: User did NOT approve reading the clipboard."
 
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n... [Clipboard truncated at {max_chars} chars]"
     return text if text.strip() else "(Clipboard contains only whitespace)"
 
 
+@tool("Copying to clipboard", text="The text to place onto the Windows clipboard.")
 def write_clipboard(text: str) -> str:
-    """Writes text directly to the Windows clipboard."""
+    """Copy text directly onto the user's Windows clipboard so they can immediately Ctrl+V paste it into
+    Outlook, Word, or Teams."""
     try:
+        # What lands on the clipboard gets pasted somewhere later, possibly into a terminal
+        if not APPROVAL_HANDLER.request_approval(
+            "Copy to clipboard",
+            detail_text="[cyan]" + escape(_visible_controls(_head_lines(text, 40))) + "[/cyan]",
+        ):
+            return "Operation aborted: User did NOT approve writing to the clipboard."
         data = text.encode("utf-16-le") + b"\x00\x00"
         h_mem = _kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
         if not h_mem:
@@ -1036,8 +1334,10 @@ ALLOWED_OPEN_EXTENSIONS = {
 }
 
 
+@tool("Opening file", path="Relative or absolute path to the document or folder to open.")
 def open_file(path: str) -> str:
-    """Opens a document or folder in its default Windows application (Word, Excel, PDF reader, Explorer)."""
+    """Launch/open a document or folder in its default Windows application (e.g., Word, Excel, PDF reader, File
+    Explorer) after creating or updating it so the user can review it immediately."""
     try:
         target, err = _resolve_model_path(path)
         if err:
@@ -1052,10 +1352,8 @@ def open_file(path: str) -> str:
         if _is_sensitive_canon(target):
             return f"Security Error: Cannot open protected file '{path}'."
 
-        if not APPROVAL_HANDLER.request_approval(f"Open in default Windows app: {target}"):
-            return "Operation aborted: User declined to open the file."
-
-        err = _recheck_after_approval(target)
+        # Opening is not a write, so a document under Program Files may be opened
+        err = _approve_and_recheck(target, f"Open in default Windows app: {target}", writing=False)
         if err:
             return err
         os.startfile(target)
@@ -1065,7 +1363,7 @@ def open_file(path: str) -> str:
         return f"Error opening '{path}': {e}"
 
 # =====================================================================
-# STEP 3: OFFICE DOCUMENT GENERATION & EDITING (.docx & .xlsx)
+# OFFICE DOCUMENT GENERATION AND EDITING (.docx, .xlsx)
 # =====================================================================
 
 def _add_formatted_runs(paragraph, text: str):
@@ -1079,25 +1377,25 @@ def _add_formatted_runs(paragraph, text: str):
             paragraph.add_run(part)
 
 
+@tool(
+    "Creating Word document",
+    path="Output path for the .docx file.",
+    title="Optional document title heading at the top of the page.",
+    content="Markdown-formatted body content to render into the Word document.",
+)
 def write_docx(path: str, content: str, title: str = "") -> str:
-    """Creates or overwrites a Word (.docx) document from Markdown-formatted text (headings, bullets, bold, tables)."""
+    """Create or overwrite a Microsoft Word (.docx) document from Markdown-formatted text. Supports #/##/###
+    headings, bullet lists (- ), numbered lists (1. ), **bold** text, and Markdown tables (| col | col |)."""
     try:
-        target, err = _resolve_model_path(path)
+        target, err = _guard_write(path, ext=(".docx",))
         if err:
             return err
-        if not target.lower().endswith(".docx"):
-            target += ".docx"
-        if _is_protected_path(target) or _is_sensitive_canon(target):
-            return "Security Error: Writing to protected or system paths is prohibited."
 
         action = f"Overwrite Word document: {target}" if os.path.exists(target) else f"Create Word document: {target}"
         # The approved preview must contain every model-controlled element that will be written, title included.
         preview_body = f"# {title.strip()}\n\n{content}" if title.strip() else content
         preview_diff = build_unified_diff("", preview_body, target)
-        if not APPROVAL_HANDLER.request_approval(action, diff_text=preview_diff):
-            return "Operation aborted: User did NOT approve creating the Word document."
-
-        err = _recheck_after_approval(target)
+        err = _approve_and_recheck(target, action, diff=preview_diff)
         if err:
             return err
 
@@ -1169,33 +1467,35 @@ def write_docx(path: str, content: str, title: str = "") -> str:
         return f"Error writing Word document '{path}': {e}"
 
 
+@tool(
+    "Filling Word template",
+    template_path="Path to the existing .docx template file.",
+    output_path="Path where the filled .docx file should be saved.",
+    replacements="Key-value dictionary mapping exact placeholder strings to their replacement text.",
+)
 def fill_docx_template(template_path: str, output_path: str, replacements: dict) -> str:
-    """Fills placeholders (e.g. '{{NAME}}': 'TSgt Davis') in an existing .docx template and saves to output_path."""
+    """Fill placeholders (such as '{{DATE}}', '{{SUBJECT}}', '[NAME]') inside an existing Word (.docx) template
+    (preserving headers, footers, tables, and formatting) and save to a new .docx file."""
     try:
         src, err = _resolve_model_path(template_path)
         if err:
             return err
-        dst, err = _resolve_model_path(output_path)
+        dst, err = _guard_write(output_path, ext=(".docx",))
         if err:
             return err
-        if not dst.lower().endswith(".docx"):
-            dst += ".docx"
-        if not os.path.exists(src):
+        if not os.path.isfile(src):
             return f"Error: Template file not found: {template_path}"
-        if _is_sensitive_canon(src) or _is_sensitive_canon(dst) or _is_protected_path(dst):
-            return "Security Error: Template or output path is restricted."
+        if _is_sensitive_canon(src):
+            return f"Security Error: Template '{template_path}' is a protected file."
 
         summary_lines = [f"Template: {src}", f"Output:   {dst}", "Replacements:"]
         for k, v in replacements.items():
             summary_lines.append(f"  {k}  -->  {v}")
 
-        if not APPROVAL_HANDLER.request_approval(
-            f"Fill Word template -> {dst}",
-            detail_text="[dim]" + escape(_visible_controls("\n".join(summary_lines))) + "[/dim]",
-        ):
-            return "Operation aborted: User did NOT approve filling the Word template."
-
-        err = _recheck_after_approval(dst)
+        err = _approve_and_recheck(
+            dst, f"Fill Word template -> {dst}",
+            detail="[dim]" + escape(_visible_controls("\n".join(summary_lines))) + "[/dim]",
+        )
         if err:
             return err
 
@@ -1234,24 +1534,39 @@ def fill_docx_template(template_path: str, output_path: str, replacements: dict)
     except Exception as e:
         return f"Error filling Word template: {e}"
 
+@tool(
+    "Updating Excel workbook",
+    path="Path to the .xlsx file (created automatically if it does not exist).",
+    sheet_name="Optional target worksheet name (defaults to active sheet, or creates sheet if missing).",
+    append_rows="Optional list of rows (each row is a list of cell values) to append to the bottom of the sheet.",
+    cell_updates="Optional dictionary mapping cell coordinates (like 'A1', 'C5') to new values.",
+)
 def update_excel(
     path: str,
     sheet_name: str = "",
-    append_rows: list[list] | None = None,
+    append_rows: list[list[str]] | None = None,
     cell_updates: dict | None = None,
 ) -> str:
-    """Creates or updates an Excel (.xlsx) workbook by appending rows and/or updating specific cells (e.g. {'B2': 'Done'})."""
+    """Create a new Excel (.xlsx) workbook or update an existing one by appending rows to a sheet and/or setting
+    specific cell coordinates (e.g. {'B4': 'Complete', 'C4': 100})."""
     try:
-        target, err = _resolve_model_path(path)
+        target, err = _guard_write(path, ext=(".xlsx", ".xlsm"))
         if err:
             return err
-        if not target.lower().endswith((".xlsx", ".xlsm")):
-            target += ".xlsx"
-        if _is_protected_path(target) or _is_sensitive_canon(target):
-            return "Security Error: Writing to protected or system paths is prohibited."
 
         exists = os.path.exists(target)
+        is_macro = target.lower().endswith(".xlsm")
+        if is_macro and not exists:
+            return (
+                "Error: a new macro-enabled workbook (.xlsm) cannot be created by this tool; use .xlsx. "
+                "Existing .xlsm workbooks can be updated."
+            )
         preview = [f"Workbook: {target} ({'existing' if exists else 'new file'})"]
+        if exists:
+            preview.append(
+                "Note:     the whole workbook is rewritten. Content the library does not model (shapes, form "
+                "controls, some formatting) can be lost; keep a copy of anything important."
+            )
         if sheet_name:
             preview.append(f"Sheet:    {sheet_name}")
         if append_rows:
@@ -1268,18 +1583,17 @@ def update_excel(
             if len(cell_items) > 25:
                 preview.append(f"  ... (+{len(cell_items) - 25} more cells)")
 
-        if not APPROVAL_HANDLER.request_approval(
-            f"Update Excel workbook: {target}",
-            detail_text="[cyan]" + escape(_visible_controls("\n".join(preview))) + "[/cyan]",
-        ):
-            return "Operation aborted: User did NOT approve the Excel update."
-
-        err = _recheck_after_approval(target)
+        err = _approve_and_recheck(
+            target, f"Update Excel workbook: {target}",
+            detail="[cyan]" + escape(_visible_controls("\n".join(preview))) + "[/cyan]",
+        )
         if err:
             return err
 
         if exists:
-            wb = load_workbook(target)
+            # Without keep_vba the macro project is dropped and the file is saved as a plain workbook under an
+            # .xlsm name, which Excel then refuses to open.
+            wb = load_workbook(target, keep_vba=is_macro)
             if sheet_name:
                 ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(title=sheet_name)
             else:
@@ -1318,25 +1632,32 @@ def update_excel(
         return f"Error updating Excel file '{path}': {e}"
 
 # =====================================================================
-# STEP 4: SMART FILE & OFFICE CONTENT SEARCH (search_files)
+# FILE AND DOCUMENT CONTENT SEARCH
 # =====================================================================
 
 SEARCHABLE_TEXT_EXTS = {
     ".txt", ".md", ".csv", ".json", ".py", ".ps1", ".bat", ".cmd",
     ".yaml", ".yml", ".toml", ".ini", ".cfg", ".log", ".xml", ".html", ".js", ".ts",
 }
-SEARCHABLE_OFFICE_EXTS = {".docx", ".xlsx", ".xlsm", ".pdf", ".pptx"}
 MAX_OFFICE_PARSE_FILES = 40
 MAX_SEARCH_FILE_BYTES = 15 * 1024 * 1024  # 15 MB
 
 
+@tool(
+    "Searching files",
+    path="Root directory to search from (default is current directory '.').",
+    query="Optional case-insensitive text or keyword to search for inside files and filenames.",
+    file_pattern="Optional filename filter or glob pattern (e.g. '*.docx', '*.xlsx', '*memo*', default '*').",
+    max_results="Maximum number of matching files to return (default 30).",
+)
 def search_files(
     path: str = ".",
     query: str = "",
     file_pattern: str = "*",
     max_results: int = 30,
 ) -> str:
-    """Searches for files by filename pattern and/or text query (including inside .docx, .xlsx, .pdf, .pptx)."""
+    """Search recursively across a directory tree by filename pattern and/or inside file contents (searches
+    plaintext, code, CSV, Word .docx, Excel .xlsx, PDF .pdf, and PowerPoint .pptx in one call)."""
     try:
         root_dir, err = _resolve_model_path(path)
         if err:
@@ -1345,9 +1666,12 @@ def search_files(
             return f"Error: Search path does not exist: {path}"
         if not os.path.isdir(root_dir):
             return f"Error: Search path is not a directory: {path}"
+        if _is_sensitive_canon(root_dir):
+            return f"Security Error: '{path}' is a protected location and will not be searched."
         if not _confirm_outside_workspace(root_dir, "Search files"):
             return "Operation aborted: User did NOT approve searching outside the working directory."
 
+        max_results = max(1, min(int(max_results), 100))
         q_lower = query.strip().lower()
         pat_lower = (file_pattern.strip() or "*").lower()
         results = []
@@ -1407,22 +1731,15 @@ def search_files(
                 if ext in SEARCHABLE_TEXT_EXTS:
                     files_scanned += 1
                     try:
-                        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                        with _open_text_lenient(full_path) as f:
                             text_to_scan = f.read(200_000)
                     except OSError:
                         pass
-                elif ext in SEARCHABLE_OFFICE_EXTS and office_parsed_count < MAX_OFFICE_PARSE_FILES:
+                elif ext in _DOC_READERS and office_parsed_count < MAX_OFFICE_PARSE_FILES:
                     office_parsed_count += 1
                     files_scanned += 1
                     try:
-                        if ext in {".xlsx", ".xlsm"}:
-                            text_to_scan = _read_excel(full_path)
-                        elif ext == ".pdf":
-                            text_to_scan = _read_pdf(full_path)
-                        elif ext == ".docx":
-                            text_to_scan = _read_docx(full_path)
-                        elif ext == ".pptx":
-                            text_to_scan = _read_pptx(full_path)
+                        text_to_scan = _DOC_READERS[ext](full_path)
                     except Exception:
                         pass
 
@@ -1461,8 +1778,25 @@ def search_files(
         return f"Error searching files in '{path}': {e}"
 
 # =====================================================================
-# STEP 5: CLASSIC OUTLOOK COM TOOLS (STIG-Safe Triage, Calendar, Drafts)
+# CLASSIC OUTLOOK COM TOOLS (inbox triage, calendar, drafts)
 # =====================================================================
+
+def _dev_mode_gate(what: str) -> str | None:
+    """Dev mode talks to the public Gemini API, and mailbox data is real operational data. Returns an abort
+    message unless the user explicitly allows this one read (always None outside dev mode)."""
+    if not DEV_MODE:
+        return None
+    ok = APPROVAL_HANDLER.request_approval(
+        f"DEV MODE: send {what} to the public Gemini API",
+        detail_text=(
+            "[bold yellow]This session is NOT GenAI.mil.[/bold yellow] "
+            f"Approving sends {escape(what)} from this machine's Outlook profile to Google's public API. "
+            "Approve only on a machine with test data."
+        ),
+        always_ask=True,
+    )
+    return None if ok else f"Operation aborted: User did NOT approve sending {what} to the public API in dev mode."
+
 
 def _get_outlook_ns():
     """Returns (Outlook.Application, MAPI Namespace) or raises RuntimeError."""
@@ -1484,13 +1818,23 @@ def _safe_prop(item, prop: str, default=""):
         return default
 
 
+@tool(
+    "Checking Outlook Inbox",
+    max_items="Maximum number of emails to return (default 25, max 100).",
+    unread_only="If true, only return unread emails (default false).",
+    subject_filter="Optional case-insensitive substring to filter email subjects.",
+)
 def list_inbox(
     max_items: int = 25,
     unread_only: bool = False,
     subject_filter: str = "",
 ) -> str:
-    """Lists recent emails in the user's Outlook Inbox using STIG-permitted metadata (Subject, ReceivedTime, Unread, EntryID)."""
+    """List recent emails in the user's Classic Outlook Inbox (returns Subject, ReceivedTime, Unread status,
+    Categories, and EntryID). Supports filtering by unread status or subject keywords."""
     try:
+        gate = _dev_mode_gate("inbox subject lines")
+        if gate:
+            return gate
         _, ns = _get_outlook_ns()
         inbox = ns.GetDefaultFolder(6)  # olFolderInbox = 6
         items = inbox.Items
@@ -1541,28 +1885,42 @@ def list_inbox(
         return f"Error listing Outlook Inbox: {e}"
 
 
+@tool(
+    "Checking Outlook Calendar",
+    days_ahead="Number of days ahead from today to include (default 7).",
+    days_back="Number of days in the past to include (default 0).",
+)
 def get_calendar(days_ahead: int = 7, days_back: int = 0) -> str:
-    """Lists Outlook Calendar appointments/meetings within [today - days_back, today + days_ahead]."""
+    """Read the user's Classic Outlook Calendar appointments and meetings for today and upcoming/past days
+    (returns Subject, Start, End, Location, AllDayEvent, and BusyStatus)."""
     try:
+        gate = _dev_mode_gate("calendar entries")
+        if gate:
+            return gate
         _, ns = _get_outlook_ns()
         cal_folder = ns.GetDefaultFolder(9)  # olFolderCalendar = 9
+        # Outlook only expands recurring meetings when the collection is sorted by Start *before*
+        # IncludeRecurrences is set, and the filter is applied last.
         items = cal_folder.Items
-        items.IncludeRecurrences = True
         items.Sort("[Start]")
+        items.IncludeRecurrences = True
 
         now = datetime.now()
-        start_dt = (now - timedelta(days=max(0, days_back))).replace(hour=0, minute=0, second=0)
+        start_dt = (now - timedelta(days=max(0, min(days_back, 60)))).replace(hour=0, minute=0, second=0)
         end_dt = (now + timedelta(days=max(1, min(days_ahead, 60)))).replace(hour=23, minute=59, second=59)
 
         # Outlook Restrict filter uses US date format MM/DD/YYYY HH:MM AM/PM
         start_str = start_dt.strftime("%m/%d/%Y %I:%M %p")
         end_str = end_dt.strftime("%m/%d/%Y %I:%M %p")
-        restriction = f"[Start] >= '{start_str}' AND [Start] <= '{end_str}'"
+        # Overlap test, so a meeting already in progress at the start of the window is included
+        restriction = f"[End] >= '{start_str}' AND [Start] <= '{end_str}'"
 
         try:
             filtered = items.Restrict(restriction)
-        except Exception:
-            filtered = items
+        except Exception as e:
+            # Never fall back to the unfiltered collection: with recurrences expanded it has no end, and its
+            # first entries would be reported under the requested date range.
+            return f"Error reading Outlook Calendar: the date filter was rejected ({e})."
 
         events = []
         BUSY_MAP = {0: "Free", 1: "Tentative", 2: "Busy", 3: "Out of Office", 4: "Working Elsewhere"}
@@ -1591,8 +1949,14 @@ def get_calendar(days_ahead: int = 7, days_back: int = 0) -> str:
         return f"Error reading Outlook Calendar: {e}"
 
 
+@tool(
+    "Opening Outlook email",
+    entry_id="The exact EntryID string of the email from `list_inbox`.",
+    open_reply_window="If true, opens a Reply draft window for the email instead of just viewing it (default false).",
+)
 def open_email(entry_id: str, open_reply_window: bool = False) -> str:
-    """Pops open a specific Outlook email (or a Reply window for it) on the user's screen using its EntryID."""
+    """Pop open a specific Outlook email (or a Reply window for it) on the user's screen using its EntryID from
+    `list_inbox`."""
     try:
         _, ns = _get_outlook_ns()
         item = ns.GetItemFromID(entry_id.strip())
@@ -1618,19 +1982,26 @@ def open_email(entry_id: str, open_reply_window: bool = False) -> str:
         return f"Error opening Outlook email '{entry_id}': {e}"
 
 
+@tool(
+    "Creating Outlook draft",
+    subject="Subject line for the draft email.",
+    body="Plaintext body of the draft email.",
+    to_hint="Optional recipient email address or name.",
+)
 def create_draft_email(subject: str, body: str, to_hint: str = "") -> str:
-    """Creates a new draft email in Classic Outlook and displays it on screen for the user to review and send (never auto-sends)."""
+    """Create a new draft email in Classic Outlook and pop it open on the user's screen ready for review and
+    manual sending. Never auto-sends."""
     try:
         app, _ = _get_outlook_ns()
         preview_lines = [f"Subject: {subject}"]
         if to_hint:
             preview_lines.append(f"Intended Recipient(s) (add in Outlook To: line): {to_hint}")
         preview_lines.append("--- Draft Body ---")
-        preview_lines.append(body)
+        preview_lines.append(_head_lines(body, 40))
 
         if not APPROVAL_HANDLER.request_approval(
             f"Create Outlook Draft: {subject}",
-            detail_text="[cyan]" + escape(_visible_controls("\n".join(preview_lines[:40]))) + "[/cyan]",
+            detail_text="[cyan]" + escape(_visible_controls("\n".join(preview_lines))) + "[/cyan]",
         ):
             return "Operation aborted: User did NOT approve creating the Outlook draft."
 
@@ -1653,449 +2024,38 @@ def create_draft_email(subject: str, body: str, to_hint: str = "") -> str:
         return f"Error creating Outlook draft: {e}"
 
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "list_directory",
-            "description": "List files and folders in a directory on the user's local PC. Defaults to current working directory '.'.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative or absolute directory path to list (default is '.').",
-                    }
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read the contents of a file on the user's local PC. Supports plaintext, code, CSV, Excel (.xlsx/.xlsm), PDF (.pdf), Word (.docx), and PowerPoint (.pptx).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative or absolute path to the file to read.",
-                    }
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Create a new file or completely overwrite an existing file with content.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative or absolute path to the file to create/overwrite.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The exact plaintext or code content to write into the file.",
-                    },
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": "Search and replace a specific block of text/code within an existing file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative or absolute path to the file to edit.",
-                    },
-                    "old_text": {
-                        "type": "string",
-                        "description": "The exact string block currently in the file that you want to replace.",
-                    },
-                    "new_text": {
-                        "type": "string",
-                        "description": "The replacement string block to insert.",
-                    },
-                },
-                "required": ["path", "old_text", "new_text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_powershell",
-            "description": (
-                "Run a PowerShell command on the user's local PC in the current working directory "
-                "(e.g. git, pytest, builds, dir). Returns exit code, stdout and stderr. "
-                "The user must manually approve every command, so keep each one purposeful."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The PowerShell command line to execute.",
-                    }
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_clipboard",
-            "description": (
-                "Read the text currently copied to the user's Windows clipboard. "
-                "Ideal when the user copies an email, paragraph, table, or snippet and asks you to summarize, fix, or act on it."
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_clipboard",
-            "description": (
-                "Copy text directly onto the user's Windows clipboard so they can immediately Ctrl+V paste it into Outlook, Word, or Teams."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "The text to place onto the Windows clipboard.",
-                    }
-                },
-                "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "open_file",
-            "description": (
-                "Launch/open a document or folder in its default Windows application (e.g., Word, Excel, PDF reader, File Explorer) "
-                "after creating or updating it so the user can review it immediately."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative or absolute path to the document or folder to open.",
-                    }
-                },
-                "required": ["path"],
-            },
-        },
-    },
-        {
-        "type": "function",
-        "function": {
-            "name": "write_docx",
-            "description": (
-                "Create or overwrite a Microsoft Word (.docx) document from Markdown-formatted text. "
-                "Supports #/##/### headings, bullet lists (- ), numbered lists (1. ), **bold** text, and Markdown tables (| col | col |)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Output path for the .docx file.",
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Optional document title heading at the top of the page.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Markdown-formatted body content to render into the Word document.",
-                    },
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fill_docx_template",
-            "description": (
-                "Fill placeholders (such as '{{DATE}}', '{{SUBJECT}}', '[NAME]') inside an existing Word (.docx) "
-                "template (preserving headers, footers, tables, and formatting) and save to a new .docx file."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "template_path": {
-                        "type": "string",
-                        "description": "Path to the existing .docx template file.",
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Path where the filled .docx file should be saved.",
-                    },
-                    "replacements": {
-                        "type": "object",
-                        "description": "Key-value dictionary mapping exact placeholder strings to their replacement text.",
-                    },
-                },
-                "required": ["template_path", "output_path", "replacements"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_excel",
-            "description": (
-                "Create a new Excel (.xlsx) workbook or update an existing one by appending rows to a sheet "
-                "and/or setting specific cell coordinates (e.g. {'B4': 'Complete', 'C4': 100})."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the .xlsx file (created automatically if it does not exist).",
-                    },
-                    "sheet_name": {
-                        "type": "string",
-                        "description": "Optional target worksheet name (defaults to active sheet, or creates sheet if missing).",
-                    },
-                    "append_rows": {
-                        "type": "array",
-                        "items": {"type": "array", "items": {"type": "string"}},
-                        "description": "Optional list of rows (each row is a list of cell values) to append to the bottom of the sheet.",
-                    },
-                    "cell_updates": {
-                        "type": "object",
-                        "description": "Optional dictionary mapping cell coordinates (like 'A1', 'C5') to new values.",
-                    },
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_files",
-            "description": (
-                "Search recursively across a directory tree by filename pattern and/or inside file contents "
-                "(searches plaintext, code, CSV, Word .docx, Excel .xlsx, PDF .pdf, and PowerPoint .pptx in one call)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Root directory to search from (default is current directory '.').",
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Optional case-insensitive text or keyword to search for inside files and filenames.",
-                    },
-                    "file_pattern": {
-                        "type": "string",
-                        "description": "Optional filename filter or glob pattern (e.g. '*.docx', '*.xlsx', '*memo*', default '*').",
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of matching files to return (default 30).",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-        {
-        "type": "function",
-        "function": {
-            "name": "list_inbox",
-            "description": (
-                "List recent emails in the user's Classic Outlook Inbox (returns Subject, ReceivedTime, Unread status, Categories, and EntryID). "
-                "Supports filtering by unread status or subject keywords."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "max_items": {
-                        "type": "integer",
-                        "description": "Maximum number of emails to return (default 25, max 100).",
-                    },
-                    "unread_only": {
-                        "type": "boolean",
-                        "description": "If true, only return unread emails (default false).",
-                    },
-                    "subject_filter": {
-                        "type": "string",
-                        "description": "Optional case-insensitive substring to filter email subjects.",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_calendar",
-            "description": (
-                "Read the user's Classic Outlook Calendar appointments and meetings for today and upcoming/past days "
-                "(returns Subject, Start, End, Location, AllDayEvent, and BusyStatus)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "days_ahead": {
-                        "type": "integer",
-                        "description": "Number of days ahead from today to include (default 7).",
-                    },
-                    "days_back": {
-                        "type": "integer",
-                        "description": "Number of days in the past to include (default 0).",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "open_email",
-            "description": (
-                "Pop open a specific Outlook email (or a Reply window for it) on the user's screen using its EntryID from `list_inbox`."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "entry_id": {
-                        "type": "string",
-                        "description": "The exact EntryID string of the email from `list_inbox`.",
-                    },
-                    "open_reply_window": {
-                        "type": "boolean",
-                        "description": "If true, opens a Reply draft window for the email instead of just viewing it (default false).",
-                    },
-                },
-                "required": ["entry_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_draft_email",
-            "description": (
-                "Create a new draft email in Classic Outlook and pop it open on the user's screen ready for review and manual sending. "
-                "Never auto-sends."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "subject": {
-                        "type": "string",
-                        "description": "Subject line for the draft email.",
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Plaintext body of the draft email.",
-                    },
-                    "to_hint": {
-                        "type": "string",
-                        "description": "Optional recipient email address or name.",
-                    },
-                },
-                "required": ["subject", "body"],
-            },
-        },
-    },
-]
-
-AVAILABLE_FUNCTIONS = {
-    "list_directory": list_directory,
-    "read_file": read_file,
-    "write_file": write_file,
-    "edit_file": edit_file,
-    "run_powershell": run_powershell,
-    "read_clipboard": read_clipboard,
-    "write_clipboard": write_clipboard,
-    "open_file": open_file,
-    "write_docx": write_docx,
-    "fill_docx_template": fill_docx_template,
-    "update_excel": update_excel,
-    "search_files": search_files,
-    "list_inbox": list_inbox,
-    "get_calendar": get_calendar,
-    "open_email": open_email,
-    "create_draft_email": create_draft_email,
-
-}
-
-
 # =====================================================================
-# 2. SYSTEM PROMPT & AGENT STREAMING LOOP
+# SYSTEM PROMPT AND AGENT STREAMING LOOP
 # =====================================================================
 
-DEFAULT_SYSTEM_PROMPT = """# Identity & Role
-Your name is **Eustace** (**E**lectronic **U**tility for **S**cripting, **T**asking, and **A**utomated **C**ommand **E**xecution). You are a sharp, personable, and collaborative CLI coding and operational sidekick running locally on the user's Windows workstation.
-
-# Personality & Tone
-- **Warm & Approachable:** Be conversational, natural, and friendly, like a trusted teammate at the next desk. A little dry wit is welcome.
-- **Action-Oriented on Tasks:** When writing code, debugging, or answering technical questions, be clear, structured, and get straight to the solution (BLUF).
-
-# Core Directives
-1. **Use Local Tools Proactively:** You have direct access to the user's PC via `list_directory`, `read_file`, `read_clipboard`, and `write_clipboard`. Inspect files or clipboard contents yourself rather than asking the user to paste them.
-2. **Environment Awareness:** The user is on Windows with PowerShell. Tailor shell commands for PowerShell.
-3. **Write and Edit Files Safely:** You have `write_file`, `edit_file`, and `open_file`. Explain what you are about to change before calling them. The user sees a unified diff and must approve every write/edit.
-4. **Run Commands Deliberately:** You can execute PowerShell via `run_powershell`. The user must approve every command, so prefer single, purposeful commands and state your intent first. Secrets files (`.env`, keys, certificates, credentials) are blocked from `read_file`; do not try to work around that.
-"""
-
+# The persona lives in system_prompt.md: the user's copy in the Eustace home (setup.ps1 puts it there and it is
+# theirs to edit), else the one shipped beside this file when running from a source checkout.
 GLOBAL_PROMPT_PATH = os.path.join(EUSTACE_HOME, "system_prompt.md")
+BUNDLED_PROMPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.md")
+FALLBACK_SYSTEM_PROMPT = (
+    "You are Eustace, a CLI assistant running locally on the user's Windows workstation. Be clear and direct. "
+    "Use your tools to inspect local files yourself instead of asking the user to paste them, and say what you "
+    "are about to change before writing files or running commands."
+)
 
 
-def _ensure_global_prompt() -> str:
-    """Makes sure ~/.eustace/system_prompt.md exists."""
-    if not os.path.exists(GLOBAL_PROMPT_PATH):
-        os.makedirs(EUSTACE_HOME, exist_ok=True)
-        local_prompt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.md")
-        if os.path.exists(local_prompt_file):
-            shutil.copyfile(local_prompt_file, GLOBAL_PROMPT_PATH)
-        else:
-            with open(GLOBAL_PROMPT_PATH, "w", encoding="utf-8") as f:
-                f.write(DEFAULT_SYSTEM_PROMPT)
-        console.print(f"[dim]Created persona file at {escape(GLOBAL_PROMPT_PATH)} (edit it to customize Eustace)[/dim]")
-    return GLOBAL_PROMPT_PATH
+def _load_persona() -> str:
+    for path in (GLOBAL_PROMPT_PATH, BUNDLED_PROMPT_PATH):
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                text = f.read().strip()
+            if text:
+                return text
+        except OSError:
+            continue
+    console.print(f"[dim yellow]No persona file at {escape(GLOBAL_PROMPT_PATH)}; using the built-in default.[/dim yellow]")
+    return FALLBACK_SYSTEM_PROMPT
 
 
 def build_system_prompt() -> str:
     """Loads global system_prompt.md from ~/.eustace/ and optional local AGENT.md."""
     cwd = os.getcwd()
-    try:
-        with open(_ensure_global_prompt(), "r", encoding="utf-8") as f:
-            base_prompt = f.read().strip()
-    except OSError as e:
-        console.print(f"[dim yellow]Could not load persona file ({escape(str(e))}); using built-in default.[/dim yellow]")
-        base_prompt = DEFAULT_SYSTEM_PROMPT.strip()
+    base_prompt = _load_persona()
 
     tool_names = ", ".join(f"`{name}`" for name in AVAILABLE_FUNCTIONS.keys())
     if DEV_MODE:
@@ -2151,21 +2111,6 @@ MAX_AGENT_MD_BYTES = 16 * 1024
 _AGENT_MD_SESSION_DENIED: dict[str, str] = {}  # realpath -> sha256 declined for this process
 
 
-def _read_config() -> dict:
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _write_config(data: dict) -> None:
-    os.makedirs(EUSTACE_HOME, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
 def _git_root(start: str) -> str | None:
     probe = start
     while True:
@@ -2211,9 +2156,10 @@ def _load_trusted_agent_md(path: str) -> str | None:
         return None
     key = os.path.normcase(os.path.realpath(path))
 
-    cfg = _read_config()
-    trusted = cfg.get("trusted_agent_md", {})
-    if isinstance(trusted, dict) and trusted.get(key) == digest:
+    trusted = _read_config().get("trusted_agent_md")
+    if not isinstance(trusted, dict):
+        trusted = {}
+    if trusted.get(key) == digest:
         return text
     if _AGENT_MD_SESSION_DENIED.get(key) == digest:
         return None
@@ -2236,14 +2182,7 @@ def _load_trusted_agent_md(path: str) -> str | None:
     console.print("  [bold yellow]Trust this file and load it as instructions? (y/N):[/bold yellow] ", end="")
     choice = input().strip().lower()
     if choice in ("y", "yes"):
-        if not isinstance(trusted, dict):
-            trusted = {}
-        trusted[key] = digest
-        cfg["trusted_agent_md"] = trusted
-        try:
-            _write_config(cfg)
-        except OSError:
-            pass
+        _update_config(trusted_agent_md={**trusted, key: digest})
         return text
     _AGENT_MD_SESSION_DENIED[key] = digest
     console.print(f"  [dim]Skipped {escape(path)} for this session.[/dim]")
@@ -2310,28 +2249,15 @@ def check_user_abort():
                 raise KeyboardInterrupt("Aborted via ESC key")
 
 
+def _render_markdown(text: str) -> Markdown:
+    """Model text as Markdown with control characters exposed. hyperlinks=False prints each link's URL beside its
+    text instead of hiding it behind a clickable label, so a link cannot display one destination and open another."""
+    return Markdown(_sanitize_for_display(text), hyperlinks=False)
+
+
 MAX_TOOL_RESULT_CHARS = 30000
+MAX_TOOL_ROUNDS = 40
 ARG_PREVIEW_CHARS = 120
-
-
-TOOL_FRIENDLY_LABELS = {
-    "list_directory": "Listing folder",
-    "read_file": "Reading file",
-    "write_file": "Writing file",
-    "edit_file": "Editing file",
-    "search_files": "Searching files",
-    "open_file": "Opening file",
-    "run_powershell": "Running PowerShell",
-    "read_clipboard": "Reading clipboard",
-    "write_clipboard": "Copying to clipboard",
-    "write_docx": "Creating Word document",
-    "fill_docx_template": "Filling Word template",
-    "update_excel": "Updating Excel workbook",
-    "list_inbox": "Checking Outlook Inbox",
-    "get_calendar": "Checking Outlook Calendar",
-    "open_email": "Opening Outlook email",
-    "create_draft_email": "Creating Outlook draft",
-}
 
 
 def _summarize_args(fn_name: str, fn_args: dict) -> str:
@@ -2363,6 +2289,95 @@ def _tail_lines(text: str, max_lines: int) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+def _accumulate_tool_call(buffer: dict[int, dict], tc) -> None:
+    """Folds one streamed tool-call delta into buffer (position -> call under construction).
+
+    OpenAI-style streams tag every delta with an index. Some compatible endpoints omit it; then a delta that
+    carries a different id, or a function name when the current call already has one, starts a new call and
+    anything else continues the latest one (so arguments split across chunks stay in one call)."""
+    idx = getattr(tc, "index", None)
+    fn = getattr(tc, "function", None)
+    if idx is None:
+        last = max(buffer) if buffer else None
+        if last is None:
+            idx = 0
+        else:
+            cur = buffer[last]
+            new_id = bool(tc.id) and bool(cur["id"]) and tc.id != cur["id"]
+            new_name = bool(fn and fn.name) and bool(cur["function"]["name"])
+            idx = last + 1 if (new_id or new_name) else last
+    entry = buffer.setdefault(idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+    if tc.id:
+        entry["id"] = tc.id
+    if fn:
+        if fn.name:
+            entry["function"]["name"] += fn.name
+        if fn.arguments:
+            entry["function"]["arguments"] += fn.arguments
+    extra = _tool_call_extra(tc)
+    if extra:
+        entry["extra_content"] = extra  # Gemini thought_signature; must be echoed back verbatim
+
+
+def _parse_tool_args(fn_name: str, raw_args: str | None) -> tuple[dict | None, str | None]:
+    """(arguments, None) when the call is well formed for a known tool, else (None, error for the model).
+    Rejects unknown tools, invalid JSON (typically output cut off mid-call), non-object arguments, parameters
+    the tool's schema does not declare, and missing required parameters."""
+    schema = _TOOL_SCHEMAS.get(fn_name)
+    if schema is None:
+        return None, f"Error: Unknown tool '{fn_name}'"
+    try:
+        args = json.loads(raw_args or "{}")
+    except json.JSONDecodeError as je:
+        return None, f"Error: the arguments for '{fn_name}' were not valid JSON ({je}). Nothing was run; send the call again."
+    if not isinstance(args, dict):
+        return None, f"Error: the arguments for '{fn_name}' must be a JSON object. Nothing was run."
+    unknown = sorted(set(args) - set(schema.get("properties", {})))
+    if unknown:
+        return None, f"Error: '{fn_name}' does not accept the parameter(s): {', '.join(unknown)}. Nothing was run."
+    missing = [k for k in schema.get("required", []) if k not in args]
+    if missing:
+        return None, f"Error: '{fn_name}' is missing required parameter(s): {', '.join(missing)}. Nothing was run."
+    return args, None
+
+
+INTERRUPTED_TOOL_NOTE = (
+    "Not completed: the user interrupted the turn. If this call had already started it may have partly run; "
+    "check its effects before retrying."
+)
+
+
+def _close_open_tool_calls(messages: list[dict], turn_start: int) -> None:
+    """Appends a stub result for each tool call of this turn that has none, so every call stays paired with a
+    result (the API rejects a history where one is missing). Tools run in order, so the unanswered calls are
+    always the tail of the last assistant message that requested any."""
+    for i in range(len(messages) - 1, turn_start - 1, -1):
+        calls = messages[i].get("tool_calls") if messages[i].get("role") == "assistant" else None
+        if calls:
+            answered = sum(1 for m in messages[i + 1:] if m.get("role") == "tool")
+            for tc in calls[answered:]:
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": INTERRUPTED_TOOL_NOTE})
+            return
+
+
+def _ran_tool_calls(messages: list[dict], turn_start: int) -> list[str]:
+    """One line per tool call of this turn that produced a result: '- name(args) -> start of result'."""
+    lines, pending = [], []
+    for m in messages[turn_start:]:
+        if m.get("role") == "assistant":
+            pending = list(m.get("tool_calls") or [])
+        elif m.get("role") == "tool" and pending:
+            fn = pending.pop(0)["function"]
+            result = str(m.get("content", "")).replace("\n", " ")
+            lines.append(f"- {fn['name']}({fn['arguments'][:150]}) -> {result[:150]}")
+    return lines
+
+
+def _clear_status_line() -> None:
+    """Blanks the transient 'Thinking...' line written with a carriage return."""
+    print(" " * 70, end="\r", flush=True)
+
+
 def run_agent_turn(messages: list[dict]):
     """Streams responses & tool calls with instant ESC or Ctrl+C cancellation."""
     turn_start_len = len(messages)
@@ -2370,7 +2385,13 @@ def run_agent_turn(messages: list[dict]):
     APPROVAL_HANDLER.reset_turn()
 
     try:
-        while True:
+        for round_no in range(MAX_TOOL_ROUNDS + 1):
+            if round_no == MAX_TOOL_ROUNDS:
+                # Tools that need no approval could otherwise loop without the user ever being asked anything
+                note = f"(Paused after {MAX_TOOL_ROUNDS} rounds of tool calls in one turn. Say \"continue\" to keep going.)"
+                console.print(f"\n  [bold yellow]{escape(note)}[/bold yellow]")
+                messages.append({"role": "assistant", "content": note})
+                break
             check_user_abort()
             console.print("  [dim cyan]Thinking... (press ESC or Ctrl+C to stop)[/dim cyan]", end="\r")
 
@@ -2391,7 +2412,7 @@ def run_agent_turn(messages: list[dict]):
                 for chunk in stream:
                     if first_chunk:
                         first_chunk = False
-                        print(" " * 60, end="\r", flush=True)
+                        _clear_status_line()
 
                     if not chunk.choices:
                         continue
@@ -2416,38 +2437,20 @@ def run_agent_turn(messages: list[dict]):
                         else:
                             live.update(preview)
 
-                    if delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            # Some OpenAI-compatible endpoints omit index on single-call deltas
-                            idx = tc.index if tc.index is not None else len(tool_calls_buffer)
-                            if idx not in tool_calls_buffer:
-                                tool_calls_buffer[idx] = {
-                                    "id": tc.id or "",
-                                    "type": "function",
-                                    "function": {"name": "", "arguments": ""},
-                                }
-                            if tc.id:
-                                tool_calls_buffer[idx]["id"] = tc.id
-                            if tc.function:
-                                if tc.function.name:
-                                    tool_calls_buffer[idx]["function"]["name"] += tc.function.name
-                                if tc.function.arguments:
-                                    tool_calls_buffer[idx]["function"]["arguments"] += tc.function.arguments
-                            extra = _tool_call_extra(tc)
-                            if extra:
-                                tool_calls_buffer[idx]["extra_content"] = extra
+                    for tc in delta.tool_calls or []:
+                        _accumulate_tool_call(tool_calls_buffer, tc)
             finally:
                 if live is not None:
                     live.stop()
                 stream.cancel()
                 if first_chunk:
-                    print(" " * 60, end="\r", flush=True)
+                    _clear_status_line()
 
             if full_reply:
                 console.print()
                 console.print(
                     Panel(
-                        Markdown(_sanitize_for_display(full_reply)),
+                        _render_markdown(full_reply),
                         title=f"[bold cyan]Eustace[/bold cyan] [dim]({short_model_label(MODEL)}{' | DEV' if DEV_MODE else ''})[/dim]",
                         title_align="left",
                         border_style="cyan",
@@ -2483,28 +2486,24 @@ def run_agent_turn(messages: list[dict]):
                 for tc in tool_calls_list:
                     check_user_abort()
                     fn_name = tc["function"]["name"]
-                    raw_args = tc["function"]["arguments"] or "{}"
+                    fn_args, arg_err = _parse_tool_args(fn_name, tc["function"]["arguments"])
 
-                    try:
-                        fn_args = json.loads(raw_args)
-                    except json.JSONDecodeError as je:
-                        console.print(f"[bold red]Error parsing tool arguments JSON:[/bold red] {escape(str(je))}")
-                        fn_args = {}
-
-                    console.print(f"  [yellow]●[/yellow] {_summarize_args(fn_name, fn_args)}")
+                    console.print(f"  [yellow]●[/yellow] {_summarize_args(fn_name, fn_args or {})}")
 
                     APPROVAL_HANDLER.last_decision = "auto"
-                    func = AVAILABLE_FUNCTIONS.get(fn_name)
-                    if func:
+                    APPROVAL_HANDLER.current_tool = fn_name
+                    if arg_err:
+                        # Never run a tool on arguments the model did not actually send
+                        console.print(f"  [bold red]{escape(arg_err)}[/bold red]")
+                        result = arg_err
+                    else:
                         try:
-                            result = func(**fn_args)
+                            result = AVAILABLE_FUNCTIONS[fn_name](**fn_args)
                         except Exception as fe:
                             console.print(f"[bold red]Tool execution error inside '{escape(fn_name)}':[/bold red] {escape(str(fe))}")
                             result = f"Error: Tool execution failed: {fe}"
-                    else:
-                        result = f"Error: Unknown tool '{fn_name}'"
 
-                    log_audit_event(fn_name, fn_args, APPROVAL_HANDLER.last_decision, result)
+                    log_audit_event(fn_name, fn_args or {}, APPROVAL_HANDLER.last_decision, result)
 
                     content = str(result)
                     if len(content) > MAX_TOOL_RESULT_CHARS:
@@ -2525,17 +2524,26 @@ def run_agent_turn(messages: list[dict]):
     except KeyboardInterrupt:
         console.print("\n  [bold red]⏹ Stopped by user[/bold red]")
         if partial_reply:
-            console.print(Markdown(_sanitize_for_display(partial_reply)))
+            console.print(_render_markdown(partial_reply))
             console.print("[dim](partial reply)[/dim]")
-        del messages[turn_start_len:]
-        messages.append({"role": "assistant", "content": "(Response interrupted by the user before completion.)"})
+        # Keep what already happened: tool calls that ran changed real files, and the model must still know.
+        _close_open_tool_calls(messages, turn_start_len)
+        note = "(Response interrupted by the user before completion.)"
+        messages.append({"role": "assistant", "content": f"{partial_reply}\n\n{note}" if partial_reply else note})
     except Exception as e:
-        console.print(f"\n[bold red]System Loop Error:[/bold red] {escape(_format_api_error(e))}")
+        err_line = _format_api_error(e)
+        console.print(f"\n[bold red]System Loop Error:[/bold red] {escape(err_line)}")
         if partial_reply:
-            console.print(Markdown(_sanitize_for_display(partial_reply)))
+            console.print(_render_markdown(partial_reply))
             console.print("[dim](partial reply)[/dim]")
+        # Roll the turn back so a request the API rejected cannot poison every later one, but carry a plain-text
+        # record of the tool calls that did run.
+        ran = _ran_tool_calls(messages, turn_start_len)
         del messages[turn_start_len:]
-        messages.append({"role": "assistant", "content": f"(Response failed with an error: {e})"})
+        note = f"(Response failed with an error: {err_line})"
+        if ran:
+            note += "\nTool calls that completed before the failure:\n" + "\n".join(ran)
+        messages.append({"role": "assistant", "content": note})
 
 
 COMPACT_INSTRUCTION = (
@@ -2550,14 +2558,27 @@ def compact_messages(messages: list[dict]) -> list[dict]:
     if len(messages) <= 1:
         return messages
 
-    console.print("  [dim cyan]Compacting conversation...[/dim cyan]", end="\r")
-    response = client.chat.completions.create(
+    console.print("  [dim cyan]Compacting conversation... (press ESC or Ctrl+C to cancel)[/dim cyan]", end="\r")
+    # Same worker as a normal turn, so ESC cancels. The history contains tool calls, so the tool list must
+    # accompany it; tool_choice "none" makes the model answer in text.
+    worker = _StreamWorker(
         model=MODEL,
         messages=messages + [{"role": "user", "content": COMPACT_INSTRUCTION}],
+        tools=TOOLS,
+        tool_choice="none",
+        stream=True,
     )
-    print(" " * 60, end="\r", flush=True)
+    summary = ""
+    try:
+        for chunk in worker:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta is not None and delta.content:
+                summary += delta.content
+    finally:
+        worker.cancel()
+        _clear_status_line()
 
-    summary = (response.choices[0].message.content or "").strip()
+    summary = summary.strip()
     if not summary:
         raise RuntimeError("Model returned an empty summary; history left unchanged.")
 
@@ -2568,10 +2589,13 @@ def compact_messages(messages: list[dict]) -> list[dict]:
     ]
 
 # =====================================================================
-# STEP 6: PERSISTENT SESSIONS (/save, /resume, /sessions, + Autosave)
+# PERSISTENT SESSIONS (/save, /resume, /sessions, autosave)
 # =====================================================================
 
 SESSIONS_DIR = os.path.join(EUSTACE_HOME, "sessions")
+MAX_AUTOSAVES = 10
+# Each run autosaves to its own file, so starting a new conversation never overwrites the previous one.
+AUTOSAVE_NAME = datetime.now().strftime("auto_%Y%m%d_%H%M%S")
 
 
 def _sanitize_session_name(name: str) -> str:
@@ -2579,10 +2603,9 @@ def _sanitize_session_name(name: str) -> str:
     return clean or datetime.now().strftime("session_%Y%m%d_%H%M%S")
 
 
-def save_session(messages: list[dict], name: str = "autosave", quiet: bool = False) -> str:
-    """Saves non-system conversation messages to ~/.eustace/sessions/<name>.json."""
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-    slug = _sanitize_session_name(name)
+def save_session(messages: list[dict], name: str = "", quiet: bool = False) -> str:
+    """Saves non-system conversation messages to ~/.eustace/sessions/<name>.json (default: this run's autosave)."""
+    slug = _sanitize_session_name(name or AUTOSAVE_NAME)
     path = os.path.join(SESSIONS_DIR, f"{slug}.json")
 
     non_sys = [m for m in messages if m.get("role") != "system"]
@@ -2601,12 +2624,23 @@ def save_session(messages: list[dict], name: str = "autosave", quiet: bool = Fal
         "preview": str(first_user)[:100],
         "messages": non_sys,
     }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _write_json_atomic(path, payload)
+    if slug == AUTOSAVE_NAME:
+        _prune_autosaves()
 
     if not quiet:
-        console.print(f"[dim cyan]✓ Session saved as '[bold]{escape(slug)}[/bold]' ({path})[/dim cyan]")
+        console.print(f"[dim cyan]✓ Session saved as '[bold]{escape(slug)}[/bold]' ({escape(path)})[/dim cyan]")
     return path
+
+
+def _prune_autosaves() -> None:
+    """Keeps the newest MAX_AUTOSAVES per-run autosave files; named sessions are never pruned."""
+    try:
+        autos = sorted(f for f in os.listdir(SESSIONS_DIR) if re.fullmatch(r"auto_\d{8}_\d{6}\.json", f))
+        for stale in autos[:-MAX_AUTOSAVES]:  # the timestamped names sort chronologically
+            os.remove(os.path.join(SESSIONS_DIR, stale))
+    except OSError:
+        pass
 
 
 def list_saved_sessions() -> list[dict]:
@@ -2635,8 +2669,9 @@ def list_saved_sessions() -> list[dict]:
     return items
 
 
-def load_session(target: str = "autosave") -> list[dict] | None:
-    """Loads a saved session by name or 1-based index and prepends the fresh system prompt."""
+def load_session(target: str = "") -> list[dict] | None:
+    """Loads a saved session by name or 1-based index (default: the most recent one from an earlier run)
+    and prepends the fresh system prompt."""
     sessions = list_saved_sessions()
     if not sessions:
         console.print("[dim yellow]No saved sessions found.[/dim yellow]")
@@ -2644,7 +2679,12 @@ def load_session(target: str = "autosave") -> list[dict] | None:
 
     chosen = None
     t = target.strip()
-    if t.isdigit():
+    if not t:
+        chosen = next((s for s in sessions if s["name"] != AUTOSAVE_NAME), None)
+        if chosen is None:
+            console.print("[dim yellow]No earlier session to resume.[/dim yellow]")
+            return None
+    elif t.isdigit():
         idx = int(t) - 1
         if 0 <= idx < len(sessions):
             chosen = sessions[idx]
@@ -2671,7 +2711,6 @@ def load_session(target: str = "autosave") -> list[dict] | None:
 
 def select_model_interactive(arg: str = "") -> str:
     """Interactive /model selector that updates global MODEL and saves to <EUSTACE_HOME>/config.json."""
-    global MODEL
     choice = arg.strip()
 
     models = list(AVAILABLE_MODELS)
@@ -2702,7 +2741,7 @@ def select_model_interactive(arg: str = "") -> str:
     def _switch(new_id: str, note: str = "") -> str:
         global MODEL
         MODEL = new_id
-        save_selected_model(MODEL)
+        _update_config(model=MODEL)
         label = "✓ Switched to custom model ID:" if note == "custom" else "✓ Switched model to:"
         console.print(f"  [bold {'yellow' if note == 'custom' else 'green'}]{label}[/bold {'yellow' if note == 'custom' else 'green'}] [bold cyan]{escape(MODEL)}[/bold cyan]")
         return MODEL
@@ -2809,7 +2848,7 @@ def main():
                 continue
 
             if cmd == "/resume":
-                restored = load_session(cmd_arg or "autosave")
+                restored = load_session(cmd_arg)
                 if restored is not None:
                     messages = restored
                 continue
@@ -2817,7 +2856,7 @@ def main():
             if cmd == "/compact":
                 try:
                     messages = compact_messages(messages)
-                    save_session(messages, name="autosave", quiet=True)
+                    save_session(messages, quiet=True)
                     console.print("[dim cyan]✓ Context compacted into a summary[/dim cyan]")
                 except Exception as e:
                     console.print(f"[bold red]Compact failed:[/bold red] {escape(str(e))}")
@@ -2825,8 +2864,8 @@ def main():
 
             messages.append({"role": "user", "content": user_input})
             run_agent_turn(messages)
-            # Automatically checkpoint every completed turn to autosave.json
-            save_session(messages, name="autosave", quiet=True)
+            # Checkpoint every completed turn to this run's autosave file
+            save_session(messages, quiet=True)
 
         except KeyboardInterrupt:
             console.print("\n[dim yellow]Interrupted. Type /exit to quit, or enter your next prompt.[/dim yellow]")

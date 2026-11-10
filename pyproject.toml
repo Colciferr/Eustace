@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "genai-cli"
-version = "1.1.3"
+dynamic = ["version"]
 description = "CLI agent for GenAI.mil models with local file, Office, and Outlook tools"
 requires-python = ">=3.11"
 dependencies = [
@@ -24,3 +24,7 @@ eustace = "cli:main"
 
 [tool.setuptools]
 py-modules = ["cli"]
+
+# Single source of truth: VERSION in cli.py (read statically, without importing the module)
+[tool.setuptools.dynamic]
+version = {attr = "cli.VERSION"}

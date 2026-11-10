@@ -1,0 +1,380 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "list_directory",
+      "description": "List files and folders in a directory on the user's local PC. Defaults to current working directory '.'.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative or absolute directory path to list (default is '.')."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_file",
+      "description": "Read the contents of a file on the user's local PC. Supports plaintext, code, CSV, Excel (.xlsx/.xlsm), PDF (.pdf), Word (.docx), and PowerPoint (.pptx).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative or absolute path to the file to read."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write_file",
+      "description": "Create a new file or completely overwrite an existing file with content.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative or absolute path to the file to create/overwrite."
+          },
+          "content": {
+            "type": "string",
+            "description": "The exact plaintext or code content to write into the file."
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "edit_file",
+      "description": "Search and replace a specific block of text/code within an existing file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative or absolute path to the file to edit."
+          },
+          "old_text": {
+            "type": "string",
+            "description": "The exact string block currently in the file that you want to replace."
+          },
+          "new_text": {
+            "type": "string",
+            "description": "The replacement string block to insert."
+          }
+        },
+        "required": [
+          "path",
+          "old_text",
+          "new_text"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_powershell",
+      "description": "Run a PowerShell command on the user's local PC in the current working directory (e.g. git, pytest, builds, dir). Returns exit code, stdout and stderr. The user must manually approve every command, so keep each one purposeful.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The PowerShell command line to execute."
+          }
+        },
+        "required": [
+          "command"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_clipboard",
+      "description": "Read the text currently copied to the user's Windows clipboard. Ideal when the user copies an email, paragraph, table, or snippet and asks you to summarize, fix, or act on it.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write_clipboard",
+      "description": "Copy text directly onto the user's Windows clipboard so they can immediately Ctrl+V paste it into Outlook, Word, or Teams.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The text to place onto the Windows clipboard."
+          }
+        },
+        "required": [
+          "text"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "open_file",
+      "description": "Launch/open a document or folder in its default Windows application (e.g., Word, Excel, PDF reader, File Explorer) after creating or updating it so the user can review it immediately.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative or absolute path to the document or folder to open."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write_docx",
+      "description": "Create or overwrite a Microsoft Word (.docx) document from Markdown-formatted text. Supports #/##/### headings, bullet lists (- ), numbered lists (1. ), **bold** text, and Markdown tables (| col | col |).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Output path for the .docx file."
+          },
+          "title": {
+            "type": "string",
+            "description": "Optional document title heading at the top of the page."
+          },
+          "content": {
+            "type": "string",
+            "description": "Markdown-formatted body content to render into the Word document."
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "fill_docx_template",
+      "description": "Fill placeholders (such as '{{DATE}}', '{{SUBJECT}}', '[NAME]') inside an existing Word (.docx) template (preserving headers, footers, tables, and formatting) and save to a new .docx file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "template_path": {
+            "type": "string",
+            "description": "Path to the existing .docx template file."
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Path where the filled .docx file should be saved."
+          },
+          "replacements": {
+            "type": "object",
+            "description": "Key-value dictionary mapping exact placeholder strings to their replacement text."
+          }
+        },
+        "required": [
+          "template_path",
+          "output_path",
+          "replacements"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_excel",
+      "description": "Create a new Excel (.xlsx) workbook or update an existing one by appending rows to a sheet and/or setting specific cell coordinates (e.g. {'B4': 'Complete', 'C4': 100}).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the .xlsx file (created automatically if it does not exist)."
+          },
+          "sheet_name": {
+            "type": "string",
+            "description": "Optional target worksheet name (defaults to active sheet, or creates sheet if missing)."
+          },
+          "append_rows": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "description": "Optional list of rows (each row is a list of cell values) to append to the bottom of the sheet."
+          },
+          "cell_updates": {
+            "type": "object",
+            "description": "Optional dictionary mapping cell coordinates (like 'A1', 'C5') to new values."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "search_files",
+      "description": "Search recursively across a directory tree by filename pattern and/or inside file contents (searches plaintext, code, CSV, Word .docx, Excel .xlsx, PDF .pdf, and PowerPoint .pptx in one call).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Root directory to search from (default is current directory '.')."
+          },
+          "query": {
+            "type": "string",
+            "description": "Optional case-insensitive text or keyword to search for inside files and filenames."
+          },
+          "file_pattern": {
+            "type": "string",
+            "description": "Optional filename filter or glob pattern (e.g. '*.docx', '*.xlsx', '*memo*', default '*')."
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Maximum number of matching files to return (default 30)."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_inbox",
+      "description": "List recent emails in the user's Classic Outlook Inbox (returns Subject, ReceivedTime, Unread status, Categories, and EntryID). Supports filtering by unread status or subject keywords.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "max_items": {
+            "type": "integer",
+            "description": "Maximum number of emails to return (default 25, max 100)."
+          },
+          "unread_only": {
+            "type": "boolean",
+            "description": "If true, only return unread emails (default false)."
+          },
+          "subject_filter": {
+            "type": "string",
+            "description": "Optional case-insensitive substring to filter email subjects."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_calendar",
+      "description": "Read the user's Classic Outlook Calendar appointments and meetings for today and upcoming/past days (returns Subject, Start, End, Location, AllDayEvent, and BusyStatus).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "days_ahead": {
+            "type": "integer",
+            "description": "Number of days ahead from today to include (default 7)."
+          },
+          "days_back": {
+            "type": "integer",
+            "description": "Number of days in the past to include (default 0)."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "open_email",
+      "description": "Pop open a specific Outlook email (or a Reply window for it) on the user's screen using its EntryID from `list_inbox`.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "entry_id": {
+            "type": "string",
+            "description": "The exact EntryID string of the email from `list_inbox`."
+          },
+          "open_reply_window": {
+            "type": "boolean",
+            "description": "If true, opens a Reply draft window for the email instead of just viewing it (default false)."
+          }
+        },
+        "required": [
+          "entry_id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_draft_email",
+      "description": "Create a new draft email in Classic Outlook and pop it open on the user's screen ready for review and manual sending. Never auto-sends.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "Subject line for the draft email."
+          },
+          "body": {
+            "type": "string",
+            "description": "Plaintext body of the draft email."
+          },
+          "to_hint": {
+            "type": "string",
+            "description": "Optional recipient email address or name."
+          }
+        },
+        "required": [
+          "subject",
+          "body"
+        ]
+      }
+    }
+  }
+]

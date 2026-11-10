@@ -18,6 +18,11 @@ import cli  # noqa: E402
 HOME = os.path.expanduser("~")
 
 
+def _blocked(path: str) -> bool:
+    """True when the shared write guard, the gate every writing tool passes through, refuses this path."""
+    return cli._guard_write(path)[1] is not None
+
+
 def _make_junction(link: str, target: str) -> bool:
     """Creates a directory junction with mklink /J (no admin required). Returns False if unavailable."""
     try:
@@ -32,13 +37,14 @@ class _CaptureApproval:
 
     def __init__(self):
         self.calls = []
-        self.approve_all_for_turn = False
+        self.answer = False
+        self.current_tool = ""
         self.last_decision = "auto"
 
-    def request_approval(self, action_title, detail_text="", diff_text=""):
+    def request_approval(self, action_title, detail_text="", diff_text="", always_ask=False):
         self.calls.append((action_title, detail_text, diff_text))
         self.last_decision = "denied_user"
-        return False
+        return self.answer
 
     def reset_turn(self):
         pass
@@ -63,7 +69,7 @@ class CanonicalPathTests(unittest.TestCase):
                 canon, err = cli._resolve_model_path(bad)
                 self.assertIsNone(canon)
                 self.assertTrue(err.startswith("Security Error"))
-                self.assertTrue(cli._is_sensitive(bad), "un-canonicalizable spelling must fail closed")
+                self.assertTrue(_blocked(bad), "un-canonicalizable spelling must fail closed")
 
     def test_plain_local_paths_pass(self):
         here = os.path.abspath(__file__)
@@ -84,7 +90,7 @@ class CanonicalPathTests(unittest.TestCase):
 
 class JunctionTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="eustace-test-")
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="eustace-test-"))
         self.plain = os.path.join(self.tmp, "plain")
         os.mkdir(self.plain)
         # Point the junction AT an existing protected home; nothing is ever written through it.
@@ -109,10 +115,16 @@ class JunctionTests(unittest.TestCase):
         via_link = os.path.join(self.link, "sessions", "autosave.json")
         canon = cli._canonical_path(via_link)
         self.assertTrue(cli._is_under(canon, self.target), f"{canon} should resolve under {self.target}")
-        self.assertTrue(cli._is_sensitive(via_link))
+        self.assertTrue(_blocked(via_link))
         self.assertTrue(cli._has_link_component(via_link))
         self.assertIn("Security Error", cli._recheck_after_approval(via_link) or "")
-        listing = cli.list_directory(self.tmp)
+        saved = cli.APPROVAL_HANDLER
+        cli.APPROVAL_HANDLER = cap = _CaptureApproval()
+        cap.answer = True  # the temp dir is outside the workspace, so listing it asks first
+        try:
+            listing = cli.list_directory(self.tmp)
+        finally:
+            cli.APPROVAL_HANDLER = saved
         self.assertIn("[LINK] jump", listing)
         self.assertNotIn("autosave", listing)
 
@@ -130,10 +142,10 @@ class SensitivePatternTests(unittest.TestCase):
             os.path.join(HOME, "proj", "web.config"),
         ):
             with self.subTest(path=p):
-                self.assertTrue(cli._is_sensitive(p))
+                self.assertTrue(_blocked(p))
 
     def test_ordinary_files_not_sensitive(self):
-        self.assertFalse(cli._is_sensitive(os.path.join(os.getcwd(), "README.md")))
+        self.assertFalse(_blocked(os.path.join(os.getcwd(), "README.md")))
 
 
 class ControlCharacterTests(unittest.TestCase):
@@ -184,7 +196,7 @@ class OpenFileTests(unittest.TestCase):
     def test_non_document_extension_blocked_before_approval(self):
         saved = cli.APPROVAL_HANDLER
         cli.APPROVAL_HANDLER = cap = _CaptureApproval()
-        tmp = tempfile.mkdtemp(prefix="eustace-test-")
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="eustace-test-"))
         try:
             for name in ("evil.hta", "evil.pif", "evil.msc", "evil.reg", "evil.url", "app.application", "addin.xll", "noext", "evil.hta. "):
                 p = os.path.join(tmp, name.rstrip(" ."))
@@ -207,7 +219,7 @@ class OpenFileTests(unittest.TestCase):
 
 class AgentMdDiscoveryTests(unittest.TestCase):
     def test_stops_at_git_root(self):
-        tmp = tempfile.mkdtemp(prefix="eustace-test-")
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="eustace-test-"))
         try:
             root = os.path.join(tmp, "repo")
             sub = os.path.join(root, "pkg", "sub")
@@ -233,7 +245,7 @@ class PreviewFaithfulnessTests(unittest.TestCase):
     def setUp(self):
         self.saved = cli.APPROVAL_HANDLER
         cli.APPROVAL_HANDLER = self.cap = _CaptureApproval()
-        self.tmp = tempfile.mkdtemp(prefix="eustace-test-")
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="eustace-test-"))
 
     def tearDown(self):
         cli.APPROVAL_HANDLER = self.saved
@@ -360,10 +372,75 @@ class ApiErrorFormattingTests(unittest.TestCase):
         self.assertIn("retry after 1592s", line)
         self.assertIn("/model", line)
 
+    def test_unparseable_error_shows_start_of_raw_body_not_headers(self):
+        from types import SimpleNamespace
+        class FakeErr(Exception):
+            status_code = 400
+            body = None
+            response = SimpleNamespace(text="<html>Bad Request from proxy</html>", url="https://x/v1", headers={"set-cookie": "s=1"})
+        saved = os.environ.pop("EUSTACE_DEBUG", None)
+        try:
+            line = cli._format_api_error(FakeErr("Error code: 400"))
+            self.assertIn("API error 400", line)
+            self.assertIn("Bad Request from proxy", line)
+            self.assertNotIn("set-cookie", line)
+            os.environ["EUSTACE_DEBUG"] = "1"
+            self.assertIn("set-cookie", cli._format_api_error(FakeErr("Error code: 400")))
+        finally:
+            os.environ.pop("EUSTACE_DEBUG", None)
+            if saved is not None:
+                os.environ["EUSTACE_DEBUG"] = saved
+
     def test_plain_exception_falls_back_to_its_text(self):
         line = cli._format_api_error(RuntimeError("socket closed"))
         self.assertIn("RuntimeError", line)
         self.assertIn("socket closed", line)
+
+
+class ApiKeyEntryTests(unittest.TestCase):
+    """The Ctrl+V fallback must never save a clipboard error message (or anything unkeylike) as the key."""
+
+    def _run(self, typed, clipboard):
+        saved = (cli.console.input, cli._clipboard_text_raw, cli._merge_env_line, os.environ.pop(cli.API_KEY_ENV, None))
+        written = []
+        answers, clips = list(typed), list(clipboard)
+        cli.console.input = lambda *a, **k: answers.pop(0)
+        cli._clipboard_text_raw = lambda: clips.pop(0)
+        cli._merge_env_line = lambda path, key, value: written.append(value)
+        try:
+            return cli.ensure_api_key(), written
+        finally:
+            cli.console.input, cli._clipboard_text_raw, cli._merge_env_line = saved[:3]
+            os.environ.pop(cli.API_KEY_ENV, None)
+            if saved[3] is not None:
+                os.environ[cli.API_KEY_ENV] = saved[3]
+
+    def test_ctrl_v_reads_clipboard(self):
+        key, written = self._run(["\x16"], [" sk-abc123\r\n"])
+        self.assertEqual(key, "sk-abc123")
+        self.assertEqual(written, ["sk-abc123"])
+
+    def test_unreadable_or_empty_clipboard_reprompts(self):
+        key, written = self._run(["\x16", "\x16", "typed-key"], [None, ""])
+        self.assertEqual(key, "typed-key")
+        self.assertEqual(written, ["typed-key"])
+
+    def test_gives_up_without_saving(self):
+        written = []
+        with self.assertRaises(SystemExit):
+            _, written = self._run(["\x16", "", "  "], [None])
+        self.assertEqual(written, [])
+
+    def test_malformed_stored_key_is_not_used(self):
+        os.environ[cli.API_KEY_ENV] = "bad key\x16"
+        saved_input, saved_merge = cli.console.input, cli._merge_env_line
+        cli.console.input = lambda *a, **k: "good"
+        cli._merge_env_line = lambda *a: None
+        try:
+            self.assertEqual(cli.ensure_api_key(), "good")
+        finally:
+            cli.console.input, cli._merge_env_line = saved_input, saved_merge
+            os.environ.pop(cli.API_KEY_ENV, None)
 
 
 if __name__ == "__main__":
