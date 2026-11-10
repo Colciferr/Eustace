@@ -269,6 +269,13 @@ class ApprovalPromptTests(unittest.TestCase):
             self.assertFalse(handler.request_approval("Edit file: x", diff_text="+a"))
         self.assertEqual(handler.last_decision, "denied_user")
 
+    def test_only_whole_word_answers_approve(self):
+        for answer, expected in (("y", True), ("YES", True), (" yes ", True), ("yeah sure", False), ("you should", False),
+                                 ("always", False), ("1", False), ("ok", False)):
+            handler = cli.CLIApprovalHandler()
+            with self.subTest(answer=answer), sandbox(), typed(answer):
+                self.assertEqual(handler.request_approval("Edit file: x", diff_text="+a"), expected)
+
     def test_long_diff_is_cut_with_notice_and_v_shows_all(self):
         handler = cli.CLIApprovalHandler()
         with sandbox(), typed("v", "y"):
@@ -300,6 +307,64 @@ class ApprovalPromptTests(unittest.TestCase):
         self.assertIn("a\\x0db", out)
         self.assertIn("\\x1b[2J", out)
         self.assertNotIn("\x1b[2J", out)
+
+
+class MainLoopSmokeTests(unittest.TestCase):
+    """Drives main() itself through every slash command with scripted keyboard input."""
+
+    def test_full_session(self):
+        client = ScriptedClient(
+            [text("Hello!")],                                           # reply to "hi"
+            [text("Summary of the chat.")],                             # /compact
+            [call("list_directory", "{}", id="c1")], [text("Listed.")], # reply to "list"
+        )
+        saved_init, saved_model, saved_name = cli._init_client, cli.MODEL, cli.AUTOSAVE_NAME
+        cli._init_client = lambda: None
+        try:
+            with sandbox(client=client, approval=RecordingApproval()) as (ws, home):
+                with typed("", "/sessions", "hi", "/save my session", "/sessions", "/compact", "/model", "",
+                           "/model custom-model-id", "/clear", "list", "/resume my session", "/resume 99", "/exit"):
+                    cli.main()
+                out = output()
+                saved = sorted(os.listdir(cli.SESSIONS_DIR))
+                with open(cli.AUDIT_LOG_PATH, encoding="utf-8") as f:
+                    audit_lines = f.read().splitlines()
+                self.assertEqual(cli.load_saved_model(), "custom-model-id")
+        finally:
+            cli._init_client, cli.MODEL, cli.AUTOSAVE_NAME = saved_init, saved_model, saved_name
+        self.assertIn(f"Eustace v{cli.VERSION}", out)
+        self.assertIn("No saved sessions yet", out)
+        self.assertIn("Hello!", out)
+        self.assertIn("Context compacted", out)
+        self.assertIn("Select AI Model", out)
+        self.assertIn("custom-model-id", out)
+        self.assertIn("Context cleared", out)
+        self.assertIn("Resumed session", out)
+        self.assertIn("not found", out)
+        self.assertIn("Goodbye", out)
+        self.assertNotIn("Error:", out)
+        self.assertIn("my_session.json", saved)
+        self.assertEqual(len(saved), 2)
+        self.assertEqual(len(audit_lines), 1)
+        self.assertEqual(client.rounds, [])
+
+    def test_end_of_input_exits_cleanly(self):
+        saved_init = cli._init_client
+        cli._init_client = lambda: None
+
+        def eof(prompt=""):
+            raise EOFError
+
+        import builtins
+        real_input = builtins.input
+        builtins.input = eof
+        try:
+            with sandbox(client=ScriptedClient(), approval=RecordingApproval()):
+                cli.main()
+                self.assertIn("Goodbye", output())
+        finally:
+            builtins.input = real_input
+            cli._init_client = saved_init
 
 
 if __name__ == "__main__":

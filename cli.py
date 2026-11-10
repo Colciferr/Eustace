@@ -38,7 +38,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "1.1.3"
+VERSION = "1.2.0"
 
 # When output is redirected to a file or pipe, Windows uses the ANSI code page, which cannot encode the symbols
 # printed here; degrade to "?" instead of crashing mid-turn.
@@ -776,17 +776,18 @@ class CLIApprovalHandler:
 
         while True:
             console.print(f"  [bold yellow]Choice ({'/'.join(options)}) \\[default: N]:[/bold yellow] ", end="")
-            choice = input().strip().lower()[:1]
-            if choice == "v" and hidden > 0:
+            # Whole-word answers only: stray typed-ahead text that merely starts with "y" must not approve
+            choice = input().strip().lower()
+            if choice in ("v", "view") and hidden > 0:
                 console.print(Syntax("\n".join(diff_lines), "diff", theme="monokai", word_wrap=True))
                 continue
             break
 
-        if choice == "a" and can_approve_all:
+        if choice in ("a", "all") and can_approve_all:
             self.approved_tools.add(self.current_tool)
             self.last_decision = "approved_all_turn"
             return True
-        if choice == "y":
+        if choice in ("y", "yes"):
             self.last_decision = "approved_user"
             return True
 
