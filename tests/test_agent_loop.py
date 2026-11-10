@@ -128,5 +128,85 @@ class InterruptedTurnTests(unittest.TestCase):
         self.assertNotIn("Tool calls", messages[-1]["content"])
 
 
+class ToolCallAssemblyTests(unittest.TestCase):
+    def _assemble(self, *deltas):
+        buf = {}
+        for d in deltas:
+            cli._accumulate_tool_call(buf, d.choices[0].delta.tool_calls[0])
+        return [(buf[i]["id"], buf[i]["function"]["name"], buf[i]["function"]["arguments"]) for i in sorted(buf)]
+
+    def test_indexed_stream_with_split_arguments(self):
+        got = self._assemble(
+            call("read_file", "", id="a", index=0),
+            call(None, '{"pa', index=0),
+            call("list_directory", "{}", id="b", index=1),
+            call(None, 'th": "x"}', index=0),
+        )
+        self.assertEqual(got, [("a", "read_file", '{"path": "x"}'), ("b", "list_directory", "{}")])
+
+    def test_missing_index_with_split_arguments_stays_one_call(self):
+        got = self._assemble(
+            call("read_file", "", id="a", index=None),
+            call(None, '{"pa', index=None),
+            call(None, 'th": "x"}', index=None),
+        )
+        self.assertEqual(got, [("a", "read_file", '{"path": "x"}')])
+
+    def test_missing_index_new_id_starts_a_new_call(self):
+        got = self._assemble(
+            call("read_file", '{"path": "x"}', id="a", index=None),
+            call("list_directory", "{}", id="b", index=None),
+        )
+        self.assertEqual(got, [("a", "read_file", '{"path": "x"}'), ("b", "list_directory", "{}")])
+
+    def test_missing_index_and_id_new_name_starts_a_new_call(self):
+        got = self._assemble(
+            call("read_file", '{"path": "x"}', index=None),
+            call("list_directory", "{}", index=None),
+        )
+        self.assertEqual(got, [("", "read_file", '{"path": "x"}'), ("", "list_directory", "{}")])
+
+
+class DispatchValidationTests(unittest.TestCase):
+    def _run(self, name, args):
+        client = ScriptedClient([call(name, args, id="c1")], [text("ok")])
+        approval = RecordingApproval(default=True)
+        with sandbox(client=client, approval=approval) as (ws, _):
+            with open(os.path.join(ws, "note.txt"), "w") as f:
+                f.write("x" * 500)
+            messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "go"}]
+            cli.run_agent_turn(messages)
+            created = sorted(os.listdir(ws))
+        assert_history_valid(self, messages)
+        return messages[3]["content"], created, approval
+
+    def test_truncated_json_runs_nothing(self):
+        result, created, approval = self._run("write_file", '{"path": "a.txt", "content": "half')
+        self.assertIn("not valid JSON", result)
+        self.assertEqual(created, ["note.txt"])
+        self.assertEqual(approval.calls, [])
+
+    def test_non_object_arguments(self):
+        result, _, _ = self._run("list_directory", '["."]')
+        self.assertIn("must be a JSON object", result)
+
+    def test_unknown_tool(self):
+        result, _, _ = self._run("format_disk", "{}")
+        self.assertIn("Unknown tool 'format_disk'", result)
+
+    def test_undeclared_parameter_is_rejected(self):
+        """read_file's internal max_chars is not in the schema, so the model cannot raise the truncation limit."""
+        result, _, _ = self._run("read_file", '{"path": "note.txt", "max_chars": 10}')
+        self.assertIn("does not accept the parameter(s): max_chars", result)
+
+    def test_missing_required_parameter(self):
+        result, _, _ = self._run("write_file", '{"path": "a.txt"}')
+        self.assertIn("missing required parameter(s): content", result)
+
+    def test_empty_arguments_string_means_no_arguments(self):
+        result, _, _ = self._run("list_directory", "")
+        self.assertIn("note.txt", result)
+
+
 if __name__ == "__main__":
     unittest.main()

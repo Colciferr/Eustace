@@ -2172,6 +2172,8 @@ TOOLS = [
     },
 ]
 
+_TOOL_SCHEMAS = {t["function"]["name"]: t["function"]["parameters"] for t in TOOLS}
+
 AVAILABLE_FUNCTIONS = {
     "list_directory": list_directory,
     "read_file": read_file,
@@ -2504,6 +2506,58 @@ def _tail_lines(text: str, max_lines: int) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+def _accumulate_tool_call(buffer: dict[int, dict], tc) -> None:
+    """Folds one streamed tool-call delta into buffer (position -> call under construction).
+
+    OpenAI-style streams tag every delta with an index. Some compatible endpoints omit it; then a delta that
+    carries a different id, or a function name when the current call already has one, starts a new call and
+    anything else continues the latest one (so arguments split across chunks stay in one call)."""
+    idx = getattr(tc, "index", None)
+    fn = getattr(tc, "function", None)
+    if idx is None:
+        last = max(buffer) if buffer else None
+        if last is None:
+            idx = 0
+        else:
+            cur = buffer[last]
+            new_id = bool(tc.id) and bool(cur["id"]) and tc.id != cur["id"]
+            new_name = bool(fn and fn.name) and bool(cur["function"]["name"])
+            idx = last + 1 if (new_id or new_name) else last
+    entry = buffer.setdefault(idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+    if tc.id:
+        entry["id"] = tc.id
+    if fn:
+        if fn.name:
+            entry["function"]["name"] += fn.name
+        if fn.arguments:
+            entry["function"]["arguments"] += fn.arguments
+    extra = _tool_call_extra(tc)
+    if extra:
+        entry["extra_content"] = extra  # Gemini thought_signature; must be echoed back verbatim
+
+
+def _parse_tool_args(fn_name: str, raw_args: str | None) -> tuple[dict | None, str | None]:
+    """(arguments, None) when the call is well formed for a known tool, else (None, error for the model).
+    Rejects unknown tools, invalid JSON (typically output cut off mid-call), non-object arguments, parameters
+    the tool's schema does not declare, and missing required parameters."""
+    schema = _TOOL_SCHEMAS.get(fn_name)
+    if schema is None:
+        return None, f"Error: Unknown tool '{fn_name}'"
+    try:
+        args = json.loads(raw_args or "{}")
+    except json.JSONDecodeError as je:
+        return None, f"Error: the arguments for '{fn_name}' were not valid JSON ({je}). Nothing was run; send the call again."
+    if not isinstance(args, dict):
+        return None, f"Error: the arguments for '{fn_name}' must be a JSON object. Nothing was run."
+    unknown = sorted(set(args) - set(schema.get("properties", {})))
+    if unknown:
+        return None, f"Error: '{fn_name}' does not accept the parameter(s): {', '.join(unknown)}. Nothing was run."
+    missing = [k for k in schema.get("required", []) if k not in args]
+    if missing:
+        return None, f"Error: '{fn_name}' is missing required parameter(s): {', '.join(missing)}. Nothing was run."
+    return args, None
+
+
 INTERRUPTED_TOOL_NOTE = (
     "Not completed: the user interrupted the turn. If this call had already started it may have partly run; "
     "check its effects before retrying."
@@ -2589,26 +2643,8 @@ def run_agent_turn(messages: list[dict]):
                         else:
                             live.update(preview)
 
-                    if delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            # Some OpenAI-compatible endpoints omit index on single-call deltas
-                            idx = tc.index if tc.index is not None else len(tool_calls_buffer)
-                            if idx not in tool_calls_buffer:
-                                tool_calls_buffer[idx] = {
-                                    "id": tc.id or "",
-                                    "type": "function",
-                                    "function": {"name": "", "arguments": ""},
-                                }
-                            if tc.id:
-                                tool_calls_buffer[idx]["id"] = tc.id
-                            if tc.function:
-                                if tc.function.name:
-                                    tool_calls_buffer[idx]["function"]["name"] += tc.function.name
-                                if tc.function.arguments:
-                                    tool_calls_buffer[idx]["function"]["arguments"] += tc.function.arguments
-                            extra = _tool_call_extra(tc)
-                            if extra:
-                                tool_calls_buffer[idx]["extra_content"] = extra
+                    for tc in delta.tool_calls or []:
+                        _accumulate_tool_call(tool_calls_buffer, tc)
             finally:
                 if live is not None:
                     live.stop()
@@ -2656,28 +2692,23 @@ def run_agent_turn(messages: list[dict]):
                 for tc in tool_calls_list:
                     check_user_abort()
                     fn_name = tc["function"]["name"]
-                    raw_args = tc["function"]["arguments"] or "{}"
+                    fn_args, arg_err = _parse_tool_args(fn_name, tc["function"]["arguments"])
 
-                    try:
-                        fn_args = json.loads(raw_args)
-                    except json.JSONDecodeError as je:
-                        console.print(f"[bold red]Error parsing tool arguments JSON:[/bold red] {escape(str(je))}")
-                        fn_args = {}
-
-                    console.print(f"  [yellow]●[/yellow] {_summarize_args(fn_name, fn_args)}")
+                    console.print(f"  [yellow]●[/yellow] {_summarize_args(fn_name, fn_args or {})}")
 
                     APPROVAL_HANDLER.last_decision = "auto"
-                    func = AVAILABLE_FUNCTIONS.get(fn_name)
-                    if func:
+                    if arg_err:
+                        # Never run a tool on arguments the model did not actually send
+                        console.print(f"  [bold red]{escape(arg_err)}[/bold red]")
+                        result = arg_err
+                    else:
                         try:
-                            result = func(**fn_args)
+                            result = AVAILABLE_FUNCTIONS[fn_name](**fn_args)
                         except Exception as fe:
                             console.print(f"[bold red]Tool execution error inside '{escape(fn_name)}':[/bold red] {escape(str(fe))}")
                             result = f"Error: Tool execution failed: {fe}"
-                    else:
-                        result = f"Error: Unknown tool '{fn_name}'"
 
-                    log_audit_event(fn_name, fn_args, APPROVAL_HANDLER.last_decision, result)
+                    log_audit_event(fn_name, fn_args or {}, APPROVAL_HANDLER.last_decision, result)
 
                     content = str(result)
                     if len(content) > MAX_TOOL_RESULT_CHARS:
