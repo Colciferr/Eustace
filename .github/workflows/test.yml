@@ -26,12 +26,17 @@ jobs:
 
   setup-script:
     # Runs the real installer under Windows PowerShell 5.1 on a Python that has no pipx yet.
+    # 3.14 on PATH is the normal case; 3.12 on PATH makes the installer go and get its preferred version.
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        path-python: ['3.14', '3.12']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.path-python }}
       - name: Remove pipx so the installer's bootstrap path is the one tested
         shell: pwsh
         run: |
@@ -45,3 +50,8 @@ jobs:
         run: |
           $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
           eustace --version
+      - name: Report which Python the install used
+        shell: powershell
+        run: |
+          Get-ChildItem "$env:USERPROFILE\pipx\venvs", "$env:LOCALAPPDATA\pipx\pipx\venvs" -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-Content (Join-Path $_.FullName "pyvenv.cfg") }
