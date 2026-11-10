@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import difflib
 import fnmatch
 import hashlib
+import inspect
 import json
 import msvcrt
 import os
@@ -15,6 +16,8 @@ import subprocess
 import sys
 import threading
 import time
+import types
+import typing
 
 import truststore
 truststore.inject_into_ssl()
@@ -728,12 +731,58 @@ DIFF_PREVIEW_LINES = 100
 APPROVAL_HANDLER = CLIApprovalHandler()
 
 
+# ---------------------------------------------------------------------
+# Tool registry: @tool is the single place a tool is declared. The model-facing schema is derived from the
+# function itself (name, docstring, annotations, defaults) plus the per-parameter descriptions given here.
+# Parameters without a description stay internal: they are not in the schema and the model cannot pass them.
+# ---------------------------------------------------------------------
+
+TOOLS: list[dict] = []                    # schemas sent to the model, in declaration order
+AVAILABLE_FUNCTIONS: dict = {}            # tool name -> function
+TOOL_FRIENDLY_LABELS: dict[str, str] = {} # tool name -> short progress label
+_TOOL_SCHEMAS: dict[str, dict] = {}       # tool name -> its JSON-schema "parameters" object
+_JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean", dict: "object"}
+
+
+def _json_type(annotation) -> dict:
+    """JSON-schema fragment for a parameter annotation: X | None is treated as X, list[X] as an array of X."""
+    origin, args = typing.get_origin(annotation), [a for a in typing.get_args(annotation) if a is not type(None)]
+    if origin in (typing.Union, types.UnionType):
+        return _json_type(args[0])
+    if annotation is list or origin is list:
+        return {"type": "array", "items": _json_type(args[0])} if args else {"type": "array"}
+    return {"type": _JSON_TYPES[origin or annotation]}
+
+
+def tool(label: str, **param_docs: str):
+    """Registers the decorated function as a model-callable tool. `label` is the progress text shown while it
+    runs; each keyword documents one parameter and exposes it to the model."""
+    def register(fn):
+        sig, hints = inspect.signature(fn), typing.get_type_hints(fn)
+        unknown = set(param_docs) - set(sig.parameters)
+        if unknown:
+            raise TypeError(f"@tool on {fn.__name__}: no such parameter(s) {sorted(unknown)}")
+        params = {
+            "type": "object",
+            "properties": {n: {**_json_type(hints[n]), "description": d} for n, d in param_docs.items()},
+            "required": [n for n, p in sig.parameters.items() if n in param_docs and p.default is p.empty],
+        }
+        description = " ".join(inspect.getdoc(fn).split())
+        TOOLS.append({"type": "function", "function": {"name": fn.__name__, "description": description, "parameters": params}})
+        _TOOL_SCHEMAS[fn.__name__] = params
+        AVAILABLE_FUNCTIONS[fn.__name__] = fn
+        TOOL_FRIENDLY_LABELS[fn.__name__] = label
+        return fn
+    return register
+
+
 # =====================================================================
 # 1. LOCAL FILE SYSTEM TOOLS (Plaintext + Excel, PDF, Word, PowerPoint)
 # =====================================================================
 
+@tool("Listing folder", path="Relative or absolute directory path to list (default is '.').")
 def list_directory(path: str = ".") -> str:
-    """Lists files and directories at the given path."""
+    """List files and folders in a directory on the user's local PC. Defaults to current working directory '.'."""
     try:
         target, err = _resolve_model_path(path)
         if err:
@@ -822,8 +871,10 @@ def _read_pptx(target: str) -> str:
     return "\n".join(out)
 
 
+@tool("Reading file", path="Relative or absolute path to the file to read.")
 def read_file(path: str, max_chars: int = 30000) -> str:
-    """Reads plaintext, code, Excel (.xlsx), PDF (.pdf), Word (.docx), and PowerPoint (.pptx) files."""
+    """Read the contents of a file on the user's local PC. Supports plaintext, code, CSV, Excel (.xlsx/.xlsm),
+    PDF (.pdf), Word (.docx), and PowerPoint (.pptx)."""
     try:
         target, err = _resolve_model_path(path)
         if err:
@@ -913,8 +964,13 @@ def _open_text_lenient(path: str):
     return open(path, "r", encoding=enc, errors="replace")
 
 
+@tool(
+    "Writing file",
+    path="Relative or absolute path to the file to create/overwrite.",
+    content="The exact plaintext or code content to write into the file.",
+)
 def write_file(path: str, content: str) -> str:
-    """Creates a new file or overwrites an existing file with unified diff preview & confirmation."""
+    """Create a new file or completely overwrite an existing file with content."""
     try:
         target, err = _resolve_model_path(path)
         if err:
@@ -959,8 +1015,14 @@ def write_file(path: str, content: str) -> str:
         return f"Error writing file '{path}': {e}"
 
 
+@tool(
+    "Editing file",
+    path="Relative or absolute path to the file to edit.",
+    old_text="The exact string block currently in the file that you want to replace.",
+    new_text="The replacement string block to insert.",
+)
 def edit_file(path: str, old_text: str, new_text: str) -> str:
-    """Replaces a specific block of text/code inside an existing file with unified diff preview."""
+    """Search and replace a specific block of text/code within an existing file."""
     try:
         target, err = _resolve_model_path(path)
         if err:
@@ -1025,8 +1087,11 @@ SHELL_TIMEOUT_SECONDS = 120
 MAX_SHELL_OUTPUT_CHARS = 20000
 
 
+@tool("Running PowerShell", command="The PowerShell command line to execute.")
 def run_powershell(command: str) -> str:
-    """Runs a PowerShell command in the current working directory (requires manual user confirmation)."""
+    """Run a PowerShell command on the user's local PC in the current working directory (e.g. git, pytest,
+    builds, dir). Returns exit code, stdout and stderr. The user must manually approve every command, so keep
+    each one purposeful."""
     try:
         # Windows PowerShell treats a bare CR (and other C0 controls rich would drop from the panel) as a
         # statement separator, so a hidden second statement could ride behind the displayed one. Normalize
@@ -1129,8 +1194,10 @@ def _clipboard_text_raw() -> str | None:
         _user32.CloseClipboard()
 
 
+@tool("Reading clipboard")
 def read_clipboard(max_chars: int = 30000) -> str:
-    """Reads the current text content from the Windows clipboard."""
+    """Read the text currently copied to the user's Windows clipboard. Ideal when the user copies an email,
+    paragraph, table, or snippet and asks you to summarize, fix, or act on it."""
     text = _clipboard_text_raw()
     if text is None:
         return "Error: Could not read the Windows clipboard (it may be locked by another application)."
@@ -1146,8 +1213,10 @@ def read_clipboard(max_chars: int = 30000) -> str:
     return text if text.strip() else "(Clipboard contains only whitespace)"
 
 
+@tool("Copying to clipboard", text="The text to place onto the Windows clipboard.")
 def write_clipboard(text: str) -> str:
-    """Writes text directly to the Windows clipboard."""
+    """Copy text directly onto the user's Windows clipboard so they can immediately Ctrl+V paste it into
+    Outlook, Word, or Teams."""
     try:
         data = text.encode("utf-16-le") + b"\x00\x00"
         h_mem = _kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
@@ -1188,8 +1257,10 @@ ALLOWED_OPEN_EXTENSIONS = {
 }
 
 
+@tool("Opening file", path="Relative or absolute path to the document or folder to open.")
 def open_file(path: str) -> str:
-    """Opens a document or folder in its default Windows application (Word, Excel, PDF reader, Explorer)."""
+    """Launch/open a document or folder in its default Windows application (e.g., Word, Excel, PDF reader, File
+    Explorer) after creating or updating it so the user can review it immediately."""
     try:
         target, err = _resolve_model_path(path)
         if err:
@@ -1231,8 +1302,15 @@ def _add_formatted_runs(paragraph, text: str):
             paragraph.add_run(part)
 
 
+@tool(
+    "Creating Word document",
+    path="Output path for the .docx file.",
+    title="Optional document title heading at the top of the page.",
+    content="Markdown-formatted body content to render into the Word document.",
+)
 def write_docx(path: str, content: str, title: str = "") -> str:
-    """Creates or overwrites a Word (.docx) document from Markdown-formatted text (headings, bullets, bold, tables)."""
+    """Create or overwrite a Microsoft Word (.docx) document from Markdown-formatted text. Supports #/##/###
+    headings, bullet lists (- ), numbered lists (1. ), **bold** text, and Markdown tables (| col | col |)."""
     try:
         target, err = _resolve_model_path(path)
         if err:
@@ -1321,8 +1399,15 @@ def write_docx(path: str, content: str, title: str = "") -> str:
         return f"Error writing Word document '{path}': {e}"
 
 
+@tool(
+    "Filling Word template",
+    template_path="Path to the existing .docx template file.",
+    output_path="Path where the filled .docx file should be saved.",
+    replacements="Key-value dictionary mapping exact placeholder strings to their replacement text.",
+)
 def fill_docx_template(template_path: str, output_path: str, replacements: dict) -> str:
-    """Fills placeholders (e.g. '{{NAME}}': 'TSgt Davis') in an existing .docx template and saves to output_path."""
+    """Fill placeholders (such as '{{DATE}}', '{{SUBJECT}}', '[NAME]') inside an existing Word (.docx) template
+    (preserving headers, footers, tables, and formatting) and save to a new .docx file."""
     try:
         src, err = _resolve_model_path(template_path)
         if err:
@@ -1386,13 +1471,21 @@ def fill_docx_template(template_path: str, output_path: str, replacements: dict)
     except Exception as e:
         return f"Error filling Word template: {e}"
 
+@tool(
+    "Updating Excel workbook",
+    path="Path to the .xlsx file (created automatically if it does not exist).",
+    sheet_name="Optional target worksheet name (defaults to active sheet, or creates sheet if missing).",
+    append_rows="Optional list of rows (each row is a list of cell values) to append to the bottom of the sheet.",
+    cell_updates="Optional dictionary mapping cell coordinates (like 'A1', 'C5') to new values.",
+)
 def update_excel(
     path: str,
     sheet_name: str = "",
-    append_rows: list[list] | None = None,
+    append_rows: list[list[str]] | None = None,
     cell_updates: dict | None = None,
 ) -> str:
-    """Creates or updates an Excel (.xlsx) workbook by appending rows and/or updating specific cells (e.g. {'B2': 'Done'})."""
+    """Create a new Excel (.xlsx) workbook or update an existing one by appending rows to a sheet and/or setting
+    specific cell coordinates (e.g. {'B4': 'Complete', 'C4': 100})."""
     try:
         target, err = _resolve_model_path(path)
         if err:
@@ -1495,13 +1588,21 @@ MAX_OFFICE_PARSE_FILES = 40
 MAX_SEARCH_FILE_BYTES = 15 * 1024 * 1024  # 15 MB
 
 
+@tool(
+    "Searching files",
+    path="Root directory to search from (default is current directory '.').",
+    query="Optional case-insensitive text or keyword to search for inside files and filenames.",
+    file_pattern="Optional filename filter or glob pattern (e.g. '*.docx', '*.xlsx', '*memo*', default '*').",
+    max_results="Maximum number of matching files to return (default 30).",
+)
 def search_files(
     path: str = ".",
     query: str = "",
     file_pattern: str = "*",
     max_results: int = 30,
 ) -> str:
-    """Searches for files by filename pattern and/or text query (including inside .docx, .xlsx, .pdf, .pptx)."""
+    """Search recursively across a directory tree by filename pattern and/or inside file contents (searches
+    plaintext, code, CSV, Word .docx, Excel .xlsx, PDF .pdf, and PowerPoint .pptx in one call)."""
     try:
         root_dir, err = _resolve_model_path(path)
         if err:
@@ -1649,12 +1750,19 @@ def _safe_prop(item, prop: str, default=""):
         return default
 
 
+@tool(
+    "Checking Outlook Inbox",
+    max_items="Maximum number of emails to return (default 25, max 100).",
+    unread_only="If true, only return unread emails (default false).",
+    subject_filter="Optional case-insensitive substring to filter email subjects.",
+)
 def list_inbox(
     max_items: int = 25,
     unread_only: bool = False,
     subject_filter: str = "",
 ) -> str:
-    """Lists recent emails in the user's Outlook Inbox using STIG-permitted metadata (Subject, ReceivedTime, Unread, EntryID)."""
+    """List recent emails in the user's Classic Outlook Inbox (returns Subject, ReceivedTime, Unread status,
+    Categories, and EntryID). Supports filtering by unread status or subject keywords."""
     try:
         _, ns = _get_outlook_ns()
         inbox = ns.GetDefaultFolder(6)  # olFolderInbox = 6
@@ -1706,8 +1814,14 @@ def list_inbox(
         return f"Error listing Outlook Inbox: {e}"
 
 
+@tool(
+    "Checking Outlook Calendar",
+    days_ahead="Number of days ahead from today to include (default 7).",
+    days_back="Number of days in the past to include (default 0).",
+)
 def get_calendar(days_ahead: int = 7, days_back: int = 0) -> str:
-    """Lists Outlook Calendar appointments/meetings within [today - days_back, today + days_ahead]."""
+    """Read the user's Classic Outlook Calendar appointments and meetings for today and upcoming/past days
+    (returns Subject, Start, End, Location, AllDayEvent, and BusyStatus)."""
     try:
         _, ns = _get_outlook_ns()
         cal_folder = ns.GetDefaultFolder(9)  # olFolderCalendar = 9
@@ -1761,8 +1875,14 @@ def get_calendar(days_ahead: int = 7, days_back: int = 0) -> str:
         return f"Error reading Outlook Calendar: {e}"
 
 
+@tool(
+    "Opening Outlook email",
+    entry_id="The exact EntryID string of the email from `list_inbox`.",
+    open_reply_window="If true, opens a Reply draft window for the email instead of just viewing it (default false).",
+)
 def open_email(entry_id: str, open_reply_window: bool = False) -> str:
-    """Pops open a specific Outlook email (or a Reply window for it) on the user's screen using its EntryID."""
+    """Pop open a specific Outlook email (or a Reply window for it) on the user's screen using its EntryID from
+    `list_inbox`."""
     try:
         _, ns = _get_outlook_ns()
         item = ns.GetItemFromID(entry_id.strip())
@@ -1788,8 +1908,15 @@ def open_email(entry_id: str, open_reply_window: bool = False) -> str:
         return f"Error opening Outlook email '{entry_id}': {e}"
 
 
+@tool(
+    "Creating Outlook draft",
+    subject="Subject line for the draft email.",
+    body="Plaintext body of the draft email.",
+    to_hint="Optional recipient email address or name.",
+)
 def create_draft_email(subject: str, body: str, to_hint: str = "") -> str:
-    """Creates a new draft email in Classic Outlook and displays it on screen for the user to review and send (never auto-sends)."""
+    """Create a new draft email in Classic Outlook and pop it open on the user's screen ready for review and
+    manual sending. Never auto-sends."""
     try:
         app, _ = _get_outlook_ns()
         preview_lines = [f"Subject: {subject}"]
@@ -1821,407 +1948,6 @@ def create_draft_email(subject: str, body: str, to_hint: str = "") -> str:
         return f"Success: Draft email '{subject}' opened in Outlook for user review. (Never auto-sent)."
     except Exception as e:
         return f"Error creating Outlook draft: {e}"
-
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "list_directory",
-            "description": "List files and folders in a directory on the user's local PC. Defaults to current working directory '.'.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative or absolute directory path to list (default is '.').",
-                    }
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read the contents of a file on the user's local PC. Supports plaintext, code, CSV, Excel (.xlsx/.xlsm), PDF (.pdf), Word (.docx), and PowerPoint (.pptx).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative or absolute path to the file to read.",
-                    }
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Create a new file or completely overwrite an existing file with content.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative or absolute path to the file to create/overwrite.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The exact plaintext or code content to write into the file.",
-                    },
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": "Search and replace a specific block of text/code within an existing file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative or absolute path to the file to edit.",
-                    },
-                    "old_text": {
-                        "type": "string",
-                        "description": "The exact string block currently in the file that you want to replace.",
-                    },
-                    "new_text": {
-                        "type": "string",
-                        "description": "The replacement string block to insert.",
-                    },
-                },
-                "required": ["path", "old_text", "new_text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_powershell",
-            "description": (
-                "Run a PowerShell command on the user's local PC in the current working directory "
-                "(e.g. git, pytest, builds, dir). Returns exit code, stdout and stderr. "
-                "The user must manually approve every command, so keep each one purposeful."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The PowerShell command line to execute.",
-                    }
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_clipboard",
-            "description": (
-                "Read the text currently copied to the user's Windows clipboard. "
-                "Ideal when the user copies an email, paragraph, table, or snippet and asks you to summarize, fix, or act on it."
-            ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_clipboard",
-            "description": (
-                "Copy text directly onto the user's Windows clipboard so they can immediately Ctrl+V paste it into Outlook, Word, or Teams."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "The text to place onto the Windows clipboard.",
-                    }
-                },
-                "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "open_file",
-            "description": (
-                "Launch/open a document or folder in its default Windows application (e.g., Word, Excel, PDF reader, File Explorer) "
-                "after creating or updating it so the user can review it immediately."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative or absolute path to the document or folder to open.",
-                    }
-                },
-                "required": ["path"],
-            },
-        },
-    },
-        {
-        "type": "function",
-        "function": {
-            "name": "write_docx",
-            "description": (
-                "Create or overwrite a Microsoft Word (.docx) document from Markdown-formatted text. "
-                "Supports #/##/### headings, bullet lists (- ), numbered lists (1. ), **bold** text, and Markdown tables (| col | col |)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Output path for the .docx file.",
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Optional document title heading at the top of the page.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Markdown-formatted body content to render into the Word document.",
-                    },
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fill_docx_template",
-            "description": (
-                "Fill placeholders (such as '{{DATE}}', '{{SUBJECT}}', '[NAME]') inside an existing Word (.docx) "
-                "template (preserving headers, footers, tables, and formatting) and save to a new .docx file."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "template_path": {
-                        "type": "string",
-                        "description": "Path to the existing .docx template file.",
-                    },
-                    "output_path": {
-                        "type": "string",
-                        "description": "Path where the filled .docx file should be saved.",
-                    },
-                    "replacements": {
-                        "type": "object",
-                        "description": "Key-value dictionary mapping exact placeholder strings to their replacement text.",
-                    },
-                },
-                "required": ["template_path", "output_path", "replacements"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_excel",
-            "description": (
-                "Create a new Excel (.xlsx) workbook or update an existing one by appending rows to a sheet "
-                "and/or setting specific cell coordinates (e.g. {'B4': 'Complete', 'C4': 100})."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the .xlsx file (created automatically if it does not exist).",
-                    },
-                    "sheet_name": {
-                        "type": "string",
-                        "description": "Optional target worksheet name (defaults to active sheet, or creates sheet if missing).",
-                    },
-                    "append_rows": {
-                        "type": "array",
-                        "items": {"type": "array", "items": {"type": "string"}},
-                        "description": "Optional list of rows (each row is a list of cell values) to append to the bottom of the sheet.",
-                    },
-                    "cell_updates": {
-                        "type": "object",
-                        "description": "Optional dictionary mapping cell coordinates (like 'A1', 'C5') to new values.",
-                    },
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_files",
-            "description": (
-                "Search recursively across a directory tree by filename pattern and/or inside file contents "
-                "(searches plaintext, code, CSV, Word .docx, Excel .xlsx, PDF .pdf, and PowerPoint .pptx in one call)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Root directory to search from (default is current directory '.').",
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Optional case-insensitive text or keyword to search for inside files and filenames.",
-                    },
-                    "file_pattern": {
-                        "type": "string",
-                        "description": "Optional filename filter or glob pattern (e.g. '*.docx', '*.xlsx', '*memo*', default '*').",
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of matching files to return (default 30).",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-        {
-        "type": "function",
-        "function": {
-            "name": "list_inbox",
-            "description": (
-                "List recent emails in the user's Classic Outlook Inbox (returns Subject, ReceivedTime, Unread status, Categories, and EntryID). "
-                "Supports filtering by unread status or subject keywords."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "max_items": {
-                        "type": "integer",
-                        "description": "Maximum number of emails to return (default 25, max 100).",
-                    },
-                    "unread_only": {
-                        "type": "boolean",
-                        "description": "If true, only return unread emails (default false).",
-                    },
-                    "subject_filter": {
-                        "type": "string",
-                        "description": "Optional case-insensitive substring to filter email subjects.",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_calendar",
-            "description": (
-                "Read the user's Classic Outlook Calendar appointments and meetings for today and upcoming/past days "
-                "(returns Subject, Start, End, Location, AllDayEvent, and BusyStatus)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "days_ahead": {
-                        "type": "integer",
-                        "description": "Number of days ahead from today to include (default 7).",
-                    },
-                    "days_back": {
-                        "type": "integer",
-                        "description": "Number of days in the past to include (default 0).",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "open_email",
-            "description": (
-                "Pop open a specific Outlook email (or a Reply window for it) on the user's screen using its EntryID from `list_inbox`."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "entry_id": {
-                        "type": "string",
-                        "description": "The exact EntryID string of the email from `list_inbox`.",
-                    },
-                    "open_reply_window": {
-                        "type": "boolean",
-                        "description": "If true, opens a Reply draft window for the email instead of just viewing it (default false).",
-                    },
-                },
-                "required": ["entry_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_draft_email",
-            "description": (
-                "Create a new draft email in Classic Outlook and pop it open on the user's screen ready for review and manual sending. "
-                "Never auto-sends."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "subject": {
-                        "type": "string",
-                        "description": "Subject line for the draft email.",
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Plaintext body of the draft email.",
-                    },
-                    "to_hint": {
-                        "type": "string",
-                        "description": "Optional recipient email address or name.",
-                    },
-                },
-                "required": ["subject", "body"],
-            },
-        },
-    },
-]
-
-_TOOL_SCHEMAS = {t["function"]["name"]: t["function"]["parameters"] for t in TOOLS}
-
-AVAILABLE_FUNCTIONS = {
-    "list_directory": list_directory,
-    "read_file": read_file,
-    "write_file": write_file,
-    "edit_file": edit_file,
-    "run_powershell": run_powershell,
-    "read_clipboard": read_clipboard,
-    "write_clipboard": write_clipboard,
-    "open_file": open_file,
-    "write_docx": write_docx,
-    "fill_docx_template": fill_docx_template,
-    "update_excel": update_excel,
-    "search_files": search_files,
-    "list_inbox": list_inbox,
-    "get_calendar": get_calendar,
-    "open_email": open_email,
-    "create_draft_email": create_draft_email,
-
-}
 
 
 # =====================================================================
@@ -2490,26 +2216,6 @@ def _render_markdown(text: str) -> Markdown:
 
 MAX_TOOL_RESULT_CHARS = 30000
 ARG_PREVIEW_CHARS = 120
-
-
-TOOL_FRIENDLY_LABELS = {
-    "list_directory": "Listing folder",
-    "read_file": "Reading file",
-    "write_file": "Writing file",
-    "edit_file": "Editing file",
-    "search_files": "Searching files",
-    "open_file": "Opening file",
-    "run_powershell": "Running PowerShell",
-    "read_clipboard": "Reading clipboard",
-    "write_clipboard": "Copying to clipboard",
-    "write_docx": "Creating Word document",
-    "fill_docx_template": "Filling Word template",
-    "update_excel": "Updating Excel workbook",
-    "list_inbox": "Checking Outlook Inbox",
-    "get_calendar": "Checking Outlook Calendar",
-    "open_email": "Opening Outlook email",
-    "create_draft_email": "Creating Outlook draft",
-}
 
 
 def _summarize_args(fn_name: str, fn_args: dict) -> str:
