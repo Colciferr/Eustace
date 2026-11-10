@@ -4,7 +4,9 @@ from datetime import datetime, timedelta, timezone
 import difflib
 import fnmatch
 import hashlib
+import importlib
 import inspect
+import io
 import json
 import msvcrt
 import os
@@ -18,16 +20,13 @@ import threading
 import time
 import types
 import typing
+import zipfile
 
 import truststore
 truststore.inject_into_ssl()
 
 from dotenv import load_dotenv
 from openai import OpenAI, Timeout as APITimeout
-from openpyxl import Workbook, load_workbook
-from pypdf import PdfReader
-from docx import Document
-from pptx import Presentation
 from rich import box
 from rich.console import Console
 from rich.live import Live
@@ -38,7 +37,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # When output is redirected to a file or pipe, Windows uses the ANSI code page, which cannot encode the symbols
 # printed here; degrade to "?" instead of crashing mid-turn.
@@ -823,7 +822,7 @@ def _json_type(annotation) -> dict:
     return {"type": _JSON_TYPES[origin or annotation]}
 
 
-def tool(label: str, **param_docs: str):
+def tool(label: str, **param_docs):
     """Registers the decorated function as a model-callable tool. `label` is the progress text shown while it
     runs; each keyword documents one parameter and exposes it to the model."""
     def register(fn):
@@ -833,7 +832,9 @@ def tool(label: str, **param_docs: str):
             raise TypeError(f"@tool on {fn.__name__}: no such parameter(s) {sorted(unknown)}")
         params = {
             "type": "object",
-            "properties": {n: {**_json_type(hints[n]), "description": d} for n, d in param_docs.items()},
+            # a plain string documents the parameter; a dict is a complete schema for it (nested structures)
+            "properties": {n: d if isinstance(d, dict) else {**_json_type(hints[n]), "description": d}
+                           for n, d in param_docs.items()},
             "required": [n for n, p in sig.parameters.items() if n in param_docs and p.default is p.empty],
         }
         description = " ".join(inspect.getdoc(fn).split())
@@ -885,9 +886,25 @@ def list_directory(path: str = ".") -> str:
         return f"Error listing directory '{path}': {e}"
 
 
+class ToolUnavailable(Exception):
+    """An optional library could not be loaded on this machine."""
+
+
+def _need(module: str, feature: str):
+    """Imports an optional library the first time a tool needs it and returns the module.
+
+    Word, PowerPoint, Excel, PDF and Outlook support each rest on a separate package, and some of those contain
+    compiled code that application control may refuse to load. Importing here instead of at startup means a
+    missing or blocked package disables only the tools that need it; Eustace itself still starts."""
+    try:
+        return importlib.import_module(module)
+    except Exception as e:
+        raise ToolUnavailable(f"{feature} is unavailable on this machine (could not load '{module}': {e})") from e
+
+
 def _read_excel(target: str) -> str:
     """Extracts all sheets and rows from an .xlsx file as Markdown-style tables."""
-    wb = load_workbook(target, data_only=True, read_only=True)
+    wb = _need("openpyxl", "Excel support").load_workbook(target, data_only=True, read_only=True)
     out = []
     for sheet_name in wb.sheetnames:
         sheet = wb[sheet_name]
@@ -908,7 +925,7 @@ def _read_excel(target: str) -> str:
 
 def _read_pdf(target: str) -> str:
     """Extracts text page-by-page from a .pdf file."""
-    reader = PdfReader(target)
+    reader = _need("pypdf", "PDF support").PdfReader(target)
     out = [f"PDF Pages: {len(reader.pages)}\n"]
     for i, page in enumerate(reader.pages, start=1):
         text = page.extract_text() or "(No extractable text on this page)"
@@ -918,7 +935,7 @@ def _read_pdf(target: str) -> str:
 
 def _read_docx(target: str) -> str:
     """Extracts paragraphs and tables from a .docx Word document."""
-    doc = Document(target)
+    doc = _need("docx", "Word support").Document(target)
     out = []
     for p in doc.paragraphs:
         if p.text.strip():
@@ -930,21 +947,8 @@ def _read_docx(target: str) -> str:
     return "\n".join(out)
 
 
-def _read_pptx(target: str) -> str:
-    """Extracts slide text and speaker notes from a .pptx PowerPoint file."""
-    prs = Presentation(target)
-    out = [f"Presentation Slides: {len(prs.slides)}\n"]
-    for i, slide in enumerate(prs.slides, start=1):
-        out.append(f"--- Slide {i} ---")
-        for shape in slide.shapes:
-            if shape.has_text_frame and shape.text_frame.text.strip():
-                out.append(shape.text_frame.text.strip())
-        if slide.has_notes_slide and slide.notes_slide.notes_text_frame.text.strip():
-            out.append(f"[Speaker Notes]: {slide.notes_slide.notes_text_frame.text.strip()}")
-    return "\n".join(out)
-
-
-_DOC_READERS = {".xlsx": _read_excel, ".xlsm": _read_excel, ".pdf": _read_pdf, ".docx": _read_docx, ".pptx": _read_pptx}
+_DOC_READERS = {".xlsx": _read_excel, ".xlsm": _read_excel, ".pdf": _read_pdf, ".docx": _read_docx,
+                ".pptx": lambda target: _read_pptx(target)}  # defined with the PowerPoint tools below
 
 
 @tool("Reading file", path="Relative or absolute path to the file to read.")
@@ -1387,6 +1391,7 @@ def write_docx(path: str, content: str, title: str = "") -> str:
     """Create or overwrite a Microsoft Word (.docx) document from Markdown-formatted text. Supports #/##/###
     headings, bullet lists (- ), numbered lists (1. ), **bold** text, and Markdown tables (| col | col |)."""
     try:
+        Document = _need("docx", "Word support").Document  # before any prompt: do not ask for what cannot be done
         target, err = _guard_write(path, ext=(".docx",))
         if err:
             return err
@@ -1477,6 +1482,7 @@ def fill_docx_template(template_path: str, output_path: str, replacements: dict)
     """Fill placeholders (such as '{{DATE}}', '{{SUBJECT}}', '[NAME]') inside an existing Word (.docx) template
     (preserving headers, footers, tables, and formatting) and save to a new .docx file."""
     try:
+        Document = _need("docx", "Word support").Document
         src, err = _resolve_model_path(template_path)
         if err:
             return err
@@ -1550,6 +1556,7 @@ def update_excel(
     """Create a new Excel (.xlsx) workbook or update an existing one by appending rows to a sheet and/or setting
     specific cell coordinates (e.g. {'B4': 'Complete', 'C4': 100})."""
     try:
+        openpyxl = _need("openpyxl", "Excel support")
         target, err = _guard_write(path, ext=(".xlsx", ".xlsm"))
         if err:
             return err
@@ -1593,13 +1600,13 @@ def update_excel(
         if exists:
             # Without keep_vba the macro project is dropped and the file is saved as a plain workbook under an
             # .xlsm name, which Excel then refuses to open.
-            wb = load_workbook(target, keep_vba=is_macro)
+            wb = openpyxl.load_workbook(target, keep_vba=is_macro)
             if sheet_name:
                 ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(title=sheet_name)
             else:
                 ws = wb.active
         else:
-            wb = Workbook()
+            wb = openpyxl.Workbook()
             ws = wb.active
             if sheet_name:
                 ws.title = sheet_name
@@ -1630,6 +1637,553 @@ def update_excel(
         )
     except Exception as e:
         return f"Error updating Excel file '{path}': {e}"
+
+# =====================================================================
+# POWERPOINT (.pptx): outline reader, write_pptx, edit_pptx
+# =====================================================================
+
+PPTX_FEATURE = "PowerPoint support"
+MAX_PPTX_SLIDES = 200
+_PPTX_SLIDE_KEYS = {"layout", "title", "subtitle", "bullets", "notes", "table", "image_path"}
+_PPTX_SLIDE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "layout": {"type": "string", "description": "Slide layout name from the deck or template, e.g. 'Title Slide', 'Title and Content', 'Title Only'. Omit to choose automatically."},
+        "title": {"type": "string", "description": "Slide title."},
+        "subtitle": {"type": "string", "description": "Subtitle (title slides)."},
+        "bullets": {"type": "array", "items": {"type": "string"}, "description": "Body text, one entry per paragraph. Indent an entry with two leading spaces per level for sub-bullets."},
+        "notes": {"type": "string", "description": "Speaker notes."},
+        "table": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}, "description": "Table rows; the first row is the header."},
+        "image_path": {"type": "string", "description": "Path to a .png or .jpg file to place on the slide."},
+    },
+}
+
+
+def _potx_as_pptx(data: bytes) -> bytes:
+    """A PowerPoint template (.potx) is a normal deck whose main part is declared as a template, which the
+    library refuses to open. Re-declare it as a presentation in an in-memory copy."""
+    src = zipfile.ZipFile(io.BytesIO(data))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        for item in src.infolist():
+            blob = src.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                blob = blob.replace(b"presentationml.template.main+xml", b"presentationml.presentation.main+xml")
+            dst.writestr(item, blob)
+    return out.getvalue()
+
+
+def _pptx_make_widescreen(prs) -> None:
+    """The library's built-in blank deck is 4:3. Widen it to 16:9 and stretch the master and layout
+    placeholders to match, so new decks fill a modern slide."""
+    ratio = (prs.slide_height * 16 / 9) / prs.slide_width
+    prs.slide_width = int(prs.slide_height * 16 / 9)
+    for holder in [prs.slide_master, *prs.slide_layouts]:
+        for shape in holder.shapes:
+            if shape._element.xpath("./p:spPr/a:xfrm"):
+                shape.left, shape.width = int(shape.left * ratio), int(shape.width * ratio)
+
+
+def _open_presentation(source=None):
+    """Opens a deck from a path or bytes (.pptx or .potx), or a blank widescreen deck when source is None."""
+    pptx = _need("pptx", PPTX_FEATURE)
+    if source is None:
+        prs = pptx.Presentation()
+        _pptx_make_widescreen(prs)
+        return prs
+    if isinstance(source, str):
+        with open(source, "rb") as f:
+            data = f.read()
+        if source.lower().endswith(".potx"):
+            data = _potx_as_pptx(data)
+    else:
+        data = source
+    return pptx.Presentation(io.BytesIO(data))
+
+
+def _pptx_iter_shapes(shapes, depth: int = 0):
+    """Yields (shape, depth) for every shape, descending into groups."""
+    for shape in shapes:
+        yield shape, depth
+        if hasattr(shape, "shapes"):
+            yield from _pptx_iter_shapes(shape.shapes, depth + 1)
+
+
+def _pptx_shape_kind(shape) -> str:
+    try:
+        if shape.is_placeholder:
+            return shape.placeholder_format.type.name.lower().replace("_", " ")
+        if getattr(shape, "has_table", False):
+            return "table"
+        return shape.shape_type.name.lower().replace("_", " ")
+    except Exception:
+        return "shape"
+
+
+def _pptx_text_lines(text_frame) -> list[str]:
+    """Non-empty paragraphs, indented two spaces per bullet level; in-paragraph line breaks shown as ' / '."""
+    return [("  " * (p.level or 0)) + p.text.replace("\v", " / ").replace("\n", " / ")
+            for p in text_frame.paragraphs if p.text.strip()]
+
+
+def _pptx_outline(prs) -> str:
+    """Text outline of a deck: every slide's layout, each shape as '[id] name (kind): text', tables row by row,
+    grouped shapes nested, and speaker notes. read_file returns it, and the before/after diff of this outline is
+    what the user approves for write_pptx and edit_pptx."""
+    slides = list(prs.slides)
+    out = [f"Presentation: {len(slides)} slide(s)"]
+    for n, slide in enumerate(slides, start=1):
+        out.append(f"--- Slide {n} (layout: {slide.slide_layout.name}) ---")
+        for shape, depth in _pptx_iter_shapes(slide.shapes):
+            pad = "    " * depth
+            head = f"{pad}[{shape.shape_id}] {shape.name} ({_pptx_shape_kind(shape)})"
+            if getattr(shape, "has_table", False):
+                out.append(head + ":")
+                for row in shape.table.rows:
+                    out.append(pad + "    " + " | ".join(" / ".join(c.text.split("\n")).strip() for c in row.cells))
+            elif shape.has_text_frame and shape.text_frame.text.strip():
+                lines = _pptx_text_lines(shape.text_frame)
+                if len(lines) == 1:
+                    out.append(f"{head}: {lines[0].strip()}")
+                else:
+                    out.append(head + ":")
+                    out.extend(pad + "    " + line for line in lines)
+            else:
+                out.append(head)
+        if slide.has_notes_slide and slide.notes_slide.notes_text_frame.text.strip():
+            out.append("[Speaker Notes]: " + slide.notes_slide.notes_text_frame.text.strip().replace("\n", " / "))
+    return "\n".join(out)
+
+
+def _read_pptx(target: str) -> str:
+    """Outline of a .pptx PowerPoint file (see _pptx_outline)."""
+    return _pptx_outline(_open_presentation(target))
+
+
+def _pptx_set_paragraphs(text_frame, lines: list[str]) -> None:
+    """Replaces a text frame's content with one paragraph per line. Two leading spaces mean one indent level;
+    a leading '- ' or '* ' marker is dropped, since the layout supplies the bullet."""
+    text_frame.text = ""
+    for i, raw in enumerate(lines or [""]):
+        raw = str(raw)
+        stripped = raw.lstrip(" ")
+        para = text_frame.paragraphs[0] if i == 0 else text_frame.add_paragraph()
+        para.text = re.sub(r"^[-*•]\s+", "", stripped)
+        para.level = min((len(raw) - len(stripped)) // 2, 8)
+
+
+def _pptx_validate_slide(spec, where: str) -> str | None:
+    """Checks one slide description; returns an error for the model or None."""
+    if not isinstance(spec, dict):
+        return f"Error: {where} must be an object."
+    unknown = sorted(set(spec) - _PPTX_SLIDE_KEYS)
+    if unknown:
+        return f"Error: {where} has unknown field(s): {', '.join(unknown)}. Allowed: {', '.join(sorted(_PPTX_SLIDE_KEYS))}."
+    for key in ("layout", "title", "subtitle", "notes", "image_path"):
+        if key in spec and not isinstance(spec[key], str):
+            return f"Error: {where} field '{key}' must be text."
+    if "bullets" in spec and not (isinstance(spec["bullets"], list) and all(isinstance(b, str) for b in spec["bullets"])):
+        return f"Error: {where} field 'bullets' must be a list of text entries."
+    if "table" in spec:
+        rows = spec["table"]
+        if not (isinstance(rows, list) and rows and all(isinstance(r, list) and r for r in rows)):
+            return f"Error: {where} field 'table' must be a non-empty list of non-empty rows."
+        if len(rows) > 50 or max(len(r) for r in rows) > 20:
+            return f"Error: {where} table is larger than 50 rows by 20 columns."
+    return None
+
+
+def _pptx_readable(raw: str, exts: tuple[str, ...], what: str) -> tuple[str | None, str | None]:
+    """(canonical path, None) for a template or image the model may have read into a deck, else (None, error).
+    Same rules as read_file: canonical path, never a protected file, ask before leaving the workspace."""
+    canon, err = _resolve_model_path(raw)
+    if err:
+        return None, err
+    if _is_sensitive_canon(canon):  # first, so a protected path gets the same answer whether or not it exists
+        return None, f"Security Error: {what} '{raw}' is a protected file."
+    if not os.path.isfile(canon):
+        return None, f"Error: {what} not found: {raw}"
+    if not canon.lower().endswith(exts):
+        return None, f"Error: {what} must be one of: {', '.join(exts)}"
+    if os.path.getsize(canon) > 50 * 1024 * 1024:
+        return None, f"Error: {what} is larger than 50 MB."
+    if not _confirm_outside_workspace(canon, f"Use {what}"):
+        return None, f"Operation aborted: User did NOT approve using a {what} outside the working directory."
+    return canon, None
+
+
+def _pptx_pick_layout(prs, spec: dict, where: str):
+    layouts = list(prs.slide_layouts)
+    by_name = {layout.name.strip().lower(): layout for layout in layouts}
+    wanted = spec.get("layout", "").strip()
+    if wanted:
+        if wanted.lower() in by_name:
+            return by_name[wanted.lower()]
+        raise ValueError(f"{where}: no layout named '{wanted}'. Available: {', '.join(layout.name for layout in layouts)}")
+    content = bool(spec.get("bullets"))
+    extras = bool(spec.get("table") or spec.get("image_path"))
+    if not content and not extras:
+        prefer = ("title slide",) if spec.get("subtitle") or len(prs.slides) == 0 else ("title only", "section header")
+    else:
+        prefer = ("title and content",) if content else ("title only", "title and content")
+    for name in prefer:
+        if name in by_name:
+            return by_name[name]
+    # Template with its own layout names: fall back on structure (a title plus a body area), then on the first layout
+    PH = _need("pptx.enum.shapes", PPTX_FEATURE).PP_PLACEHOLDER
+    for layout in layouts:
+        kinds = {p.placeholder_format.type for p in layout.placeholders}
+        if (content or extras) and kinds & {PH.BODY, PH.OBJECT} and kinds & {PH.TITLE, PH.CENTER_TITLE}:
+            return layout
+    return layouts[0]
+
+
+def _pptx_add_slide(prs, spec: dict, where: str, image: str | None = None):
+    """Appends one slide built from a validated slide description and returns it."""
+    PH = _need("pptx.enum.shapes", PPTX_FEATURE).PP_PLACEHOLDER
+    slide = prs.slides.add_slide(_pptx_pick_layout(prs, spec, where))
+    width, height = prs.slide_width, prs.slide_height
+
+    title = spec.get("title", "").strip()
+    if title:
+        if slide.shapes.title is not None:
+            slide.shapes.title.text_frame.text = title
+        else:
+            box = slide.shapes.add_textbox(int(width * 0.06), int(height * 0.06), int(width * 0.88), int(height * 0.14))
+            box.text_frame.text = title
+
+    text_holders = [p for p in slide.placeholders
+                    if p.placeholder_format.type in (PH.SUBTITLE, PH.BODY, PH.OBJECT) and p.has_text_frame]
+    subtitle = spec.get("subtitle", "").strip()
+    if subtitle:
+        holder = next((p for p in text_holders if p.placeholder_format.type == PH.SUBTITLE), None) or (text_holders[0] if text_holders else None)
+        if holder is None:
+            raise ValueError(f"{where}: layout '{slide.slide_layout.name}' has no place for a subtitle")
+        holder.text_frame.text = subtitle
+        text_holders.remove(holder)
+
+    # The main area: the layout's body placeholder if it has one, otherwise a default box under the title
+    body = next((p for p in text_holders if p.placeholder_format.type in (PH.BODY, PH.OBJECT)), None) or (text_holders[0] if text_holders else None)
+    if body is not None:
+        left, top, w, h = body.left, body.top, body.width, body.height
+        text_holders.remove(body)
+    else:
+        left, top, w, h = int(width * 0.06), int(height * 0.24), int(width * 0.88), int(height * 0.64)
+
+    bullets, table = spec.get("bullets") or [], spec.get("table")
+    if image:  # picture takes the right-hand side whenever it shares the slide
+        shares = bool(bullets or table)
+        img_left, img_w = (left + int(w * 0.58), int(w * 0.42)) if shares else (left, w)
+        if shares:
+            w = int(w * 0.55)
+        pic = slide.shapes.add_picture(image, img_left, top)
+        scale = min(img_w / pic.width, h / pic.height)
+        pic.width, pic.height = int(pic.width * scale), int(pic.height * scale)
+        pic.left, pic.top = img_left + (img_w - pic.width) // 2, top + (h - pic.height) // 2
+    text_h = int(h * 0.45) if (bullets and table) else h
+    if bullets:
+        if body is None:
+            body = slide.shapes.add_textbox(left, top, w, text_h)
+            body.text_frame.word_wrap = True
+        else:
+            body.left, body.top, body.width, body.height = left, top, w, text_h
+        _pptx_set_paragraphs(body.text_frame, bullets)
+    elif body is not None:
+        body._element.getparent().remove(body._element)  # an empty "Click to add text" box helps nobody
+    if table:
+        cols = max(len(r) for r in table)
+        t_top, t_h = (top + int(h * 0.5), int(h * 0.5)) if bullets else (top, min(h, int(height * 0.08) * len(table)))
+        frame = slide.shapes.add_table(len(table), cols, left, t_top, w, t_h)
+        for r, row in enumerate(table):
+            for c in range(cols):
+                frame.table.cell(r, c).text = str(row[c]) if c < len(row) else ""
+    for leftover in text_holders:
+        leftover._element.getparent().remove(leftover._element)
+
+    if spec.get("notes", "").strip():
+        slide.notes_slide.notes_text_frame.text = spec["notes"].strip()
+    return slide
+
+
+def _pptx_delete_slide(prs, index: int) -> None:
+    """Removes the slide at a zero-based position (the library has no public call for this)."""
+    id_list = prs.slides._sldIdLst
+    entry = id_list[index]
+    prs.part.drop_rel(entry.rId)
+    id_list.remove(entry)
+
+
+def _pptx_move_slide(prs, index: int, to: int) -> None:
+    id_list = prs.slides._sldIdLst
+    entry = id_list[index]
+    id_list.remove(entry)
+    id_list.insert(to, entry)
+
+
+def _pptx_save(prs, target: str) -> None:
+    """Serializes fully in memory first, then swaps the file in, so a failed save cannot leave half a deck."""
+    buf = io.BytesIO()
+    prs.save(buf)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    tmp = f"{target}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(buf.getvalue())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    _mark_of_the_web(target)
+
+
+def _pptx_approve_and_save(prs, target: str, before: bytes | None, old_outline: str, action: str, detail: str = "") -> str | None:
+    """Shared tail of write_pptx and edit_pptx: show the outline diff, re-validate, confirm the file on disk is
+    still the one previewed, save. Returns an error/abort message or None on success."""
+    diff = build_unified_diff(old_outline, _pptx_outline(prs), target)
+    err = _approve_and_recheck(target, action, detail, diff)
+    if err:
+        return err
+    if (_read_bytes_or_none(target) if os.path.isfile(target) else None) != before:
+        return "Security Error: file changed between preview and write; nothing was saved. Re-run to see the new diff."
+    _pptx_save(prs, target)
+    return None
+
+
+@tool(
+    "Building presentation",
+    path="Relative or absolute path for the .pptx file to create or overwrite.",
+    slides={"type": "array", "items": _PPTX_SLIDE_SCHEMA, "description": "The slides, in order."},
+    template_path="Optional .pptx or .potx file whose theme, master and layouts the new deck should use.",
+    keep_template_slides="Keep the slides already in the template and add the new ones after them (default false: start empty).",
+)
+def write_pptx(path: str, slides: list[dict], template_path: str = "", keep_template_slides: bool = False) -> str:
+    """Create or overwrite a PowerPoint (.pptx) presentation from a list of slides. Each slide can have a title,
+    subtitle, bullets, speaker notes, a table, and an image. Pass template_path to build on an existing deck or
+    template so the result uses its theme and layouts. To change an existing deck, use edit_pptx instead."""
+    try:
+        _need("pptx", PPTX_FEATURE)
+        target, err = _guard_write(path, ext=(".pptx",))
+        if err:
+            return err
+        if not isinstance(slides, list) or not slides:
+            return "Error: 'slides' must be a non-empty list."
+        if len(slides) > MAX_PPTX_SLIDES:
+            return f"Error: more than {MAX_PPTX_SLIDES} slides in one call."
+        for n, spec in enumerate(slides, start=1):
+            err = _pptx_validate_slide(spec, f"slide {n}")
+            if err:
+                return err
+
+        template = None
+        if template_path.strip():
+            template, err = _pptx_readable(template_path, (".pptx", ".potx"), "template")
+            if err:
+                return err
+        images = {}
+        for n, spec in enumerate(slides, start=1):
+            if spec.get("image_path", "").strip():
+                images[n], err = _pptx_readable(spec["image_path"], (".png", ".jpg", ".jpeg"), "image")
+                if err:
+                    return err
+
+        before = _read_bytes_or_none(target) if os.path.isfile(target) else None
+        old_outline = ""
+        if before is not None:
+            try:
+                old_outline = _pptx_outline(_open_presentation(before))
+            except Exception:
+                old_outline = "(the existing file is not a readable presentation; all of it will be replaced)"
+
+        # Build the whole deck in memory before asking, so the approved outline is the deck that gets saved
+        prs = _open_presentation(template)
+        if template and not keep_template_slides:
+            for _ in range(len(prs.slides)):
+                _pptx_delete_slide(prs, 0)
+        for n, spec in enumerate(slides, start=1):
+            _pptx_add_slide(prs, spec, f"slide {n}", images.get(n))
+
+        detail = [f"Template: {template}"] if template else []
+        detail += [f"Image on slide {n}: {p}" for n, p in sorted(images.items())]
+        action = f"Overwrite presentation: {target}" if before is not None else f"Create presentation: {target}"
+        err = _pptx_approve_and_save(prs, target, before, old_outline, action,
+                                     "[dim]" + escape(_visible_controls("\n".join(detail))) + "[/dim]" if detail else "")
+        if err:
+            return err
+        console.print(f"[bold green]✓ Presentation saved ({len(prs.slides)} slides): {escape(target)}[/bold green]\n")
+        return f"Success: Presentation with {len(prs.slides)} slide(s) written to {target}"
+    except ToolUnavailable as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error writing presentation '{path}': {e}"
+
+
+def _pptx_replace_in_frame(text_frame, find: str, replacement: str) -> int:
+    """Replaces text paragraph by paragraph. A match inside one run keeps that run's formatting; a match that
+    spans runs collapses the paragraph into its first run (keeping that run's formatting)."""
+    count = 0
+    for para in text_frame.paragraphs:
+        runs = para.runs
+        whole = "".join(r.text for r in runs)
+        if find not in whole:
+            continue
+        count += whole.count(find)
+        wanted = whole.replace(find, replacement)
+        for run in runs:
+            if find in run.text:
+                run.text = run.text.replace(find, replacement)
+        if "".join(r.text for r in runs) != wanted:  # some match straddled a run boundary
+            runs[0].text = wanted
+            for run in runs[1:]:
+                run.text = ""
+    return count
+
+
+def _pptx_text_frames(slide):
+    """Every text frame on a slide: shapes (inside groups too), table cells, and the notes."""
+    for shape, _ in _pptx_iter_shapes(slide.shapes):
+        if getattr(shape, "has_table", False):
+            for row in shape.table.rows:
+                for cell in row.cells:
+                    yield cell.text_frame
+        elif shape.has_text_frame:
+            yield shape.text_frame
+    if slide.has_notes_slide:
+        yield slide.notes_slide.notes_text_frame
+
+
+_PPTX_OPS = {
+    "replace_text": ({"find", "replace"}, {"slide"}),
+    "set_text": ({"slide", "shape", "text"}, {"row", "col"}),
+    "set_notes": ({"slide", "text"}, set()),
+    "add_slide": (set(), {"at"} | _PPTX_SLIDE_KEYS),
+    "delete_slide": ({"slide"}, set()),
+    "move_slide": ({"slide", "to"}, set()),
+}
+
+
+def _pptx_apply(prs, op, image: str | None) -> None:
+    """Applies one edit operation in place. Raises ValueError with a message for the model when it cannot."""
+    if not isinstance(op, dict) or op.get("op") not in _PPTX_OPS:
+        raise ValueError(f"'op' must be one of: {', '.join(_PPTX_OPS)}")
+    kind = op["op"]
+    required, optional = _PPTX_OPS[kind]
+    fields = set(op) - {"op"}
+    if required - fields or fields - required - optional:
+        raise ValueError(f"{kind} takes {sorted(required)} plus optional {sorted(optional)}; got {sorted(fields)}")
+    slides = list(prs.slides)
+
+    def position(key: str, upper: int) -> int:
+        value = op[key]
+        if isinstance(value, str) and value.strip().isdigit():  # models sometimes quote numbers
+            value = int(value)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= upper:
+            raise ValueError(f"'{key}' must be a whole number from 1 to {upper}")
+        return value - 1
+
+    if kind == "replace_text":
+        find, replacement = op["find"], op["replace"]
+        if not isinstance(find, str) or not find or not isinstance(replacement, str):
+            raise ValueError("'find' must be non-empty text and 'replace' must be text")
+        scope = [slides[position("slide", len(slides))]] if "slide" in op else slides
+        if not sum(_pptx_replace_in_frame(frame, find, replacement) for s in scope for frame in _pptx_text_frames(s)):
+            raise ValueError(f"text not found: {find!r}")
+    elif kind == "set_text":
+        slide = slides[position("slide", len(slides))]
+        shape = next((s for s, _ in _pptx_iter_shapes(slide.shapes) if str(s.shape_id) == str(op["shape"]).strip()), None)
+        if shape is None:
+            raise ValueError(f"no shape with id {op['shape']!r} on that slide (ids are the [numbers] in the outline)")
+        lines = str(op["text"]).split("\n")
+        if getattr(shape, "has_table", False):
+            if "row" not in op or "col" not in op:
+                raise ValueError("that shape is a table: give 'row' and 'col' (both starting at 1)")
+            table = shape.table
+            _pptx_set_paragraphs(table.cell(position("row", len(table.rows)), position("col", len(table.columns))).text_frame, lines)
+        elif shape.has_text_frame:
+            _pptx_set_paragraphs(shape.text_frame, lines)
+        else:
+            raise ValueError("that shape cannot hold text")
+    elif kind == "set_notes":
+        slides[position("slide", len(slides))].notes_slide.notes_text_frame.text = str(op["text"])
+    elif kind == "add_slide":
+        spec = {k: v for k, v in op.items() if k in _PPTX_SLIDE_KEYS}
+        err = _pptx_validate_slide(spec, "the new slide")
+        if err:
+            raise ValueError(err.removeprefix("Error: "))
+        at = position("at", len(slides) + 1) if "at" in op else len(slides)
+        _pptx_add_slide(prs, spec, "the new slide", image)
+        _pptx_move_slide(prs, len(slides), at)
+    elif kind == "delete_slide":
+        _pptx_delete_slide(prs, position("slide", len(slides)))
+    elif kind == "move_slide":
+        _pptx_move_slide(prs, position("slide", len(slides)), position("to", len(slides)))
+
+
+@tool(
+    "Editing presentation",
+    path="Path to the existing .pptx file to change.",
+    operations={
+        "type": "array",
+        "description": (
+            "Edits applied in order; slide numbers refer to the deck as it stands at that step. Each is an object "
+            "with 'op' and its fields: "
+            "replace_text {find, replace, slide?} replaces text everywhere (or on one slide), keeping formatting; "
+            "set_text {slide, shape, text, row?, col?} sets a shape's text by the [id] shown in the outline "
+            "(row and col for a table cell; one paragraph per line, two leading spaces per indent level); "
+            "set_notes {slide, text}; "
+            "add_slide {at?, layout?, title?, subtitle?, bullets?, notes?, table?, image_path?}; "
+            "delete_slide {slide}; move_slide {slide, to}."
+        ),
+        "items": {"type": "object", "properties": {"op": {"type": "string", "enum": list(_PPTX_OPS)}}, "required": ["op"]},
+    },
+)
+def edit_pptx(path: str, operations: list[dict]) -> str:
+    """Change an existing PowerPoint (.pptx) presentation: replace text, set a shape's or table cell's text, set
+    speaker notes, and add, delete or reorder slides. Read the file first: read_file shows each slide's layout
+    and every shape's [id]."""
+    try:
+        _need("pptx", PPTX_FEATURE)
+        target, err = _guard_write(path, ext=(".pptx",))
+        if err:
+            return err
+        if not os.path.isfile(target):
+            return f"Error: File not found: {path}"
+        if not isinstance(operations, list) or not operations:
+            return "Error: 'operations' must be a non-empty list."
+        if len(operations) > 100:
+            return "Error: more than 100 operations in one call."
+
+        before = _read_bytes_or_none(target)
+        prs = _open_presentation(before)
+        old_outline = _pptx_outline(prs)
+        images = []
+        for n, op in enumerate(operations, start=1):
+            image = None
+            if isinstance(op, dict) and op.get("op") == "add_slide" and str(op.get("image_path", "")).strip():
+                image, err = _pptx_readable(op["image_path"], (".png", ".jpg", ".jpeg"), "image")
+                if err:
+                    return err
+                images.append(f"Image (operation {n}): {image}")
+            try:
+                _pptx_apply(prs, op, image)
+            except ValueError as e:
+                return f"Error in operation {n}: {e}. No changes were made."
+        if _pptx_outline(prs) == old_outline:
+            return "Error: the operations did not change anything. No changes were made."
+
+        err = _pptx_approve_and_save(prs, target, before, old_outline, f"Edit presentation: {target}",
+                                     "[dim]" + escape(_visible_controls("\n".join(images))) + "[/dim]" if images else "")
+        if err:
+            return err
+        console.print(f"[bold green]✓ Presentation edited ({len(operations)} operations): {escape(target)}[/bold green]\n")
+        return f"Success: Applied {len(operations)} operation(s) to {target}"
+    except ToolUnavailable as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error editing presentation '{path}': {e}"
+
 
 # =====================================================================
 # FILE AND DOCUMENT CONTENT SEARCH
@@ -1677,6 +2231,7 @@ def search_files(
         results = []
         office_parsed_count = 0
         files_scanned = 0
+        unreadable: set[str] = set()  # reasons a document type could not be read at all
 
         for dirpath, dirnames, filenames in os.walk(root_dir):
             # Prune ignored, protected and reparse-point directories in-place. os.walk(followlinks=False)
@@ -1740,6 +2295,8 @@ def search_files(
                     files_scanned += 1
                     try:
                         text_to_scan = _DOC_READERS[ext](full_path)
+                    except ToolUnavailable as e:
+                        unreadable.add(str(e))
                     except Exception:
                         pass
 
@@ -1763,17 +2320,18 @@ def search_files(
             if len(results) >= max_results:
                 break
 
+        skipped = "".join(f"\nNote: some documents were not searched: {reason}" for reason in sorted(unreadable))
         if not results:
             return (
                 f"No matches found in '{root_dir}' for query='{query}', file_pattern='{file_pattern}' "
-                f"(scanned {files_scanned} files)."
+                f"(scanned {files_scanned} files)." + skipped
             )
 
         header = (
             f"Found {len(results)} matching file(s) in '{root_dir}' "
             f"(scanned {files_scanned} files, {office_parsed_count} Office/PDF docs):\n\n"
         )
-        return header + "\n\n".join(results)
+        return header + "\n\n".join(results) + skipped
     except Exception as e:
         return f"Error searching files in '{path}': {e}"
 
@@ -1801,8 +2359,7 @@ def _dev_mode_gate(what: str) -> str | None:
 def _get_outlook_ns():
     """Returns (Outlook.Application, MAPI Namespace) or raises RuntimeError."""
     try:
-        import win32com.client
-        app = win32com.client.Dispatch("Outlook.Application")
+        app = _need("win32com.client", "Outlook support").Dispatch("Outlook.Application")
         ns = app.GetNamespace("MAPI")
         return app, ns
     except Exception as e:

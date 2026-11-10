@@ -81,6 +81,10 @@ class ProtectedPathSpellingTests(unittest.TestCase):
             "write_file": lambda p: cli.write_file(p, "overwritten"),
             "edit_file": lambda p: cli.edit_file(p, SECRET, "edited"),
             "open_file": lambda p: cli.open_file(p),
+            "write_pptx": lambda p: cli.write_pptx(p, [{"title": "x"}]),
+            "edit_pptx": lambda p: cli.edit_pptx(p, [{"op": "delete_slide", "slide": 1}]),
+            "write_pptx(template)": lambda p: cli.write_pptx(os.path.join(self.ws, "o.pptx"), [{"title": "x"}], template_path=p),
+            "write_pptx(image)": lambda p: cli.write_pptx(os.path.join(self.ws, "o.pptx"), [{"image_path": p}]),
             "fill_docx_template(template)": lambda p: cli.fill_docx_template(p, os.path.join(self.ws, "out.docx"), {}),
         }
         for target in (self.by_location, self.by_name):
@@ -97,6 +101,8 @@ class ProtectedPathSpellingTests(unittest.TestCase):
         tools = {
             "write_docx": lambda p: cli.write_docx(p, "body"),
             "update_excel": lambda p: cli.update_excel(p, append_rows=[["a"]]),
+            "write_pptx": lambda p: cli.write_pptx(p, [{"title": "x"}]),
+            "edit_pptx": lambda p: cli.edit_pptx(p, [{"op": "delete_slide", "slide": 1}]),
             "fill_docx_template(output)": lambda p: cli.fill_docx_template(os.path.join(self.ws, "t.docx"), p, {}),
         }
         for spelling in spellings(base, self.ws):
