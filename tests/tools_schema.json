@@ -254,6 +254,123 @@
   {
     "type": "function",
     "function": {
+      "name": "write_pptx",
+      "description": "Create or overwrite a PowerPoint (.pptx) presentation from a list of slides. Each slide can have a title, subtitle, bullets, speaker notes, a table, and an image. Pass template_path to build on an existing deck or template so the result uses its theme and layouts. To change an existing deck, use edit_pptx instead.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative or absolute path for the .pptx file to create or overwrite."
+          },
+          "slides": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "layout": {
+                  "type": "string",
+                  "description": "Slide layout name from the deck or template, e.g. 'Title Slide', 'Title and Content', 'Title Only'. Omit to choose automatically."
+                },
+                "title": {
+                  "type": "string",
+                  "description": "Slide title."
+                },
+                "subtitle": {
+                  "type": "string",
+                  "description": "Subtitle (title slides)."
+                },
+                "bullets": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Body text, one entry per paragraph. Indent an entry with two leading spaces per level for sub-bullets."
+                },
+                "notes": {
+                  "type": "string",
+                  "description": "Speaker notes."
+                },
+                "table": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "description": "Table rows; the first row is the header."
+                },
+                "image_path": {
+                  "type": "string",
+                  "description": "Path to a .png or .jpg file to place on the slide."
+                }
+              }
+            },
+            "description": "The slides, in order."
+          },
+          "template_path": {
+            "type": "string",
+            "description": "Optional .pptx or .potx file whose theme, master and layouts the new deck should use."
+          },
+          "keep_template_slides": {
+            "type": "boolean",
+            "description": "Keep the slides already in the template and add the new ones after them (default false: start empty)."
+          }
+        },
+        "required": [
+          "path",
+          "slides"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "edit_pptx",
+      "description": "Change an existing PowerPoint (.pptx) presentation: replace text, set a shape's or table cell's text, set speaker notes, and add, delete or reorder slides. Read the file first: read_file shows each slide's layout and every shape's [id].",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the existing .pptx file to change."
+          },
+          "operations": {
+            "type": "array",
+            "description": "Edits applied in order; slide numbers refer to the deck as it stands at that step. Each is an object with 'op' and its fields: replace_text {find, replace, slide?} replaces text everywhere (or on one slide), keeping formatting; set_text {slide, shape, text, row?, col?} sets a shape's text by the [id] shown in the outline (row and col for a table cell; one paragraph per line, two leading spaces per indent level); set_notes {slide, text}; add_slide {at?, layout?, title?, subtitle?, bullets?, notes?, table?, image_path?}; delete_slide {slide}; move_slide {slide, to}.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "op": {
+                  "type": "string",
+                  "enum": [
+                    "replace_text",
+                    "set_text",
+                    "set_notes",
+                    "add_slide",
+                    "delete_slide",
+                    "move_slide"
+                  ]
+                }
+              },
+              "required": [
+                "op"
+              ]
+            }
+          }
+        },
+        "required": [
+          "path",
+          "operations"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "search_files",
       "description": "Search recursively across a directory tree by filename pattern and/or inside file contents (searches plaintext, code, CSV, Word .docx, Excel .xlsx, PDF .pdf, and PowerPoint .pptx in one call).",
       "parameters": {
