@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace as NS
 
 sys.argv = ["cli"]  # never let unittest flags reach cli's flag parser
@@ -127,3 +128,29 @@ def typed(*lines):
 def output() -> str:
     """Everything printed to the sandboxed console so far."""
     return cli.console.file.getvalue()
+
+
+@contextlib.contextmanager
+def keys(*chunks):
+    """Runs the interactive UI (input box, menus) against scripted keystrokes instead of a console.
+    Useful sequences: Enter "\\r", Down "\\x1b[B", Up "\\x1b[A", Alt+Enter "\\x1b\\r", Ctrl+C "\\x03", Ctrl+D "\\x04".
+    If a test's keys never finish the prompt, a watchdog sends Ctrl+C so the test fails instead of hanging."""
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    saved_io, saved_enabled = dict(cli._UI_IO), cli._ui_enabled
+    with create_pipe_input() as pipe:
+        for chunk in chunks:
+            pipe.send_text(chunk)
+        watchdog = threading.Timer(5.0, lambda: pipe.send_text("\x03\x03\x03\x04"))
+        watchdog.daemon = True
+        watchdog.start()
+        cli._UI_IO.update(input=pipe, output=DummyOutput())
+        cli._ui_enabled = lambda: True
+        try:
+            yield pipe
+        finally:
+            watchdog.cancel()
+            cli._UI_IO.clear()
+            cli._UI_IO.update(saved_io)
+            cli._ui_enabled = saved_enabled

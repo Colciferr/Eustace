@@ -16,7 +16,10 @@ dependencies = [
     "pypdf",
     "python-docx",
     "python-pptx",
-    "pywin32"
+    "pywin32",
+    "prompt_toolkit",
+    # prompt_toolkit needs wcwidth; 0.9+ ships compiled Windows wheels, which application control can block
+    "wcwidth<0.9"
 ]
 
 [project.scripts]

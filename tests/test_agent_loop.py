@@ -283,15 +283,15 @@ class ApprovalPromptTests(unittest.TestCase):
             out = output()
         self.assertIn("50 more diff lines", out)
         self.assertIn("View Full Diff", out)
-        self.assertIn("+line 150", out)
+        self.assertIn("150 + line 150", out)
 
     def test_long_diff_without_v_never_shows_the_tail(self):
         handler = cli.CLIApprovalHandler()
         with sandbox(), typed("n"):
             self.assertFalse(handler.request_approval("Edit file: x", diff_text=self.LONG_DIFF))
             out = output()
-        self.assertIn("+line 100", out)
-        self.assertNotIn("+line 101", out)
+        self.assertIn("100 + line 100", out)
+        self.assertNotIn("+ line 101", out)
 
     def test_short_diff_offers_no_view_option(self):
         handler = cli.CLIApprovalHandler()
@@ -322,8 +322,8 @@ class MainLoopSmokeTests(unittest.TestCase):
         cli._init_client = lambda: None
         try:
             with sandbox(client=client, approval=RecordingApproval()) as (ws, home):
-                with typed("", "/sessions", "hi", "/save my session", "/sessions", "/compact", "/model", "",
-                           "/model custom-model-id", "/clear", "list", "/resume my session", "/resume 99", "/exit"):
+                with typed("", "/help", "/status", "/nope", "/sessions", "hi", "/save my session", "/sessions", "/compact",
+                           "/model", "", "/model custom-model-id", "/clear", "list", "/resume my session", "/resume 99", "/exit"):
                     cli.main()
                 out = output()
                 saved = sorted(os.listdir(cli.SESSIONS_DIR))
@@ -333,6 +333,11 @@ class MainLoopSmokeTests(unittest.TestCase):
         finally:
             cli._init_client, cli.MODEL, cli.AUTOSAVE_NAME = saved_init, saved_model, saved_name
         self.assertIn(f"Eustace v{cli.VERSION}", out)
+        for name, (description, _) in cli.COMMANDS.items():  # /help lists every command the loop dispatches
+            self.assertIn(name, out)
+            self.assertIn(description, out)
+        self.assertIn("Session:", out)
+        self.assertIn("Unknown command /nope", out)
         self.assertIn("No saved sessions yet", out)
         self.assertIn("Hello!", out)
         self.assertIn("Context compacted", out)
