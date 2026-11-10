@@ -60,5 +60,72 @@ class ExcelMacroTests(unittest.TestCase):
             self.assertIn("rewritten", approval.calls[1][1])
 
 
+class _FakeEvent:
+    Subject, Location, AllDayEvent, BusyStatus = "Staff sync", "Bldg 1", False, 2
+    Start, End = "2026-11-10 09:00:00", "2026-11-10 09:30:00"
+
+
+class _FakeItems:
+    """Records the order of the calls Outlook is sensitive to."""
+
+    def __init__(self, restrict_error=None):
+        self.log = []
+        self.restrict_error = restrict_error
+        self._queue = []
+
+    def Sort(self, prop, descending=False):
+        self.log.append(("Sort", prop))
+
+    def __setattr__(self, name, value):
+        if name == "IncludeRecurrences":
+            self.log.append(("IncludeRecurrences", value))
+        object.__setattr__(self, name, value)
+
+    def Restrict(self, query):
+        self.log.append(("Restrict", query))
+        if self.restrict_error:
+            raise self.restrict_error
+        self._queue = [_FakeEvent()]
+        return self
+
+    def GetFirst(self):
+        self.log.append(("GetFirst",))
+        return self._queue.pop(0) if self._queue else None
+
+    GetNext = GetFirst
+
+
+class CalendarQueryTests(unittest.TestCase):
+    def _calendar(self, items):
+        folder = type("Folder", (), {"Items": items})()
+        ns = type("NS", (), {"GetDefaultFolder": lambda self, n: folder})()
+        saved = cli._get_outlook_ns
+        cli._get_outlook_ns = lambda: (None, ns)
+        try:
+            return cli.get_calendar(days_ahead=7)
+        finally:
+            cli._get_outlook_ns = saved
+
+    def test_sort_then_recurrences_then_restrict(self):
+        items = _FakeItems()
+        out = self._calendar(items)
+        self.assertEqual([c[0] for c in items.log[:3]], ["Sort", "IncludeRecurrences", "Restrict"])
+        self.assertEqual(items.log[0], ("Sort", "[Start]"))
+        self.assertEqual(items.log[1], ("IncludeRecurrences", True))
+        self.assertIn("Staff sync", out)
+
+    def test_filter_selects_overlapping_events(self):
+        items = _FakeItems()
+        self._calendar(items)
+        query = items.log[2][1]
+        self.assertRegex(query, r"^\[End\] >= '.+' AND \[Start\] <= '.+'$")
+
+    def test_rejected_filter_is_an_error_not_the_whole_calendar(self):
+        items = _FakeItems(restrict_error=RuntimeError("bad filter"))
+        out = self._calendar(items)
+        self.assertIn("Error reading Outlook Calendar", out)
+        self.assertNotIn(("GetFirst",), items.log)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1700,9 +1700,11 @@ def get_calendar(days_ahead: int = 7, days_back: int = 0) -> str:
     try:
         _, ns = _get_outlook_ns()
         cal_folder = ns.GetDefaultFolder(9)  # olFolderCalendar = 9
+        # Outlook only expands recurring meetings when the collection is sorted by Start *before*
+        # IncludeRecurrences is set, and the filter is applied last.
         items = cal_folder.Items
-        items.IncludeRecurrences = True
         items.Sort("[Start]")
+        items.IncludeRecurrences = True
 
         now = datetime.now()
         start_dt = (now - timedelta(days=max(0, days_back))).replace(hour=0, minute=0, second=0)
@@ -1711,12 +1713,15 @@ def get_calendar(days_ahead: int = 7, days_back: int = 0) -> str:
         # Outlook Restrict filter uses US date format MM/DD/YYYY HH:MM AM/PM
         start_str = start_dt.strftime("%m/%d/%Y %I:%M %p")
         end_str = end_dt.strftime("%m/%d/%Y %I:%M %p")
-        restriction = f"[Start] >= '{start_str}' AND [Start] <= '{end_str}'"
+        # Overlap test, so a meeting already in progress at the start of the window is included
+        restriction = f"[End] >= '{start_str}' AND [Start] <= '{end_str}'"
 
         try:
             filtered = items.Restrict(restriction)
-        except Exception:
-            filtered = items
+        except Exception as e:
+            # Never fall back to the unfiltered collection: with recurrences expanded it has no end, and its
+            # first entries would be reported under the requested date range.
+            return f"Error reading Outlook Calendar: the date filter was rejected ({e})."
 
         events = []
         BUSY_MAP = {0: "Free", 1: "Tentative", 2: "Busy", 3: "Out of Office", 4: "Working Elsewhere"}
