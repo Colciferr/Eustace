@@ -3720,7 +3720,7 @@ class _Quit(Exception):
 def _cmd_help(state: dict, arg: str) -> None:
     table = Table(box=None, show_header=False, padding=(0, 2, 0, 2))
     for name, (desc, _) in COMMANDS.items():
-        table.add_row(f"[cyan]{name}[/cyan]", desc)
+        table.add_row(f"[cyan]{escape(name)}[/cyan]", escape(desc))  # "[name]" in a description is text, not markup
     console.print(table)
     console.print(
         "  [dim]Enter sends · Alt+Enter or a trailing \\ adds a line · ↑↓ history · @ completes a file path\n"
