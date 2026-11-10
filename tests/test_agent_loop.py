@@ -3,7 +3,7 @@ import json
 import os
 import unittest
 
-from _harness import cli, ScriptedClient, RecordingApproval, sandbox, text, call
+from _harness import cli, ScriptedClient, RecordingApproval, sandbox, text, call, typed, output
 
 
 class ToolSchemaTests(unittest.TestCase):
@@ -206,6 +206,100 @@ class DispatchValidationTests(unittest.TestCase):
     def test_empty_arguments_string_means_no_arguments(self):
         result, _, _ = self._run("list_directory", "")
         self.assertIn("note.txt", result)
+
+
+class CompactTests(unittest.TestCase):
+    HISTORY = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "list"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "list_directory", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "Contents of ..."},
+        {"role": "assistant", "content": "done"},
+    ]
+
+    def test_compact_sends_tools_but_forbids_calls_and_replaces_history(self):
+        client = ScriptedClient([text("Summary: "), text("listed a folder.")])
+        with sandbox(client=client):
+            out = cli.compact_messages(list(self.HISTORY))
+        req = client.requests[0]
+        self.assertEqual(req["tool_choice"], "none")
+        self.assertEqual(req["tools"], cli.TOOLS)
+        self.assertTrue(req["stream"])
+        self.assertEqual(req["messages"][-1]["content"], cli.COMPACT_INSTRUCTION)
+        self.assertEqual([m["role"] for m in out], ["system", "user", "assistant"])
+        self.assertIn("Summary: listed a folder.", out[1]["content"])
+
+    def test_compact_can_be_interrupted_and_leaves_history_alone(self):
+        def interrupted():
+            yield text("Summ")
+            raise KeyboardInterrupt
+
+        history = list(self.HISTORY)
+        with sandbox(client=ScriptedClient(interrupted)):
+            with self.assertRaises(KeyboardInterrupt):
+                cli.compact_messages(history)
+        self.assertEqual(history, self.HISTORY)
+
+    def test_empty_summary_is_an_error(self):
+        with sandbox(client=ScriptedClient([text("  ")])):
+            with self.assertRaises(RuntimeError):
+                cli.compact_messages(list(self.HISTORY))
+
+
+class DisplayFidelityTests(unittest.TestCase):
+    def test_link_targets_are_printed(self):
+        with sandbox():
+            cli.console.print(cli._render_markdown("See [the docs](https://evil.example/c?d=secret)."))
+            self.assertIn("https://evil.example/c?d=secret", output())
+
+    def test_reply_text_cannot_smuggle_terminal_escapes(self):
+        with sandbox():
+            cli.console.print(cli._render_markdown("ok\x1b]52;c;QUJD\x07 done"))
+            self.assertNotIn("\x1b]52", output())
+            self.assertIn("\\x1b]52;c;QUJD\\x07", output())
+
+
+class ApprovalPromptTests(unittest.TestCase):
+    LONG_DIFF = "\n".join(f"+line {i}" for i in range(1, 151))
+
+    def test_default_is_deny(self):
+        handler = cli.CLIApprovalHandler()
+        with sandbox(), typed(""):
+            self.assertFalse(handler.request_approval("Edit file: x", diff_text="+a"))
+        self.assertEqual(handler.last_decision, "denied_user")
+
+    def test_long_diff_is_cut_with_notice_and_v_shows_all(self):
+        handler = cli.CLIApprovalHandler()
+        with sandbox(), typed("v", "y"):
+            self.assertTrue(handler.request_approval("Edit file: x", diff_text=self.LONG_DIFF))
+            out = output()
+        self.assertIn("50 more diff lines", out)
+        self.assertIn("View Full Diff", out)
+        self.assertIn("+line 150", out)
+
+    def test_long_diff_without_v_never_shows_the_tail(self):
+        handler = cli.CLIApprovalHandler()
+        with sandbox(), typed("n"):
+            self.assertFalse(handler.request_approval("Edit file: x", diff_text=self.LONG_DIFF))
+            out = output()
+        self.assertIn("+line 100", out)
+        self.assertNotIn("+line 101", out)
+
+    def test_short_diff_offers_no_view_option(self):
+        handler = cli.CLIApprovalHandler()
+        with sandbox(), typed("v"):  # "v" is not an option here, so it is a denial
+            self.assertFalse(handler.request_approval("Edit file: x", diff_text="+a"))
+            self.assertNotIn("View Full Diff", output())
+
+    def test_control_characters_in_title_and_diff_are_visible(self):
+        handler = cli.CLIApprovalHandler()
+        with sandbox(), typed("n"):
+            handler.request_approval("Edit file: a\rb", diff_text="+safe\x1b[2Jtext")
+            out = output()
+        self.assertIn("a\\x0db", out)
+        self.assertIn("\\x1b[2J", out)
+        self.assertNotIn("\x1b[2J", out)
 
 
 if __name__ == "__main__":

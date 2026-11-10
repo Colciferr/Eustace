@@ -38,6 +38,14 @@ from rich.text import Text
 
 VERSION = "1.1.3"
 
+# When output is redirected to a file or pipe, Windows uses the ANSI code page, which cannot encode the symbols
+# printed here; degrade to "?" instead of crashing mid-turn.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 # --- Command-line flags (read before any path or client is derived from them) ---
 _ARGS = sys.argv[1:]
 if "--help" in _ARGS or "-h" in _ARGS:
@@ -660,47 +668,49 @@ class CLIApprovalHandler:
     def request_approval(self, action_title: str, detail_text: str = "", diff_text: str = "") -> bool:
         if self.approve_all_for_turn:
             self.last_decision = "approved_all_turn"
-            console.print(f"  [dim green]✓ Auto-approved: {escape(action_title)}[/dim green]")
+            console.print(f"  [dim green]✓ Auto-approved: {escape(_visible_controls(action_title))}[/dim green]")
             return True
 
         # Bind the display to the bytes that will act: control characters (CR, ESC, VT, FF...) that rich
         # would silently drop or the terminal would interpret are made visible before anything is rendered.
         action_title = _visible_controls(action_title)
-        if diff_text:
-            diff_text = _visible_controls(diff_text.replace("\r\n", "\n"))
-            lines = diff_text.splitlines()
-            shown_diff = "\n".join(lines[:100])
-            if len(lines) > 100:
-                shown_diff += f"\n... ({len(lines) - 100} more diff lines)"
+        diff_lines = _visible_controls(diff_text.replace("\r\n", "\n")).splitlines() if diff_text else []
+        hidden = len(diff_lines) - DIFF_PREVIEW_LINES
+        shown = diff_lines[:DIFF_PREVIEW_LINES]
+        if hidden > 0:
+            shown.append(f"... ({hidden} more diff lines; press V to view all of them)")
+
+        keys = "[bold yellow]\\[Y][/bold yellow] Approve   [bold yellow]\\[N][/bold yellow] Deny   [bold yellow]\\[A][/bold yellow] Approve All This Turn"
+        if hidden > 0:
+            keys += "   [bold yellow]\\[V][/bold yellow] View Full Diff"
+        if diff_lines:
+            body = Syntax("\n".join(shown), "diff", theme="monokai", word_wrap=True)
+        else:
+            body = detail_text or escape(action_title)
 
         console.print()
-        if diff_text:
-            if detail_text:
-                console.print(f"  {detail_text}")
-            console.print(
-                Panel(
-                    Syntax(shown_diff, "diff", theme="monokai", word_wrap=True),
-                    title=f"[bold yellow]⚠️  Approval Required: {escape(action_title)}[/bold yellow]",
-                    subtitle="[bold yellow]\\[Y][/bold yellow] Approve   [bold yellow]\\[N][/bold yellow] Deny   [bold yellow]\\[A][/bold yellow] Approve All This Turn",
-                    border_style="yellow",
-                    box=box.ROUNDED,
-                    padding=(0, 1),
-                )
+        if diff_lines and detail_text:
+            console.print(f"  {detail_text}")
+        console.print(
+            Panel(
+                body,
+                title=f"[bold yellow]⚠️  Approval Required: {escape(action_title)}[/bold yellow]",
+                subtitle=keys,
+                border_style="yellow",
+                box=box.ROUNDED,
+                padding=(0, 1),
             )
-        else:
-            console.print(
-                Panel(
-                    detail_text or escape(action_title),
-                    title=f"[bold yellow]⚠️  Approval Required: {escape(action_title)}[/bold yellow]",
-                    subtitle="[bold yellow]\\[Y][/bold yellow] Approve   [bold yellow]\\[N][/bold yellow] Deny   [bold yellow]\\[A][/bold yellow] Approve All This Turn",
-                    border_style="yellow",
-                    box=box.ROUNDED,
-                    padding=(0, 1),
-                )
-            )
+        )
 
-        console.print("  [bold yellow]Choice (y/n/a) \\[default: N]:[/bold yellow] ", end="")
-        choice = input().strip().lower()
+        while True:
+            options = "y/n/a/v" if hidden > 0 else "y/n/a"
+            console.print(f"  [bold yellow]Choice ({options}) \\[default: N]:[/bold yellow] ", end="")
+            choice = input().strip().lower()
+            if hidden > 0 and choice in ("v", "view"):
+                console.print(Syntax("\n".join(diff_lines), "diff", theme="monokai", word_wrap=True))
+                continue
+            break
+
         if choice in ("a", "all"):
             self.approve_all_for_turn = True
             self.last_decision = "approved_all_turn"
@@ -713,6 +723,7 @@ class CLIApprovalHandler:
         return False
 
 
+DIFF_PREVIEW_LINES = 100
 
 APPROVAL_HANDLER = CLIApprovalHandler()
 
@@ -2471,6 +2482,12 @@ def check_user_abort():
                 raise KeyboardInterrupt("Aborted via ESC key")
 
 
+def _render_markdown(text: str) -> Markdown:
+    """Model text as Markdown with control characters exposed. hyperlinks=False prints each link's URL beside its
+    text instead of hiding it behind a clickable label, so a link cannot display one destination and open another."""
+    return Markdown(_sanitize_for_display(text), hyperlinks=False)
+
+
 MAX_TOOL_RESULT_CHARS = 30000
 ARG_PREVIEW_CHARS = 120
 
@@ -2674,7 +2691,7 @@ def run_agent_turn(messages: list[dict]):
                 console.print()
                 console.print(
                     Panel(
-                        Markdown(_sanitize_for_display(full_reply)),
+                        _render_markdown(full_reply),
                         title=f"[bold cyan]Eustace[/bold cyan] [dim]({short_model_label(MODEL)}{' | DEV' if DEV_MODE else ''})[/dim]",
                         title_align="left",
                         border_style="cyan",
@@ -2747,7 +2764,7 @@ def run_agent_turn(messages: list[dict]):
     except KeyboardInterrupt:
         console.print("\n  [bold red]⏹ Stopped by user[/bold red]")
         if partial_reply:
-            console.print(Markdown(_sanitize_for_display(partial_reply)))
+            console.print(_render_markdown(partial_reply))
             console.print("[dim](partial reply)[/dim]")
         # Keep what already happened: tool calls that ran changed real files, and the model must still know.
         _close_open_tool_calls(messages, turn_start_len)
@@ -2757,7 +2774,7 @@ def run_agent_turn(messages: list[dict]):
         err_line = _format_api_error(e)
         console.print(f"\n[bold red]System Loop Error:[/bold red] {escape(err_line)}")
         if partial_reply:
-            console.print(Markdown(_sanitize_for_display(partial_reply)))
+            console.print(_render_markdown(partial_reply))
             console.print("[dim](partial reply)[/dim]")
         # Roll the turn back so a request the API rejected cannot poison every later one, but carry a plain-text
         # record of the tool calls that did run.
@@ -2781,14 +2798,27 @@ def compact_messages(messages: list[dict]) -> list[dict]:
     if len(messages) <= 1:
         return messages
 
-    console.print("  [dim cyan]Compacting conversation...[/dim cyan]", end="\r")
-    response = client.chat.completions.create(
+    console.print("  [dim cyan]Compacting conversation... (press ESC or Ctrl+C to cancel)[/dim cyan]", end="\r")
+    # Same worker as a normal turn, so ESC cancels. The history contains tool calls, so the tool list must
+    # accompany it; tool_choice "none" makes the model answer in text.
+    worker = _StreamWorker(
         model=MODEL,
         messages=messages + [{"role": "user", "content": COMPACT_INSTRUCTION}],
+        tools=TOOLS,
+        tool_choice="none",
+        stream=True,
     )
-    print(" " * 60, end="\r", flush=True)
+    summary = ""
+    try:
+        for chunk in worker:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta is not None and delta.content:
+                summary += delta.content
+    finally:
+        worker.cancel()
+        print(" " * 70, end="\r", flush=True)
 
-    summary = (response.choices[0].message.content or "").strip()
+    summary = summary.strip()
     if not summary:
         raise RuntimeError("Model returned an empty summary; history left unchanged.")
 

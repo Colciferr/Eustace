@@ -2,6 +2,7 @@
 
 Not a test module itself (unittest discovery only picks up test*.py).
 """
+import builtins
 import contextlib
 import copy
 import io
@@ -102,3 +103,26 @@ def sandbox(client=None, approval=None):
         for n, v in saved.items():
             setattr(cli, n, v)
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def typed(*lines):
+    """Feeds the given lines to input(), one per call; fails the test if more are requested."""
+    queue = list(lines)
+
+    def fake_input(prompt=""):
+        if not queue:
+            raise AssertionError("input() called more times than the test scripted")
+        return queue.pop(0)
+
+    saved = builtins.input
+    builtins.input = fake_input
+    try:
+        yield queue
+    finally:
+        builtins.input = saved
+
+
+def output() -> str:
+    """Everything printed to the sandboxed console so far."""
+    return cli.console.file.getvalue()
