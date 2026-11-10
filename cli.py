@@ -400,6 +400,10 @@ PROTECTED_ROOTS = [
         os.environ.get("ProgramFiles"),
         os.environ.get("ProgramFiles(x86)"),
         os.environ.get("ProgramW6432"),
+        os.path.join(os.environ.get("APPDATA") or os.path.join(_HOME_DIR, "AppData", "Roaming"),
+                     "Microsoft", "Windows", "Start Menu", "Programs", "Startup"),
+        os.path.join(os.environ.get("ProgramData") or r"C:\ProgramData",
+                     "Microsoft", "Windows", "Start Menu", "Programs", "StartUp"),
     ) if p
 ]
 
@@ -513,6 +517,15 @@ def _mark_of_the_web(path: str) -> None:
         pass
 
 
+def _head_lines(text: str, limit: int) -> str:
+    """The first `limit` lines of text, with an explicit count of what was left out. Approval previews use
+    this so a cut-off preview never looks like the whole content."""
+    lines = str(text).replace("\r\n", "\n").split("\n")
+    if len(lines) <= limit:
+        return "\n".join(lines)
+    return "\n".join(lines[:limit]) + f"\n... (+{len(lines) - limit} more lines not shown)"
+
+
 def _trusted_powershell() -> str | None:
     """Locates a PowerShell host by absolute path, never from the current directory."""
     candidates = []
@@ -570,8 +583,12 @@ def _is_sensitive_canon(canon: str) -> bool:
 
 
 def _is_protected_path(target: str) -> bool:
-    """True if target is inside the Windows or Program Files trees."""
-    return any(_is_under(target, root) for root in PROTECTED_ROOTS)
+    """True if the model must never write here: the Windows and Program Files trees, the Startup folders,
+    and PowerShell profile scripts (the last two run code automatically at logon or shell start)."""
+    if any(_is_under(target, root) for root in PROTECTED_ROOTS):
+        return True
+    folder, name = os.path.split(os.path.normpath(target).lower())
+    return fnmatch.fnmatch(name, "*profile.ps1") and os.path.basename(folder) in ("windowspowershell", "powershell")
 
 
 def _recheck_after_approval(canon: str, writing: bool = True) -> str | None:
@@ -621,6 +638,7 @@ def _confirm_outside_workspace(canon: str, action: str) -> bool:
     return APPROVAL_HANDLER.request_approval(
         f"{action} outside the working directory",
         detail_text=f"[dim]Path:      {escape(_visible_controls(canon))}\nWorkspace: {escape(ws)}[/dim]",
+        always_ask=True,
     )
 
 
@@ -632,7 +650,7 @@ def _check_phi_guardrail(target: str, content: str = "") -> str | None:
             f"Security Policy Block: '{name}' matches a Protected Health Information (PHI) "
             "filename pattern. Processing PHI (such as medical records) is strictly prohibited."
         )
-    if content and PHI_CONTENT_REGEX.search(content[:15000]):
+    if content and PHI_CONTENT_REGEX.search(content):
         return (
             f"Security Policy Block: '{name}' contains Protected Health Information (PHI) "
             "markers. While CUI and PII are authorized, processing PHI is strictly prohibited."
@@ -640,19 +658,33 @@ def _check_phi_guardrail(target: str, content: str = "") -> str | None:
     return None
 
 
+_AUDIT_CONTENT_KEYS = {"content", "old_text", "new_text", "text", "html_body", "body"}
+
+
+def _audit_digest(value) -> str:
+    """Size and short hash of a value: enough to correlate log entries without storing the data itself."""
+    if isinstance(value, str):
+        blob, size = value, f"{len(value)} chars"
+    else:
+        blob, size = json.dumps(value, sort_keys=True, default=str), f"{type(value).__name__}, {len(value)} items"
+    return f"<{size}, sha256:{hashlib.sha256(blob.encode('utf-8', errors='replace')).hexdigest()[:12]}>"
+
+
 def log_audit_event(tool_name: str, args: dict, decision: str, result: str):
-    """Appends a structured audit record to ~/.eustace/audit.jsonl."""
+    """Appends a structured audit record to ~/.eustace/audit.jsonl.
+
+    The log records what was done, not the data it touched: file contents, document values and tool output
+    appear only as size + hash. Paths, commands, and error text are kept verbatim."""
     try:
-        os.makedirs(EUSTACE_HOME, exist_ok=True)
         safe_args = {}
         for k, v in args.items():
-            if k in ("content", "old_text", "new_text", "text", "html_body", "body") and isinstance(v, str):
-                digest = hashlib.sha256(v.encode("utf-8", errors="replace")).hexdigest()[:12]
-                safe_args[k] = f"<{len(v)} chars, sha256:{digest}>"
+            if isinstance(v, (dict, list)) or (isinstance(v, str) and (k in _AUDIT_CONTENT_KEYS or (len(v) > 200 and k != "command"))):
+                safe_args[k] = _audit_digest(v)
             else:
                 safe_args[k] = v
 
         res_str = str(result)
+        failed = res_str.startswith(("Error", "Security", "Operation aborted"))
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "backend": BACKEND_NAME,
@@ -661,11 +693,12 @@ def log_audit_event(tool_name: str, args: dict, decision: str, result: str):
             "tool": tool_name,
             "args": safe_args,
             "decision": decision,
-            "status": "error" if res_str.startswith(("Error:", "Security", "Operation aborted")) else "ok",
-            "result_preview": res_str[:200],
+            "status": "error" if failed else "ok",
+            "result_preview": res_str[:200] if failed or res_str.startswith("Success") else _audit_digest(res_str),
         }
+        os.makedirs(EUSTACE_HOME, exist_ok=True)
         with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     except Exception:
         pass
 
@@ -685,33 +718,42 @@ def build_unified_diff(old_text: str, new_text: str, path: str) -> str:
 
 
 class CLIApprovalHandler:
-    """Decoupled approval UX supporting unified diffs and 'yes to all for this turn'."""
+    """Approval prompt with unified diffs. [A] approves further calls of the *same tool* for the rest of the
+    turn; requests marked always_ask (shell commands, access outside the working directory, dev-mode data
+    warnings) are never covered by it."""
 
     def __init__(self):
-        self.approve_all_for_turn = False
+        self.approved_tools: set[str] = set()
+        self.current_tool = ""   # set by the agent loop before each tool runs
         self.last_decision = "auto"
 
     def reset_turn(self):
-        self.approve_all_for_turn = False
+        self.approved_tools.clear()
         self.last_decision = "auto"
 
-    def request_approval(self, action_title: str, detail_text: str = "", diff_text: str = "") -> bool:
-        if self.approve_all_for_turn:
-            self.last_decision = "approved_all_turn"
-            console.print(f"  [dim green]✓ Auto-approved: {escape(_visible_controls(action_title))}[/dim green]")
-            return True
-
+    def request_approval(self, action_title: str, detail_text: str = "", diff_text: str = "", always_ask: bool = False) -> bool:
         # Bind the display to the bytes that will act: control characters (CR, ESC, VT, FF...) that rich
         # would silently drop or the terminal would interpret are made visible before anything is rendered.
         action_title = _visible_controls(action_title)
+        if not always_ask and self.current_tool in self.approved_tools:
+            self.last_decision = "approved_all_turn"
+            console.print(f"  [dim green]✓ Auto-approved ({escape(self.current_tool)} this turn): {escape(action_title)}[/dim green]")
+            return True
+
         diff_lines = _visible_controls(diff_text.replace("\r\n", "\n")).splitlines() if diff_text else []
         hidden = len(diff_lines) - DIFF_PREVIEW_LINES
         shown = diff_lines[:DIFF_PREVIEW_LINES]
         if hidden > 0:
             shown.append(f"... ({hidden} more diff lines; press V to view all of them)")
 
-        keys = "[bold yellow]\\[Y][/bold yellow] Approve   [bold yellow]\\[N][/bold yellow] Deny   [bold yellow]\\[A][/bold yellow] Approve All This Turn"
+        can_approve_all = not always_ask and bool(self.current_tool)
+        options = ["y", "n"]
+        keys = "[bold yellow]\\[Y][/bold yellow] Approve   [bold yellow]\\[N][/bold yellow] Deny"
+        if can_approve_all:
+            options.append("a")
+            keys += f"   [bold yellow]\\[A][/bold yellow] Approve all {escape(self.current_tool)} this turn"
         if hidden > 0:
+            options.append("v")
             keys += "   [bold yellow]\\[V][/bold yellow] View Full Diff"
         if diff_lines:
             body = Syntax("\n".join(shown), "diff", theme="monokai", word_wrap=True)
@@ -733,19 +775,18 @@ class CLIApprovalHandler:
         )
 
         while True:
-            options = "y/n/a/v" if hidden > 0 else "y/n/a"
-            console.print(f"  [bold yellow]Choice ({options}) \\[default: N]:[/bold yellow] ", end="")
-            choice = input().strip().lower()
-            if hidden > 0 and choice in ("v", "view"):
+            console.print(f"  [bold yellow]Choice ({'/'.join(options)}) \\[default: N]:[/bold yellow] ", end="")
+            choice = input().strip().lower()[:1]
+            if choice == "v" and hidden > 0:
                 console.print(Syntax("\n".join(diff_lines), "diff", theme="monokai", word_wrap=True))
                 continue
             break
 
-        if choice in ("a", "all"):
-            self.approve_all_for_turn = True
+        if choice == "a" and can_approve_all:
+            self.approved_tools.add(self.current_tool)
             self.last_decision = "approved_all_turn"
             return True
-        if choice in ("y", "yes"):
+        if choice == "y":
             self.last_decision = "approved_user"
             return True
 
@@ -818,6 +859,10 @@ def list_directory(path: str = ".") -> str:
             return f"Error: Path does not exist: {path}"
         if not os.path.isdir(target):
             return f"Error: Path is not a directory: {path}"
+        if _is_sensitive_canon(target):
+            return f"Security Error: '{path}' is a protected location and will not be listed."
+        if not _confirm_outside_workspace(target, "List folder"):
+            return "Operation aborted: User did NOT approve listing a folder outside the working directory."
 
         items = []
         for entry in sorted(os.listdir(target)):
@@ -1122,6 +1167,7 @@ def run_powershell(command: str) -> str:
                 f"[bold cyan]{escape(_visible_controls(command))}[/bold cyan]\n"
                 f"[dim]Interpreter: {escape(shell)}[/dim]"
             ),
+            always_ask=True,  # every command is its own decision; "approve all" never covers the shell
         ):
             return "Operation aborted: User did NOT approve running the command."
 
@@ -1220,6 +1266,18 @@ def read_clipboard(max_chars: int = 30000) -> str:
     if phi_err:
         return phi_err
 
+    # The clipboard often holds something copied for another purpose (a password, a private message), so
+    # the user sees what is about to be sent before the model does.
+    lines = text.splitlines()
+    peek = [ln[:80] + ("..." if len(ln) > 80 else "") for ln in lines[:3]]
+    if len(lines) > 3:
+        peek.append(f"... (+{len(lines) - 3} more lines)")
+    if not APPROVAL_HANDLER.request_approval(
+        "Send clipboard text to the model",
+        detail_text=f"[dim]{len(text)} characters:[/dim]\n[cyan]" + escape(_visible_controls("\n".join(peek))) + "[/cyan]",
+    ):
+        return "Operation aborted: User did NOT approve reading the clipboard."
+
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n... [Clipboard truncated at {max_chars} chars]"
     return text if text.strip() else "(Clipboard contains only whitespace)"
@@ -1230,6 +1288,12 @@ def write_clipboard(text: str) -> str:
     """Copy text directly onto the user's Windows clipboard so they can immediately Ctrl+V paste it into
     Outlook, Word, or Teams."""
     try:
+        # What lands on the clipboard gets pasted somewhere later, possibly into a terminal
+        if not APPROVAL_HANDLER.request_approval(
+            "Copy to clipboard",
+            detail_text="[cyan]" + escape(_visible_controls(_head_lines(text, 40))) + "[/cyan]",
+        ):
+            return "Operation aborted: User did NOT approve writing to the clipboard."
         data = text.encode("utf-16-le") + b"\x00\x00"
         h_mem = _kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
         if not h_mem:
@@ -1604,6 +1668,7 @@ def search_files(
         if not _confirm_outside_workspace(root_dir, "Search files"):
             return "Operation aborted: User did NOT approve searching outside the working directory."
 
+        max_results = max(1, min(int(max_results), 100))
         q_lower = query.strip().lower()
         pat_lower = (file_pattern.strip() or "*").lower()
         results = []
@@ -1713,6 +1778,23 @@ def search_files(
 # CLASSIC OUTLOOK COM TOOLS (inbox triage, calendar, drafts)
 # =====================================================================
 
+def _dev_mode_gate(what: str) -> str | None:
+    """Dev mode talks to the public Gemini API, and mailbox data is real operational data. Returns an abort
+    message unless the user explicitly allows this one read (always None outside dev mode)."""
+    if not DEV_MODE:
+        return None
+    ok = APPROVAL_HANDLER.request_approval(
+        f"DEV MODE: send {what} to the public Gemini API",
+        detail_text=(
+            "[bold yellow]This session is NOT GenAI.mil.[/bold yellow] "
+            f"Approving sends {escape(what)} from this machine's Outlook profile to Google's public API. "
+            "Approve only on a machine with test data."
+        ),
+        always_ask=True,
+    )
+    return None if ok else f"Operation aborted: User did NOT approve sending {what} to the public API in dev mode."
+
+
 def _get_outlook_ns():
     """Returns (Outlook.Application, MAPI Namespace) or raises RuntimeError."""
     try:
@@ -1747,6 +1829,9 @@ def list_inbox(
     """List recent emails in the user's Classic Outlook Inbox (returns Subject, ReceivedTime, Unread status,
     Categories, and EntryID). Supports filtering by unread status or subject keywords."""
     try:
+        gate = _dev_mode_gate("inbox subject lines")
+        if gate:
+            return gate
         _, ns = _get_outlook_ns()
         inbox = ns.GetDefaultFolder(6)  # olFolderInbox = 6
         items = inbox.Items
@@ -1806,6 +1891,9 @@ def get_calendar(days_ahead: int = 7, days_back: int = 0) -> str:
     """Read the user's Classic Outlook Calendar appointments and meetings for today and upcoming/past days
     (returns Subject, Start, End, Location, AllDayEvent, and BusyStatus)."""
     try:
+        gate = _dev_mode_gate("calendar entries")
+        if gate:
+            return gate
         _, ns = _get_outlook_ns()
         cal_folder = ns.GetDefaultFolder(9)  # olFolderCalendar = 9
         # Outlook only expands recurring meetings when the collection is sorted by Start *before*
@@ -1815,7 +1903,7 @@ def get_calendar(days_ahead: int = 7, days_back: int = 0) -> str:
         items.IncludeRecurrences = True
 
         now = datetime.now()
-        start_dt = (now - timedelta(days=max(0, days_back))).replace(hour=0, minute=0, second=0)
+        start_dt = (now - timedelta(days=max(0, min(days_back, 60)))).replace(hour=0, minute=0, second=0)
         end_dt = (now + timedelta(days=max(1, min(days_ahead, 60)))).replace(hour=23, minute=59, second=59)
 
         # Outlook Restrict filter uses US date format MM/DD/YYYY HH:MM AM/PM
@@ -1906,11 +1994,11 @@ def create_draft_email(subject: str, body: str, to_hint: str = "") -> str:
         if to_hint:
             preview_lines.append(f"Intended Recipient(s) (add in Outlook To: line): {to_hint}")
         preview_lines.append("--- Draft Body ---")
-        preview_lines.append(body)
+        preview_lines.append(_head_lines(body, 40))
 
         if not APPROVAL_HANDLER.request_approval(
             f"Create Outlook Draft: {subject}",
-            detail_text="[cyan]" + escape(_visible_controls("\n".join(preview_lines[:40]))) + "[/cyan]",
+            detail_text="[cyan]" + escape(_visible_controls("\n".join(preview_lines))) + "[/cyan]",
         ):
             return "Operation aborted: User did NOT approve creating the Outlook draft."
 
@@ -2165,6 +2253,7 @@ def _render_markdown(text: str) -> Markdown:
 
 
 MAX_TOOL_RESULT_CHARS = 30000
+MAX_TOOL_ROUNDS = 40
 ARG_PREVIEW_CHARS = 120
 
 
@@ -2293,7 +2382,13 @@ def run_agent_turn(messages: list[dict]):
     APPROVAL_HANDLER.reset_turn()
 
     try:
-        while True:
+        for round_no in range(MAX_TOOL_ROUNDS + 1):
+            if round_no == MAX_TOOL_ROUNDS:
+                # Tools that need no approval could otherwise loop without the user ever being asked anything
+                note = f"(Paused after {MAX_TOOL_ROUNDS} rounds of tool calls in one turn. Say \"continue\" to keep going.)"
+                console.print(f"\n  [bold yellow]{escape(note)}[/bold yellow]")
+                messages.append({"role": "assistant", "content": note})
+                break
             check_user_abort()
             console.print("  [dim cyan]Thinking... (press ESC or Ctrl+C to stop)[/dim cyan]", end="\r")
 
@@ -2393,6 +2488,7 @@ def run_agent_turn(messages: list[dict]):
                     console.print(f"  [yellow]●[/yellow] {_summarize_args(fn_name, fn_args or {})}")
 
                     APPROVAL_HANDLER.last_decision = "auto"
+                    APPROVAL_HANDLER.current_tool = fn_name
                     if arg_err:
                         # Never run a tool on arguments the model did not actually send
                         console.print(f"  [bold red]{escape(arg_err)}[/bold red]")

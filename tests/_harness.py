@@ -58,12 +58,13 @@ class RecordingApproval:
         self.calls = []
         self.answers = list(answers)
         self.default = default
-        self.approve_all_for_turn = False
+        self.always_ask = []  # parallel to calls: whether each request was exempt from "approve all"
         self.last_decision = "auto"
         self.current_tool = ""
 
-    def request_approval(self, action_title, detail_text="", diff_text=""):
+    def request_approval(self, action_title, detail_text="", diff_text="", always_ask=False):
         self.calls.append((action_title, detail_text, diff_text))
+        self.always_ask.append(always_ask)
         ok = self.answers.pop(0) if self.answers else self.default
         self.last_decision = "approved_user" if ok else "denied_user"
         return ok

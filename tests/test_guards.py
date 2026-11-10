@@ -37,13 +37,14 @@ class _CaptureApproval:
 
     def __init__(self):
         self.calls = []
-        self.approve_all_for_turn = False
+        self.answer = False
+        self.current_tool = ""
         self.last_decision = "auto"
 
-    def request_approval(self, action_title, detail_text="", diff_text=""):
+    def request_approval(self, action_title, detail_text="", diff_text="", always_ask=False):
         self.calls.append((action_title, detail_text, diff_text))
         self.last_decision = "denied_user"
-        return False
+        return self.answer
 
     def reset_turn(self):
         pass
@@ -117,7 +118,13 @@ class JunctionTests(unittest.TestCase):
         self.assertTrue(_blocked(via_link))
         self.assertTrue(cli._has_link_component(via_link))
         self.assertIn("Security Error", cli._recheck_after_approval(via_link) or "")
-        listing = cli.list_directory(self.tmp)
+        saved = cli.APPROVAL_HANDLER
+        cli.APPROVAL_HANDLER = cap = _CaptureApproval()
+        cap.answer = True  # the temp dir is outside the workspace, so listing it asks first
+        try:
+            listing = cli.list_directory(self.tmp)
+        finally:
+            cli.APPROVAL_HANDLER = saved
         self.assertIn("[LINK] jump", listing)
         self.assertNotIn("autosave", listing)
 
