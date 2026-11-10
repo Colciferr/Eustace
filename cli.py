@@ -34,7 +34,6 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.markup import escape
 from rich.panel import Panel
-from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -95,35 +94,44 @@ else:
     ]
     DEFAULT_MODEL = "gemini-3.5-flash-lite-withtools"
 
-def load_saved_model() -> str:
-    """Loads the user's last selected model from ~/.eustace/config.json."""
+def _write_json_atomic(path: str, data) -> None:
+    """Writes JSON through a temp file and os.replace, so a crash mid-write cannot leave a truncated file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
     try:
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                m = data.get("model", "").strip()
-                if m:
-                    return m
-    except Exception:
-        pass
-    return DEFAULT_MODEL
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
-def save_selected_model(model_name: str):
-    """Persists the selected model to ~/.eustace/config.json."""
+
+def _read_config() -> dict:
+    """<EUSTACE_HOME>/config.json as a dict ({} when missing or unreadable)."""
     try:
-        os.makedirs(EUSTACE_HOME, exist_ok=True)
-        data = {}
-        if os.path.exists(CONFIG_PATH):
-            try:
-                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
-        data["model"] = model_name
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _update_config(**changes) -> None:
+    """Merges the given keys into config.json; a failed write is not fatal (the setting just does not persist)."""
+    try:
+        _write_json_atomic(CONFIG_PATH, {**_read_config(), **changes})
+    except OSError:
         pass
+
+
+def load_saved_model() -> str:
+    """The user's last selected model, or the backend default."""
+    return str(_read_config().get("model") or "").strip() or DEFAULT_MODEL
+
 
 def short_model_label(model_name: str) -> str:
     """Returns a compact badge name like 'gemini-4-argon' for UI headers."""
@@ -336,7 +344,7 @@ def _live_models() -> list[tuple[str, str]]:
         return []
 
 # =====================================================================
-# STEP 1: SECURITY GUARDRAILS, AUDIT LOG, & DIFF APPROVAL HANDLER
+# SECURITY GUARDRAILS, AUDIT LOG, APPROVAL HANDLER
 # =====================================================================
 
 IGNORE_DIRS = {".venv", ".git", "__pycache__", "node_modules"}
@@ -526,19 +534,26 @@ def _trusted_powershell() -> str | None:
     return None
 
 
-def _load_custom_deny_patterns() -> set[str]:
-    """Loads optional user/unit-defined deny patterns from ~/.eustace/deny_paths.txt."""
-    if not os.path.exists(DENY_LIST_PATH):
-        return set()
+_deny_cache: tuple = (None, None, frozenset())  # (path, mtime, patterns)
+
+
+def _load_custom_deny_patterns() -> frozenset[str]:
+    """Optional user/unit-defined deny patterns from ~/.eustace/deny_paths.txt. Called for every path checked
+    (thousands of times per search), so the parsed file is reused until its modification time changes."""
+    global _deny_cache
     try:
-        with open(DENY_LIST_PATH, "r", encoding="utf-8") as f:
-            return {
-                line.strip()
-                for line in f
-                if line.strip() and not line.strip().startswith("#")
-            }
+        mtime = os.stat(DENY_LIST_PATH).st_mtime_ns
     except OSError:
-        return set()
+        return frozenset()
+    if _deny_cache[:2] != (DENY_LIST_PATH, mtime):
+        try:
+            with open(DENY_LIST_PATH, "r", encoding="utf-8-sig") as f:
+                lines = (line.strip() for line in f)
+                patterns = frozenset(line for line in lines if line and not line.startswith("#"))
+        except OSError:
+            return frozenset()
+        _deny_cache = (DENY_LIST_PATH, mtime, patterns)
+    return _deny_cache[2]
 
 
 def _is_sensitive_canon(canon: str) -> bool:
@@ -552,18 +567,6 @@ def _is_sensitive_canon(canon: str) -> bool:
     if any(_is_under(canon, d) for d in SENSITIVE_DIRS):
         return True
     return any(_is_under(canon, h) for h in PROTECTED_HOMES)
-
-
-def _is_sensitive(target: str) -> bool:
-    """True for secrets files, deny-list matches, credential directories, or anything inside an Eustace home.
-
-    Canonicalizes first so \\\\?\\ prefixes, ::$DATA streams, 8.3 short names and junctions cannot dodge the
-    match; a spelling that cannot be canonicalized is treated as protected (fail closed)."""
-    try:
-        canon = _canonical_path(target)
-    except ValueError:
-        return True
-    return _is_sensitive_canon(canon)
 
 
 def _is_protected_path(target: str) -> bool:
@@ -801,7 +804,7 @@ def tool(label: str, **param_docs: str):
 
 
 # =====================================================================
-# 1. LOCAL FILE SYSTEM TOOLS (Plaintext + Excel, PDF, Word, PowerPoint)
+# LOCAL FILE SYSTEM TOOLS (plaintext, Excel, PDF, Word, PowerPoint)
 # =====================================================================
 
 @tool("Listing folder", path="Relative or absolute directory path to list (default is '.').")
@@ -895,6 +898,9 @@ def _read_pptx(target: str) -> str:
     return "\n".join(out)
 
 
+_DOC_READERS = {".xlsx": _read_excel, ".xlsm": _read_excel, ".pdf": _read_pdf, ".docx": _read_docx, ".pptx": _read_pptx}
+
+
 @tool("Reading file", path="Relative or absolute path to the file to read.")
 def read_file(path: str, max_chars: int = 30000) -> str:
     """Read the contents of a file on the user's local PC. Supports plaintext, code, CSV, Excel (.xlsx/.xlsm),
@@ -915,15 +921,9 @@ def read_file(path: str, max_chars: int = 30000) -> str:
         if not _confirm_outside_workspace(target, "Read file"):
             return "Operation aborted: User did NOT approve reading a file outside the working directory."
 
-        ext = os.path.splitext(target)[1].lower()
-        if ext in {".xlsx", ".xlsm"}:
-            content = _read_excel(target)
-        elif ext == ".pdf":
-            content = _read_pdf(target)
-        elif ext == ".docx":
-            content = _read_docx(target)
-        elif ext == ".pptx":
-            content = _read_pptx(target)
+        reader = _DOC_READERS.get(os.path.splitext(target)[1].lower())
+        if reader:
+            content = reader(target)
         else:
             with _open_text_lenient(target) as f:
                 content = f.read(max_chars + 1)
@@ -1157,7 +1157,7 @@ def run_powershell(command: str) -> str:
 
 
 # =====================================================================
-# STEP 2: NATIVE WIN32 CLIPBOARD & OPEN_FILE LAUNCHER
+# WIN32 CLIPBOARD AND OPEN_FILE LAUNCHER
 # =====================================================================
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -1298,7 +1298,7 @@ def open_file(path: str) -> str:
         return f"Error opening '{path}': {e}"
 
 # =====================================================================
-# STEP 3: OFFICE DOCUMENT GENERATION & EDITING (.docx & .xlsx)
+# OFFICE DOCUMENT GENERATION AND EDITING (.docx, .xlsx)
 # =====================================================================
 
 def _add_formatted_runs(paragraph, text: str):
@@ -1567,14 +1567,13 @@ def update_excel(
         return f"Error updating Excel file '{path}': {e}"
 
 # =====================================================================
-# STEP 4: SMART FILE & OFFICE CONTENT SEARCH (search_files)
+# FILE AND DOCUMENT CONTENT SEARCH
 # =====================================================================
 
 SEARCHABLE_TEXT_EXTS = {
     ".txt", ".md", ".csv", ".json", ".py", ".ps1", ".bat", ".cmd",
     ".yaml", ".yml", ".toml", ".ini", ".cfg", ".log", ".xml", ".html", ".js", ".ts",
 }
-SEARCHABLE_OFFICE_EXTS = {".docx", ".xlsx", ".xlsm", ".pdf", ".pptx"}
 MAX_OFFICE_PARSE_FILES = 40
 MAX_SEARCH_FILE_BYTES = 15 * 1024 * 1024  # 15 MB
 
@@ -1668,18 +1667,11 @@ def search_files(
                             text_to_scan = f.read(200_000)
                     except OSError:
                         pass
-                elif ext in SEARCHABLE_OFFICE_EXTS and office_parsed_count < MAX_OFFICE_PARSE_FILES:
+                elif ext in _DOC_READERS and office_parsed_count < MAX_OFFICE_PARSE_FILES:
                     office_parsed_count += 1
                     files_scanned += 1
                     try:
-                        if ext in {".xlsx", ".xlsm"}:
-                            text_to_scan = _read_excel(full_path)
-                        elif ext == ".pdf":
-                            text_to_scan = _read_pdf(full_path)
-                        elif ext == ".docx":
-                            text_to_scan = _read_docx(full_path)
-                        elif ext == ".pptx":
-                            text_to_scan = _read_pptx(full_path)
+                        text_to_scan = _DOC_READERS[ext](full_path)
                     except Exception:
                         pass
 
@@ -1718,7 +1710,7 @@ def search_files(
         return f"Error searching files in '{path}': {e}"
 
 # =====================================================================
-# STEP 5: CLASSIC OUTLOOK COM TOOLS (STIG-Safe Triage, Calendar, Drafts)
+# CLASSIC OUTLOOK COM TOOLS (inbox triage, calendar, drafts)
 # =====================================================================
 
 def _get_outlook_ns():
@@ -1942,49 +1934,37 @@ def create_draft_email(subject: str, body: str, to_hint: str = "") -> str:
 
 
 # =====================================================================
-# 2. SYSTEM PROMPT & AGENT STREAMING LOOP
+# SYSTEM PROMPT AND AGENT STREAMING LOOP
 # =====================================================================
 
-DEFAULT_SYSTEM_PROMPT = """# Identity & Role
-Your name is **Eustace** (**E**lectronic **U**tility for **S**cripting, **T**asking, and **A**utomated **C**ommand **E**xecution). You are a sharp, personable, and collaborative CLI coding and operational sidekick running locally on the user's Windows workstation.
-
-# Personality & Tone
-- **Warm & Approachable:** Be conversational, natural, and friendly, like a trusted teammate at the next desk. A little dry wit is welcome.
-- **Action-Oriented on Tasks:** When writing code, debugging, or answering technical questions, be clear, structured, and get straight to the solution (BLUF).
-
-# Core Directives
-1. **Use Local Tools Proactively:** You have direct access to the user's PC via `list_directory`, `read_file`, `read_clipboard`, and `write_clipboard`. Inspect files or clipboard contents yourself rather than asking the user to paste them.
-2. **Environment Awareness:** The user is on Windows with PowerShell. Tailor shell commands for PowerShell.
-3. **Write and Edit Files Safely:** You have `write_file`, `edit_file`, and `open_file`. Explain what you are about to change before calling them. The user sees a unified diff and must approve every write/edit.
-4. **Run Commands Deliberately:** You can execute PowerShell via `run_powershell`. The user must approve every command, so prefer single, purposeful commands and state your intent first. Secrets files (`.env`, keys, certificates, credentials) are blocked from `read_file`; do not try to work around that.
-"""
-
+# The persona lives in system_prompt.md: the user's copy in the Eustace home (setup.ps1 puts it there and it is
+# theirs to edit), else the one shipped beside this file when running from a source checkout.
 GLOBAL_PROMPT_PATH = os.path.join(EUSTACE_HOME, "system_prompt.md")
+BUNDLED_PROMPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.md")
+FALLBACK_SYSTEM_PROMPT = (
+    "You are Eustace, a CLI assistant running locally on the user's Windows workstation. Be clear and direct. "
+    "Use your tools to inspect local files yourself instead of asking the user to paste them, and say what you "
+    "are about to change before writing files or running commands."
+)
 
 
-def _ensure_global_prompt() -> str:
-    """Makes sure ~/.eustace/system_prompt.md exists."""
-    if not os.path.exists(GLOBAL_PROMPT_PATH):
-        os.makedirs(EUSTACE_HOME, exist_ok=True)
-        local_prompt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.md")
-        if os.path.exists(local_prompt_file):
-            shutil.copyfile(local_prompt_file, GLOBAL_PROMPT_PATH)
-        else:
-            with open(GLOBAL_PROMPT_PATH, "w", encoding="utf-8") as f:
-                f.write(DEFAULT_SYSTEM_PROMPT)
-        console.print(f"[dim]Created persona file at {escape(GLOBAL_PROMPT_PATH)} (edit it to customize Eustace)[/dim]")
-    return GLOBAL_PROMPT_PATH
+def _load_persona() -> str:
+    for path in (GLOBAL_PROMPT_PATH, BUNDLED_PROMPT_PATH):
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                text = f.read().strip()
+            if text:
+                return text
+        except OSError:
+            continue
+    console.print(f"[dim yellow]No persona file at {escape(GLOBAL_PROMPT_PATH)}; using the built-in default.[/dim yellow]")
+    return FALLBACK_SYSTEM_PROMPT
 
 
 def build_system_prompt() -> str:
     """Loads global system_prompt.md from ~/.eustace/ and optional local AGENT.md."""
     cwd = os.getcwd()
-    try:
-        with open(_ensure_global_prompt(), "r", encoding="utf-8") as f:
-            base_prompt = f.read().strip()
-    except OSError as e:
-        console.print(f"[dim yellow]Could not load persona file ({escape(str(e))}); using built-in default.[/dim yellow]")
-        base_prompt = DEFAULT_SYSTEM_PROMPT.strip()
+    base_prompt = _load_persona()
 
     tool_names = ", ".join(f"`{name}`" for name in AVAILABLE_FUNCTIONS.keys())
     if DEV_MODE:
@@ -2040,21 +2020,6 @@ MAX_AGENT_MD_BYTES = 16 * 1024
 _AGENT_MD_SESSION_DENIED: dict[str, str] = {}  # realpath -> sha256 declined for this process
 
 
-def _read_config() -> dict:
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _write_config(data: dict) -> None:
-    os.makedirs(EUSTACE_HOME, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
 def _git_root(start: str) -> str | None:
     probe = start
     while True:
@@ -2100,9 +2065,10 @@ def _load_trusted_agent_md(path: str) -> str | None:
         return None
     key = os.path.normcase(os.path.realpath(path))
 
-    cfg = _read_config()
-    trusted = cfg.get("trusted_agent_md", {})
-    if isinstance(trusted, dict) and trusted.get(key) == digest:
+    trusted = _read_config().get("trusted_agent_md")
+    if not isinstance(trusted, dict):
+        trusted = {}
+    if trusted.get(key) == digest:
         return text
     if _AGENT_MD_SESSION_DENIED.get(key) == digest:
         return None
@@ -2125,14 +2091,7 @@ def _load_trusted_agent_md(path: str) -> str | None:
     console.print("  [bold yellow]Trust this file and load it as instructions? (y/N):[/bold yellow] ", end="")
     choice = input().strip().lower()
     if choice in ("y", "yes"):
-        if not isinstance(trusted, dict):
-            trusted = {}
-        trusted[key] = digest
-        cfg["trusted_agent_md"] = trusted
-        try:
-            _write_config(cfg)
-        except OSError:
-            pass
+        _update_config(trusted_agent_md={**trusted, key: digest})
         return text
     _AGENT_MD_SESSION_DENIED[key] = digest
     console.print(f"  [dim]Skipped {escape(path)} for this session.[/dim]")
@@ -2322,6 +2281,11 @@ def _ran_tool_calls(messages: list[dict], turn_start: int) -> list[str]:
     return lines
 
 
+def _clear_status_line() -> None:
+    """Blanks the transient 'Thinking...' line written with a carriage return."""
+    print(" " * 70, end="\r", flush=True)
+
+
 def run_agent_turn(messages: list[dict]):
     """Streams responses & tool calls with instant ESC or Ctrl+C cancellation."""
     turn_start_len = len(messages)
@@ -2350,7 +2314,7 @@ def run_agent_turn(messages: list[dict]):
                 for chunk in stream:
                     if first_chunk:
                         first_chunk = False
-                        print(" " * 60, end="\r", flush=True)
+                        _clear_status_line()
 
                     if not chunk.choices:
                         continue
@@ -2382,7 +2346,7 @@ def run_agent_turn(messages: list[dict]):
                     live.stop()
                 stream.cancel()
                 if first_chunk:
-                    print(" " * 60, end="\r", flush=True)
+                    _clear_status_line()
 
             if full_reply:
                 console.print()
@@ -2513,7 +2477,7 @@ def compact_messages(messages: list[dict]) -> list[dict]:
                 summary += delta.content
     finally:
         worker.cancel()
-        print(" " * 70, end="\r", flush=True)
+        _clear_status_line()
 
     summary = summary.strip()
     if not summary:
@@ -2526,29 +2490,13 @@ def compact_messages(messages: list[dict]) -> list[dict]:
     ]
 
 # =====================================================================
-# STEP 6: PERSISTENT SESSIONS (/save, /resume, /sessions, + Autosave)
+# PERSISTENT SESSIONS (/save, /resume, /sessions, autosave)
 # =====================================================================
 
 SESSIONS_DIR = os.path.join(EUSTACE_HOME, "sessions")
 MAX_AUTOSAVES = 10
 # Each run autosaves to its own file, so starting a new conversation never overwrites the previous one.
 AUTOSAVE_NAME = datetime.now().strftime("auto_%Y%m%d_%H%M%S")
-
-
-def _write_json_atomic(path: str, data) -> None:
-    """Writes JSON through a temp file and os.replace, so a crash mid-write cannot leave a truncated file."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
 
 
 def _sanitize_session_name(name: str) -> str:
@@ -2664,7 +2612,6 @@ def load_session(target: str = "") -> list[dict] | None:
 
 def select_model_interactive(arg: str = "") -> str:
     """Interactive /model selector that updates global MODEL and saves to <EUSTACE_HOME>/config.json."""
-    global MODEL
     choice = arg.strip()
 
     models = list(AVAILABLE_MODELS)
@@ -2695,7 +2642,7 @@ def select_model_interactive(arg: str = "") -> str:
     def _switch(new_id: str, note: str = "") -> str:
         global MODEL
         MODEL = new_id
-        save_selected_model(MODEL)
+        _update_config(model=MODEL)
         label = "✓ Switched to custom model ID:" if note == "custom" else "✓ Switched model to:"
         console.print(f"  [bold {'yellow' if note == 'custom' else 'green'}]{label}[/bold {'yellow' if note == 'custom' else 'green'}] [bold cyan]{escape(MODEL)}[/bold cyan]")
         return MODEL

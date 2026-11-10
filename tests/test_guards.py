@@ -18,6 +18,11 @@ import cli  # noqa: E402
 HOME = os.path.expanduser("~")
 
 
+def _blocked(path: str) -> bool:
+    """True when the shared write guard, the gate every writing tool passes through, refuses this path."""
+    return cli._guard_write(path)[1] is not None
+
+
 def _make_junction(link: str, target: str) -> bool:
     """Creates a directory junction with mklink /J (no admin required). Returns False if unavailable."""
     try:
@@ -63,7 +68,7 @@ class CanonicalPathTests(unittest.TestCase):
                 canon, err = cli._resolve_model_path(bad)
                 self.assertIsNone(canon)
                 self.assertTrue(err.startswith("Security Error"))
-                self.assertTrue(cli._is_sensitive(bad), "un-canonicalizable spelling must fail closed")
+                self.assertTrue(_blocked(bad), "un-canonicalizable spelling must fail closed")
 
     def test_plain_local_paths_pass(self):
         here = os.path.abspath(__file__)
@@ -109,7 +114,7 @@ class JunctionTests(unittest.TestCase):
         via_link = os.path.join(self.link, "sessions", "autosave.json")
         canon = cli._canonical_path(via_link)
         self.assertTrue(cli._is_under(canon, self.target), f"{canon} should resolve under {self.target}")
-        self.assertTrue(cli._is_sensitive(via_link))
+        self.assertTrue(_blocked(via_link))
         self.assertTrue(cli._has_link_component(via_link))
         self.assertIn("Security Error", cli._recheck_after_approval(via_link) or "")
         listing = cli.list_directory(self.tmp)
@@ -130,10 +135,10 @@ class SensitivePatternTests(unittest.TestCase):
             os.path.join(HOME, "proj", "web.config"),
         ):
             with self.subTest(path=p):
-                self.assertTrue(cli._is_sensitive(p))
+                self.assertTrue(_blocked(p))
 
     def test_ordinary_files_not_sensitive(self):
-        self.assertFalse(cli._is_sensitive(os.path.join(os.getcwd(), "README.md")))
+        self.assertFalse(_blocked(os.path.join(os.getcwd(), "README.md")))
 
 
 class ControlCharacterTests(unittest.TestCase):
