@@ -2504,6 +2504,38 @@ def _tail_lines(text: str, max_lines: int) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+INTERRUPTED_TOOL_NOTE = (
+    "Not completed: the user interrupted the turn. If this call had already started it may have partly run; "
+    "check its effects before retrying."
+)
+
+
+def _close_open_tool_calls(messages: list[dict], turn_start: int) -> None:
+    """Appends a stub result for each tool call of this turn that has none, so every call stays paired with a
+    result (the API rejects a history where one is missing). Tools run in order, so the unanswered calls are
+    always the tail of the last assistant message that requested any."""
+    for i in range(len(messages) - 1, turn_start - 1, -1):
+        calls = messages[i].get("tool_calls") if messages[i].get("role") == "assistant" else None
+        if calls:
+            answered = sum(1 for m in messages[i + 1:] if m.get("role") == "tool")
+            for tc in calls[answered:]:
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": INTERRUPTED_TOOL_NOTE})
+            return
+
+
+def _ran_tool_calls(messages: list[dict], turn_start: int) -> list[str]:
+    """One line per tool call of this turn that produced a result: '- name(args) -> start of result'."""
+    lines, pending = [], []
+    for m in messages[turn_start:]:
+        if m.get("role") == "assistant":
+            pending = list(m.get("tool_calls") or [])
+        elif m.get("role") == "tool" and pending:
+            fn = pending.pop(0)["function"]
+            result = str(m.get("content", "")).replace("\n", " ")
+            lines.append(f"- {fn['name']}({fn['arguments'][:150]}) -> {result[:150]}")
+    return lines
+
+
 def run_agent_turn(messages: list[dict]):
     """Streams responses & tool calls with instant ESC or Ctrl+C cancellation."""
     turn_start_len = len(messages)
@@ -2668,15 +2700,24 @@ def run_agent_turn(messages: list[dict]):
         if partial_reply:
             console.print(Markdown(_sanitize_for_display(partial_reply)))
             console.print("[dim](partial reply)[/dim]")
-        del messages[turn_start_len:]
-        messages.append({"role": "assistant", "content": "(Response interrupted by the user before completion.)"})
+        # Keep what already happened: tool calls that ran changed real files, and the model must still know.
+        _close_open_tool_calls(messages, turn_start_len)
+        note = "(Response interrupted by the user before completion.)"
+        messages.append({"role": "assistant", "content": f"{partial_reply}\n\n{note}" if partial_reply else note})
     except Exception as e:
-        console.print(f"\n[bold red]System Loop Error:[/bold red] {escape(_format_api_error(e))}")
+        err_line = _format_api_error(e)
+        console.print(f"\n[bold red]System Loop Error:[/bold red] {escape(err_line)}")
         if partial_reply:
             console.print(Markdown(_sanitize_for_display(partial_reply)))
             console.print("[dim](partial reply)[/dim]")
+        # Roll the turn back so a request the API rejected cannot poison every later one, but carry a plain-text
+        # record of the tool calls that did run.
+        ran = _ran_tool_calls(messages, turn_start_len)
         del messages[turn_start_len:]
-        messages.append({"role": "assistant", "content": f"(Response failed with an error: {e})"})
+        note = f"(Response failed with an error: {err_line})"
+        if ran:
+            note += "\nTool calls that completed before the failure:\n" + "\n".join(ran)
+        messages.append({"role": "assistant", "content": note})
 
 
 COMPACT_INSTRUCTION = (
