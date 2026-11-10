@@ -571,7 +571,7 @@ def _is_protected_path(target: str) -> bool:
     return any(_is_under(target, root) for root in PROTECTED_ROOTS)
 
 
-def _recheck_after_approval(canon: str) -> str | None:
+def _recheck_after_approval(canon: str, writing: bool = True) -> str | None:
     """Re-validates an approved destination immediately before the sink; returns an error string to abort."""
     try:
         again = _canonical_path(canon)
@@ -579,11 +579,35 @@ def _recheck_after_approval(canon: str) -> str | None:
         return f"Security Error: destination no longer canonicalizes after approval ({e}); operation aborted."
     if os.path.normcase(again) != os.path.normcase(canon):
         return "Security Error: destination changed between approval and execution; operation aborted."
-    if _is_protected_path(canon) or _is_sensitive_canon(canon):
+    if (writing and _is_protected_path(canon)) or _is_sensitive_canon(canon):
         return "Security Error: destination became protected after approval; operation aborted."
     if _has_link_component(canon):
         return "Security Error: destination passes through a symlink or junction; operation aborted."
     return None
+
+
+def _guard_write(path: str, ext: tuple[str, ...] = ()) -> tuple[str | None, str | None]:
+    """(canonical target, None) when the model may write to `path`, else (None, error for the model).
+    `ext` lists the accepted extensions; the first is appended when the path has none of them. Every tool
+    that writes goes through here, so they all apply the same checks to the same canonical path."""
+    target, err = _resolve_model_path(path)
+    if not err and ext and not target.lower().endswith(ext):
+        target, err = _resolve_model_path(target + ext[0])  # resolve again: the final name may be a link
+    if err:
+        return None, err
+    if _is_protected_path(target):
+        return None, "Security Error: Writing to system folders is strictly prohibited."
+    if _is_sensitive_canon(target):
+        return None, f"Security Error: Writing to protected path '{path}' is prohibited."
+    return target, None
+
+
+def _approve_and_recheck(target: str, title: str, detail: str = "", diff: str = "", writing: bool = True) -> str | None:
+    """Asks the user, then re-validates the target right before the caller acts on it. Returns None to go
+    ahead or the message to hand back to the model."""
+    if not APPROVAL_HANDLER.request_approval(title, detail_text=detail, diff_text=diff):
+        return "Operation aborted: User did NOT approve this action."
+    return _recheck_after_approval(target, writing)
 
 
 def _confirm_outside_workspace(canon: str, action: str) -> bool:
@@ -972,13 +996,9 @@ def _open_text_lenient(path: str):
 def write_file(path: str, content: str) -> str:
     """Create a new file or completely overwrite an existing file with content."""
     try:
-        target, err = _resolve_model_path(path)
+        target, err = _guard_write(path)
         if err:
             return err
-        if _is_protected_path(target):
-            return "Security Error: Writing to system folders is strictly prohibited."
-        if _is_sensitive_canon(target):
-            return f"Security Error: Writing to protected path '{path}' is prohibited."
         if os.path.isdir(target):
             return f"Error: '{path}' is a directory."
 
@@ -997,10 +1017,7 @@ def write_file(path: str, content: str) -> str:
             detail += "\n  [bold yellow]The existing file is not UTF-8 text; all of it will be replaced.[/bold yellow]"
         diff_str = build_unified_diff(old_text.replace("\r\n", "\n"), body, target)
 
-        if not APPROVAL_HANDLER.request_approval(action, detail_text=detail, diff_text=diff_str):
-            return "Operation aborted: User did NOT approve the file write."
-
-        err = _recheck_after_approval(target)
+        err = _approve_and_recheck(target, action, detail, diff_str)
         if err:
             return err
         if (_read_bytes_or_none(target) if os.path.isfile(target) else None) != before:
@@ -1024,13 +1041,11 @@ def write_file(path: str, content: str) -> str:
 def edit_file(path: str, old_text: str, new_text: str) -> str:
     """Search and replace a specific block of text/code within an existing file."""
     try:
-        target, err = _resolve_model_path(path)
+        target, err = _guard_write(path)
         if err:
             return err
         if not os.path.isfile(target):
             return f"Error: File not found: {path}"
-        if _is_protected_path(target) or _is_sensitive_canon(target):
-            return "Security Error: Editing protected or system files is strictly prohibited."
 
         before = _read_bytes_or_none(target)
         decoded = _decode_exact(before) if before is not None else None
@@ -1064,10 +1079,7 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
         updated = text[:start] + new_n.replace("\n", _dominant_newline(text)) + text[end:]
         diff_str = build_unified_diff(norm, norm[:at] + new_n + norm[at + len(old_n):], target)
 
-        if not APPROVAL_HANDLER.request_approval(f"Edit file: {target}", diff_text=diff_str):
-            return "Operation aborted: User did NOT approve the file edit."
-
-        err = _recheck_after_approval(target)
+        err = _approve_and_recheck(target, f"Edit file: {target}", diff=diff_str)
         if err:
             return err
         # The approved diff must describe the bytes actually on disk; re-read and compare before writing.
@@ -1275,10 +1287,8 @@ def open_file(path: str) -> str:
         if _is_sensitive_canon(target):
             return f"Security Error: Cannot open protected file '{path}'."
 
-        if not APPROVAL_HANDLER.request_approval(f"Open in default Windows app: {target}"):
-            return "Operation aborted: User declined to open the file."
-
-        err = _recheck_after_approval(target)
+        # Opening is not a write, so a document under Program Files may be opened
+        err = _approve_and_recheck(target, f"Open in default Windows app: {target}", writing=False)
         if err:
             return err
         os.startfile(target)
@@ -1312,22 +1322,15 @@ def write_docx(path: str, content: str, title: str = "") -> str:
     """Create or overwrite a Microsoft Word (.docx) document from Markdown-formatted text. Supports #/##/###
     headings, bullet lists (- ), numbered lists (1. ), **bold** text, and Markdown tables (| col | col |)."""
     try:
-        target, err = _resolve_model_path(path)
+        target, err = _guard_write(path, ext=(".docx",))
         if err:
             return err
-        if not target.lower().endswith(".docx"):
-            target += ".docx"
-        if _is_protected_path(target) or _is_sensitive_canon(target):
-            return "Security Error: Writing to protected or system paths is prohibited."
 
         action = f"Overwrite Word document: {target}" if os.path.exists(target) else f"Create Word document: {target}"
         # The approved preview must contain every model-controlled element that will be written, title included.
         preview_body = f"# {title.strip()}\n\n{content}" if title.strip() else content
         preview_diff = build_unified_diff("", preview_body, target)
-        if not APPROVAL_HANDLER.request_approval(action, diff_text=preview_diff):
-            return "Operation aborted: User did NOT approve creating the Word document."
-
-        err = _recheck_after_approval(target)
+        err = _approve_and_recheck(target, action, diff=preview_diff)
         if err:
             return err
 
@@ -1412,27 +1415,22 @@ def fill_docx_template(template_path: str, output_path: str, replacements: dict)
         src, err = _resolve_model_path(template_path)
         if err:
             return err
-        dst, err = _resolve_model_path(output_path)
+        dst, err = _guard_write(output_path, ext=(".docx",))
         if err:
             return err
-        if not dst.lower().endswith(".docx"):
-            dst += ".docx"
-        if not os.path.exists(src):
+        if not os.path.isfile(src):
             return f"Error: Template file not found: {template_path}"
-        if _is_sensitive_canon(src) or _is_sensitive_canon(dst) or _is_protected_path(dst):
-            return "Security Error: Template or output path is restricted."
+        if _is_sensitive_canon(src):
+            return f"Security Error: Template '{template_path}' is a protected file."
 
         summary_lines = [f"Template: {src}", f"Output:   {dst}", "Replacements:"]
         for k, v in replacements.items():
             summary_lines.append(f"  {k}  -->  {v}")
 
-        if not APPROVAL_HANDLER.request_approval(
-            f"Fill Word template -> {dst}",
-            detail_text="[dim]" + escape(_visible_controls("\n".join(summary_lines))) + "[/dim]",
-        ):
-            return "Operation aborted: User did NOT approve filling the Word template."
-
-        err = _recheck_after_approval(dst)
+        err = _approve_and_recheck(
+            dst, f"Fill Word template -> {dst}",
+            detail="[dim]" + escape(_visible_controls("\n".join(summary_lines))) + "[/dim]",
+        )
         if err:
             return err
 
@@ -1487,13 +1485,9 @@ def update_excel(
     """Create a new Excel (.xlsx) workbook or update an existing one by appending rows to a sheet and/or setting
     specific cell coordinates (e.g. {'B4': 'Complete', 'C4': 100})."""
     try:
-        target, err = _resolve_model_path(path)
+        target, err = _guard_write(path, ext=(".xlsx", ".xlsm"))
         if err:
             return err
-        if not target.lower().endswith((".xlsx", ".xlsm")):
-            target += ".xlsx"
-        if _is_protected_path(target) or _is_sensitive_canon(target):
-            return "Security Error: Writing to protected or system paths is prohibited."
 
         exists = os.path.exists(target)
         is_macro = target.lower().endswith(".xlsm")
@@ -1524,13 +1518,10 @@ def update_excel(
             if len(cell_items) > 25:
                 preview.append(f"  ... (+{len(cell_items) - 25} more cells)")
 
-        if not APPROVAL_HANDLER.request_approval(
-            f"Update Excel workbook: {target}",
-            detail_text="[cyan]" + escape(_visible_controls("\n".join(preview))) + "[/cyan]",
-        ):
-            return "Operation aborted: User did NOT approve the Excel update."
-
-        err = _recheck_after_approval(target)
+        err = _approve_and_recheck(
+            target, f"Update Excel workbook: {target}",
+            detail="[cyan]" + escape(_visible_controls("\n".join(preview))) + "[/cyan]",
+        )
         if err:
             return err
 
