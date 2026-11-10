@@ -28,16 +28,16 @@ truststore.inject_into_ssl()
 from dotenv import load_dotenv
 from openai import OpenAI, Timeout as APITimeout
 from rich import box
+from rich.cells import cell_len, set_cell_size
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.markup import escape
 from rich.panel import Panel
-from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # When output is redirected to a file or pipe, Windows uses the ANSI code page, which cannot encode the symbols
 # printed here; degrade to "?" instead of crashing mid-turn.
@@ -704,27 +704,31 @@ def log_audit_event(tool_name: str, args: dict, decision: str, result: str):
 
 def build_unified_diff(old_text: str, new_text: str, path: str) -> str:
     """Generates a unified diff string between old_text and new_text."""
-    old_lines = old_text.splitlines(keepends=True)
-    new_lines = new_text.splitlines(keepends=True)
-    diff = difflib.unified_diff(
-        old_lines,
-        new_lines,
+    lines = list(difflib.unified_diff(
+        old_text.splitlines(),
+        new_text.splitlines(),
         fromfile=f"a/{os.path.basename(path)}",
         tofile=f"b/{os.path.basename(path)}",
         n=3,
-    )
-    return "".join(diff)
+        lineterm="",
+    ))
+    # Lines are compared without their endings (joining them with endings ran the last two together when the
+    # text had no final newline), so say explicitly when the only difference left is that final newline.
+    if old_text and new_text and old_text.endswith("\n") != new_text.endswith("\n"):
+        lines.append("\\ Final newline " + ("removed" if old_text.endswith("\n") else "added"))
+    return "\n".join(lines)
 
 
 class CLIApprovalHandler:
-    """Approval prompt with unified diffs. [A] approves further calls of the *same tool* for the rest of the
-    turn; requests marked always_ask (shell commands, access outside the working directory, dev-mode data
+    """Approval prompt with a diff preview: an arrow-key menu on a real console, a typed letter otherwise.
+    "Approve all" covers further calls of the *same tool* for the rest of the turn; requests marked always_ask (shell commands, access outside the working directory, dev-mode data
     warnings) are never covered by it."""
 
     def __init__(self):
         self.approved_tools: set[str] = set()
         self.current_tool = ""   # set by the agent loop before each tool runs
         self.last_decision = "auto"
+        self.last_feedback = ""  # what the user typed when denying with "tell Eustace what to do instead"
 
     def reset_turn(self):
         self.approved_tools.clear()
@@ -739,34 +743,33 @@ class CLIApprovalHandler:
             console.print(f"  [dim green]✓ Auto-approved ({escape(self.current_tool)} this turn): {escape(action_title)}[/dim green]")
             return True
 
-        diff_lines = _visible_controls(diff_text.replace("\r\n", "\n")).splitlines() if diff_text else []
-        hidden = len(diff_lines) - DIFF_PREVIEW_LINES
-        shown = diff_lines[:DIFF_PREVIEW_LINES]
-        if hidden > 0:
-            shown.append(f"... ({hidden} more diff lines; press V to view all of them)")
-
-        can_approve_all = not always_ask and bool(self.current_tool)
-        options = ["y", "n"]
-        keys = "[bold yellow]\\[Y][/bold yellow] Approve   [bold yellow]\\[N][/bold yellow] Deny"
-        if can_approve_all:
-            options.append("a")
-            keys += f"   [bold yellow]\\[A][/bold yellow] Approve all {escape(self.current_tool)} this turn"
-        if hidden > 0:
-            options.append("v")
-            keys += "   [bold yellow]\\[V][/bold yellow] View Full Diff"
-        if diff_lines:
-            body = Syntax("\n".join(shown), "diff", theme="monokai", word_wrap=True)
+        self.last_feedback = ""
+        rows = _diff_rows(_visible_controls(diff_text.replace("\r\n", "\n"))) if diff_text else []
+        hidden = len(rows) - DIFF_PREVIEW_LINES
+        width = max(console.width - 4, 40)
+        if rows:
+            body = _render_diff(rows[:DIFF_PREVIEW_LINES], width)
+            if hidden > 0:
+                body.append(f"\n... ({hidden} more diff lines; press V to view all of them)", style="dim")
         else:
             body = detail_text or escape(action_title)
 
+        can_approve_all = not always_ask and bool(self.current_tool)
+        interactive = _ui_enabled()
+        keys = "[bold yellow]\\[Y][/bold yellow] Approve   [bold yellow]\\[N][/bold yellow] Deny"
+        if can_approve_all:
+            keys += f"   [bold yellow]\\[A][/bold yellow] Approve all {escape(self.current_tool)} this turn"
+        if hidden > 0:
+            keys += "   [bold yellow]\\[V][/bold yellow] View Full Diff"
+
         console.print()
-        if diff_lines and detail_text:
+        if rows and detail_text:
             console.print(f"  {detail_text}")
         console.print(
             Panel(
                 body,
                 title=f"[bold yellow]⚠️  Approval Required: {escape(action_title)}[/bold yellow]",
-                subtitle=keys,
+                subtitle=None if interactive else keys,
                 border_style="yellow",
                 box=box.ROUNDED,
                 padding=(0, 1),
@@ -774,24 +777,49 @@ class CLIApprovalHandler:
         )
 
         while True:
-            console.print(f"  [bold yellow]Choice ({'/'.join(options)}) \\[default: N]:[/bold yellow] ", end="")
-            # Whole-word answers only: stray typed-ahead text that merely starts with "y" must not approve
-            choice = input().strip().lower()
-            if choice in ("v", "view") and hidden > 0:
-                console.print(Syntax("\n".join(diff_lines), "diff", theme="monokai", word_wrap=True))
-                continue
-            break
+            choice = self._ask_menu(can_approve_all, hidden > 0) if interactive else self._ask_typed(can_approve_all, hidden > 0)
+            if choice != "view":
+                break
+            console.print(_render_diff(rows, max(console.width, 40)))
 
-        if choice in ("a", "all") and can_approve_all:
+        if choice == "all":
             self.approved_tools.add(self.current_tool)
             self.last_decision = "approved_all_turn"
             return True
-        if choice in ("y", "yes"):
+        if choice == "yes":
             self.last_decision = "approved_user"
             return True
 
         self.last_decision = "denied_user"
         return False
+
+    def _ask_typed(self, can_approve_all: bool, can_view: bool) -> str:
+        """Plain typed prompt (no real console, EUSTACE_PLAIN=1, or prompt_toolkit unavailable)."""
+        options = ["y", "n"] + (["a"] if can_approve_all else []) + (["v"] if can_view else [])
+        console.print(f"  [bold yellow]Choice ({'/'.join(options)}) \\[default: N]:[/bold yellow] ", end="")
+        # Whole-word answers only: stray typed-ahead text that merely starts with "y" must not approve
+        answer = input().strip().lower()
+        if answer in ("v", "view") and can_view:
+            return "view"
+        if answer in ("a", "all") and can_approve_all:
+            return "all"
+        return "yes" if answer in ("y", "yes") else "no"
+
+    def _ask_menu(self, can_approve_all: bool, can_view: bool) -> str:
+        """Arrow-key menu. Choosing "tell Eustace what to do instead" denies the action and records the user's
+        words in last_feedback, which the agent loop passes to the model with the tool result."""
+        options = [("yes", "Yes")]
+        if can_approve_all:
+            options.append(("all", f"Yes, and don't ask again for {self.current_tool} this turn"))
+        options.append(("tell", "No, and tell Eustace what to do instead"))
+        choice = _ask_menu("Do you want to proceed?", options, allow_view=can_view)
+        if choice == "tell":
+            self.last_feedback = _ask_line("What should Eustace do instead? ")
+            console.print(f"  [dim]✗ Denied{': ' + escape(_sanitize_for_display(self.last_feedback)) if self.last_feedback else ''}[/dim]")
+            return "no"
+        console.print({"yes": "  [dim green]✓ Approved[/dim green]", "all": f"  [dim green]✓ Approved, and for further {escape(self.current_tool)} calls this turn[/dim green]",
+                       "view": "", None: "  [dim]✗ Denied[/dim]"}.get(choice, ""))
+        return choice or "no"
 
 
 DIFF_PREVIEW_LINES = 100
@@ -3060,6 +3088,11 @@ def run_agent_turn(messages: list[dict]):
                             console.print(f"[bold red]Tool execution error inside '{escape(fn_name)}':[/bold red] {escape(str(fe))}")
                             result = f"Error: Tool execution failed: {fe}"
 
+                    feedback = getattr(APPROVAL_HANDLER, "last_feedback", "")
+                    if feedback:
+                        result = f"{result}\nThe user said: {feedback}"
+                        APPROVAL_HANDLER.last_feedback = ""
+
                     log_audit_event(fn_name, fn_args or {}, APPROVAL_HANDLER.last_decision, result)
 
                     content = str(result)
@@ -3324,6 +3357,449 @@ def select_model_interactive(arg: str = "") -> str:
     # Fallback to whatever string they typed
     return _switch(choice, note="custom")
 
+# =====================================================================
+# TERMINAL UI: diff rendering, approval menu, input box, slash commands
+# =====================================================================
+
+UI_FEATURE = "The interactive input box"
+_UI_IO: dict = {"input": None, "output": None}  # tests substitute a pipe input and a dummy output
+_DEL_STYLE, _ADD_STYLE = "#ffc1c5 on #4a1519", "#b9f0c0 on #12361a"
+_UI_STYLE = {
+    "frame.border": "#6a6a6a", "prompt": "bold ansicyan", "status": "#8f8f8f",
+    "menu.current": "bg:#1f3a3a #ffffff", "menu.meta": "#8f8f8f", "question": "bold", "current": "ansicyan",
+}
+
+
+def _ui_enabled() -> bool:
+    """True when the input box and arrow-key menus can be used: a real console on both ends, not switched off
+    with EUSTACE_PLAIN=1, and prompt_toolkit loadable. Otherwise Eustace uses plain typed prompts."""
+    if os.environ.get("EUSTACE_PLAIN", "").strip() not in ("", "0"):
+        return False
+    try:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return False
+        _need("prompt_toolkit", UI_FEATURE)
+        return True
+    except Exception:
+        return False
+
+
+def _flush_console_input() -> None:
+    """Discards keystrokes typed before a prompt appeared, so typed-ahead text cannot answer it."""
+    try:
+        _kernel32.FlushConsoleInputBuffer(_kernel32.GetStdHandle(_STD_INPUT_HANDLE))
+    except Exception:
+        pass
+
+
+def _diff_rows(diff_text: str) -> list[tuple]:
+    """Parses a unified diff into display rows (kind, old_no, old_text, new_no, new_text):
+    'ctx' is an unchanged line, 'chg' pairs a removed line with an added one (either side may be None),
+    'sep' separates hunks, and 'note' carries a remark in old_text."""
+    rows, dels, adds = [], [], []
+    old_no = new_no = 1
+    seen_hunk = False
+
+    def flush():
+        for i in range(max(len(dels), len(adds))):
+            d = dels[i] if i < len(dels) else (None, None)
+            a = adds[i] if i < len(adds) else (None, None)
+            rows.append(("chg", d[0], d[1], a[0], a[1]))
+        dels.clear()
+        adds.clear()
+
+    for line in diff_text.split("\n"):
+        hunk = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if hunk:
+            flush()
+            if seen_hunk:
+                rows.append(("sep", None, None, None, None))
+            seen_hunk = True
+            old_no, new_no = max(int(hunk.group(1)), 1), max(int(hunk.group(2)), 1)
+        elif not seen_hunk and line.startswith(("--- ", "+++ ")):
+            continue
+        elif line.startswith("-"):
+            dels.append((old_no, line[1:]))
+            old_no += 1
+        elif line.startswith("+"):
+            adds.append((new_no, line[1:]))
+            new_no += 1
+        elif line.startswith("\\"):
+            flush()
+            rows.append(("note", None, line[1:].strip(), None, None))
+        elif line:
+            flush()
+            text = line[1:] if line.startswith(" ") else line
+            rows.append(("ctx", old_no, text, new_no, text))
+            old_no += 1
+            new_no += 1
+    flush()
+    return rows
+
+
+def _render_diff(rows: list[tuple], width: int) -> Text:
+    """Draws diff rows. Side by side (before | after) when the window is at least 100 columns, there is a
+    'before' to show, and every changed line fits in half the width; otherwise stacked with line numbers."""
+    numbers = [n for r in rows for n in (r[1], r[3]) if n is not None]
+    num_w = max(len(str(max(numbers, default=0))), 2)
+    col_w = (width - 2 * (num_w + 1) - 3) // 2
+    changed = [r for r in rows if r[0] == "chg"]
+    has_before = any(r[0] == "ctx" for r in rows) or any(r[2] is not None for r in changed)
+    fits = all(cell_len(t) <= col_w for r in changed for t in (r[2], r[4]) if t is not None)
+    out = Text(no_wrap=True, overflow="crop")
+
+    def number(n) -> str:
+        return f"{'' if n is None else n:>{num_w}} "
+
+    if width >= 100 and has_before and fits:
+        out.append(f"{'':>{num_w}} {set_cell_size('before', col_w)} │ {'':>{num_w}} after\n", style="dim")
+        for kind, old_no, old, new_no, new in rows:
+            if kind == "sep":
+                out.append(f"{'':>{num_w}} {set_cell_size('⋯', col_w)} │ {'':>{num_w}} ⋯\n", style="dim")
+            elif kind == "note":
+                out.append(f"{'':>{num_w}} {old}\n", style="dim")
+            else:
+                left_style = _DEL_STYLE if kind == "chg" and old is not None else ""
+                right_style = _ADD_STYLE if kind == "chg" and new is not None else ""
+                out.append(number(old_no), style=left_style or "dim")
+                out.append(set_cell_size(old or "", col_w), style=left_style)
+                out.append(" │ ", style="dim")
+                out.append(number(new_no), style=right_style or "dim")
+                out.append(set_cell_size(new or "", col_w), style=right_style)
+                out.append("\n")
+    else:
+        out.no_wrap, out.overflow = False, "fold"
+        pad = max(width - num_w - 3, 1)
+        for kind, old_no, old, new_no, new in rows:
+            if kind == "sep":
+                out.append(f"{'':>{num_w}}   ⋯\n", style="dim")
+            elif kind == "note":
+                out.append(f"{'':>{num_w}}   {old}\n", style="dim")
+            elif kind == "ctx":
+                out.append(number(new_no), style="dim")
+                out.append(f"  {new}\n")
+            else:
+                if old is not None:
+                    out.append(f"{number(old_no)}- {old}".ljust(pad + num_w + 3) + "\n", style=_DEL_STYLE)
+                if new is not None:
+                    out.append(f"{number(new_no)}+ {new}".ljust(pad + num_w + 3) + "\n", style=_ADD_STYLE)
+    out.rstrip()
+    return out
+
+
+def _ui_app(root, key_bindings, focus=None):
+    """A small inline (not full-screen) prompt_toolkit application that erases itself when it finishes."""
+    pt = _need("prompt_toolkit.application", UI_FEATURE)
+    layout = _need("prompt_toolkit.layout", UI_FEATURE).Layout(root, focused_element=focus)
+    style = _need("prompt_toolkit.styles", UI_FEATURE).Style.from_dict(_UI_STYLE)
+    app = pt.Application(layout=layout, key_bindings=key_bindings, style=style, full_screen=False,
+                         erase_when_done=True, input=_UI_IO["input"], output=_UI_IO["output"])
+    app.ttimeoutlen = 0.05  # a lone Esc is recognized quickly
+    return app
+
+
+def _ask_menu(question: str, options: list[tuple[str, str]], allow_view: bool = False) -> str | None:
+    """Arrow-key menu. Returns the chosen option's key, "view" (V, when allowed), or None when cancelled.
+
+    Nothing is highlighted at first and only Enter confirms, so neither a stray key nor text typed before the
+    menu appeared can choose an option; pending keystrokes are discarded before it is shown."""
+    kb = _need("prompt_toolkit.key_binding", UI_FEATURE).KeyBindings()
+    layout = _need("prompt_toolkit.layout", UI_FEATURE)
+    controls = _need("prompt_toolkit.layout.controls", UI_FEATURE)
+    chosen = {"index": None}
+
+    @kb.add("up")
+    def _(event):
+        chosen["index"] = len(options) - 1 if chosen["index"] is None else (chosen["index"] - 1) % len(options)
+
+    @kb.add("down")
+    def _(event):
+        chosen["index"] = 0 if chosen["index"] is None else (chosen["index"] + 1) % len(options)
+
+    for n in range(len(options)):
+        kb.add(str(n + 1))(lambda event, n=n: chosen.update(index=n))
+
+    @kb.add("enter")
+    def _(event):
+        if chosen["index"] is not None:
+            event.app.exit(result=options[chosen["index"]][0])
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _(event):
+        event.app.exit(result=None)
+
+    if allow_view:
+        @kb.add("v")
+        def _(event):
+            event.app.exit(result="view")
+
+    def render():
+        parts = [("class:question", question + "\n")]
+        for i, (_, label) in enumerate(options):
+            mark, style = ("❯ ", "class:current") if i == chosen["index"] else ("  ", "")
+            parts.append((style, f"{mark}{i + 1}. {label}\n"))
+        hint = "↑↓ to move · Enter to confirm · Esc to cancel" + (" · V to view the full diff" if allow_view else "")
+        parts.append(("class:status", "\n" + hint))
+        return parts
+
+    window = layout.Window(controls.FormattedTextControl(render, focusable=True, show_cursor=False), dont_extend_height=True)
+    _flush_console_input()
+    return _ui_app(window, kb, focus=window).run()
+
+
+def _ask_line(prompt_text: str) -> str:
+    """One line of free text ("" if cancelled)."""
+    shortcuts = _need("prompt_toolkit.shortcuts", UI_FEATURE)
+    try:
+        return shortcuts.PromptSession(input=_UI_IO["input"], output=_UI_IO["output"]).prompt(prompt_text).strip()
+    except (KeyboardInterrupt, EOFError):
+        return ""
+
+
+def _complete_paths(fragment: str, limit: int = 50) -> list[str]:
+    """Files and folders under the working directory matching a partly typed relative path. Shown to the user
+    only, but protected files and ignored folders are still left out so they are never suggested."""
+    fragment = fragment.replace("/", os.sep)
+    folder, _, prefix = fragment.rpartition(os.sep)
+    if os.path.isabs(fragment) or ".." in fragment.split(os.sep) or ":" in fragment:
+        return []
+    base = os.path.join(os.getcwd(), folder)
+    found = []
+    try:
+        entries = sorted(os.scandir(base), key=lambda e: (not e.is_dir(), e.name.lower()))
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.lower().startswith(prefix.lower()) or entry.name in IGNORE_DIRS:
+            continue
+        try:
+            if _is_sensitive_canon(_canonical_path(entry.path)):
+                continue
+        except ValueError:
+            continue
+        shown = os.path.join(folder, entry.name) if folder else entry.name
+        found.append(shown + (os.sep if entry.is_dir() else ""))
+        if len(found) >= limit:
+            break
+    return found
+
+
+def _completions_for(text: str) -> list[tuple[str, int, str]]:
+    """Completions for the text before the cursor as (replacement, start offset, description): slash commands
+    while typing the first word, file paths after an @."""
+    if text.startswith("/") and not any(c.isspace() for c in text):
+        return [(name, -len(text), desc) for name, (desc, _) in COMMANDS.items() if name.startswith(text.lower())]
+    at = re.search(r"(?:^|\s)@([^\s@]*)$", text)
+    if at:
+        return [(path, -len(at.group(1)), "") for path in _complete_paths(at.group(1))]
+    return []
+
+
+def _prompt_box(status_left: str, status_right: str) -> str:
+    """The boxed, multi-line input with a status line (or the completion list) beneath it.
+    Returns the submitted text. Raises KeyboardInterrupt for Ctrl+C on an empty box, EOFError for Ctrl+D."""
+    layout = _need("prompt_toolkit.layout", UI_FEATURE)
+    controls = _need("prompt_toolkit.layout.controls", UI_FEATURE)
+    completion = _need("prompt_toolkit.completion", UI_FEATURE)
+    filters = _need("prompt_toolkit.filters", UI_FEATURE)
+    kb = _need("prompt_toolkit.key_binding", UI_FEATURE).KeyBindings()
+    Buffer = _need("prompt_toolkit.buffer", UI_FEATURE).Buffer
+    Frame = _need("prompt_toolkit.widgets", UI_FEATURE).Frame
+    FileHistory = _need("prompt_toolkit.history", UI_FEATURE).FileHistory
+
+    class Completer(completion.Completer):
+        def get_completions(self, document, complete_event):
+            for value, start, meta in _completions_for(document.text_before_cursor):
+                yield completion.Completion(value, start_position=start, display_meta=meta)
+
+    os.makedirs(EUSTACE_HOME, exist_ok=True)
+    buf = Buffer(multiline=True, completer=Completer(), complete_while_typing=True,
+                 history=FileHistory(os.path.join(EUSTACE_HOME, "history")))
+
+    @kb.add("enter")
+    def _(event):
+        state = buf.complete_state
+        if state and state.current_completion:       # a highlighted suggestion: take it, do not send yet
+            buf.apply_completion(state.current_completion)
+        elif buf.text.endswith("\\") and buf.cursor_position == len(buf.text):
+            buf.delete_before_cursor(1)              # trailing backslash: continue on a new line
+            buf.insert_text("\n")
+        elif buf.text.strip():
+            buf.append_to_history()
+            event.app.exit(result=buf.text)
+
+    @kb.add("escape", "enter")
+    @kb.add("c-j")
+    def _(event):
+        buf.insert_text("\n")
+
+    @kb.add("tab")
+    def _(event):
+        buf.complete_next() if buf.complete_state else buf.start_completion(select_first=True)
+
+    @kb.add("s-tab")
+    def _(event):
+        buf.complete_previous()
+
+    @kb.add("c-c")
+    def _(event):
+        buf.reset() if buf.text else event.app.exit(exception=KeyboardInterrupt())
+
+    @kb.add("c-d")
+    def _(event):
+        buf.delete() if buf.text else event.app.exit(exception=EOFError())
+
+    def line_prefix(lineno, wrap_count):
+        return [("class:prompt", "> ")] if lineno == 0 and wrap_count == 0 else [("", "  ")]
+
+    def status():
+        # The right side (token estimate) always stays visible; a long folder path loses its beginning instead
+        room = max(event_size().columns - cell_len(status_right) - 3, 0)
+        left = status_left if cell_len(status_left) <= room else "…" + status_left[-max(room - 1, 0):] if room else ""
+        return [("class:status", f" {set_cell_size(left, room)} {status_right}")]
+
+    def suggestions():
+        state = buf.complete_state
+        items = state.completions if state else []
+        current = state.complete_index if state and state.complete_index is not None else -1
+        first = max(0, min(current - 7, len(items) - 8))
+        width = max((cell_len(c.text) for c in items), default=0)
+        parts = []
+        for i, c in enumerate(items[first:first + 8], start=first):
+            style = "class:menu.current" if i == current else ""
+            parts.append((style, f"  {set_cell_size(c.text, width)}  "))
+            parts.append((style or "class:menu.meta", f"{c.display_meta_text}\n"))
+        parts.append(("class:status", "  ↑↓ to move · Tab to complete · Enter to choose"))
+        return parts
+
+    def event_size():
+        return _need("prompt_toolkit.application", UI_FEATURE).get_app().output.get_size()
+
+    has_suggestions = filters.Condition(lambda: bool(buf.complete_state and buf.complete_state.completions))
+    editor = layout.Window(controls.BufferControl(buffer=buf), get_line_prefix=line_prefix, wrap_lines=True,
+                           height=layout.Dimension(min=1, max=10), dont_extend_height=True)
+    root = layout.HSplit([
+        Frame(editor),
+        layout.ConditionalContainer(layout.Window(controls.FormattedTextControl(suggestions), dont_extend_height=True), filter=has_suggestions),
+        layout.ConditionalContainer(layout.Window(controls.FormattedTextControl(status), height=1), filter=~has_suggestions),
+    ])
+    return _ui_app(root, kb, focus=editor).run()
+
+
+def _estimate_tokens(messages: list[dict]) -> int:
+    """Rough size of the conversation: about four characters per token. An estimate, not the provider's count."""
+    chars = sum(len(str(m.get("content") or "")) + len(json.dumps(m.get("tool_calls") or "")) for m in messages)
+    return chars // 4
+
+
+def _short_count(n: int) -> str:
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+def _read_user_input(messages: list[dict]) -> str:
+    """One message from the user: the input box on a real console, a plain prompt otherwise."""
+    if not _ui_enabled():
+        console.print("\n[bold cyan]>[/bold cyan] ", end="")
+        return input()
+    home = os.path.expanduser("~")
+    cwd = os.getcwd()
+    folder = "~" + cwd[len(home):] if os.path.normcase(cwd).startswith(os.path.normcase(home)) else cwd
+    left = f"{short_model_label(MODEL)}{' · DEV' if DEV_MODE else ''} · {folder}"
+    console.print()
+    text = _prompt_box(left, f"~{_short_count(_estimate_tokens(messages))} tokens")
+    # The box erases itself; leave the message in the transcript the way a plain prompt would
+    console.print("[bold cyan]>[/bold cyan] " + escape(_sanitize_for_display(text)).replace("\n", "\n  "))
+    return text
+
+
+class _Quit(Exception):
+    """Raised by /exit to leave the main loop."""
+
+
+def _cmd_help(state: dict, arg: str) -> None:
+    table = Table(box=None, show_header=False, padding=(0, 2, 0, 2))
+    for name, (desc, _) in COMMANDS.items():
+        table.add_row(f"[cyan]{escape(name)}[/cyan]", escape(desc))  # "[name]" in a description is text, not markup
+    console.print(table)
+    console.print(
+        "  [dim]Enter sends · Alt+Enter or a trailing \\ adds a line · ↑↓ history · @ completes a file path\n"
+        "  ESC or Ctrl+C stops a reply · EUSTACE_PLAIN=1 switches back to the plain prompt[/dim]"
+    )
+
+
+def _cmd_status(state: dict, arg: str) -> None:
+    turns = sum(1 for m in state["messages"] if m.get("role") == "user")
+    console.print(
+        f"  [dim]Model:[/dim]    {escape(MODEL)} [dim]({escape(BACKEND_NAME)})[/dim]\n"
+        f"  [dim]Folder:[/dim]   {escape(os.getcwd())}\n"
+        f"  [dim]Session:[/dim]  {escape(AUTOSAVE_NAME)} [dim]({turns} turns, about {_short_count(_estimate_tokens(state['messages']))} tokens)[/dim]\n"
+        f"  [dim]Audit log:[/dim] {escape(AUDIT_LOG_PATH)}"
+    )
+
+
+def _cmd_save(state: dict, arg: str) -> None:
+    save_session(state["messages"], name=arg or datetime.now().strftime("session_%Y%m%d_%H%M"))
+
+
+def _cmd_resume(state: dict, arg: str) -> None:
+    restored = load_session(arg)
+    if restored is not None:
+        state["messages"] = restored
+
+
+def _cmd_sessions(state: dict, arg: str) -> None:
+    saved = list_saved_sessions()
+    if not saved:
+        console.print("[dim yellow]No saved sessions yet.[/dim yellow]")
+        return
+    console.print("[bold cyan]Saved Sessions (~/.eustace/sessions/):[/bold cyan]")
+    for idx, s in enumerate(saved, start=1):
+        prev = escape(s["preview"].replace("\n", " "))
+        console.print(
+            f"  [bold]{idx}.[/bold] [cyan]{escape(s['name'])}[/cyan] "
+            f"[dim]({s['turn_count']} turns | {s['updated_at']})[/dim] — \"{prev}\""
+        )
+
+
+def _cmd_compact(state: dict, arg: str) -> None:
+    try:
+        state["messages"] = compact_messages(state["messages"])
+        save_session(state["messages"], quiet=True)
+        console.print("[dim cyan]✓ Context compacted into a summary[/dim cyan]")
+    except Exception as e:
+        console.print(f"[bold red]Compact failed:[/bold red] {escape(str(e))}")
+
+
+def _cmd_clear(state: dict, arg: str) -> None:
+    state["messages"] = [{"role": "system", "content": build_system_prompt()}]
+    console.print("[dim cyan]✓ Context cleared & system_prompt.md reloaded[/dim cyan]")
+
+
+def _cmd_model(state: dict, arg: str) -> None:
+    select_model_interactive(arg)
+    state["messages"][0]["content"] = build_system_prompt()
+
+
+def _cmd_exit(state: dict, arg: str) -> None:
+    raise _Quit
+
+
+# The one list of slash commands: the main loop dispatches from it and the input box's "/" menu shows it.
+COMMANDS: dict[str, tuple[str, typing.Callable[[dict, str], None]]] = {
+    "/help": ("Show commands and keys", _cmd_help),
+    "/status": ("Model, folder, session and token estimate", _cmd_status),
+    "/save": ("Save this session: /save [name]", _cmd_save),
+    "/resume": ("Restore a saved session: /resume [name or number]", _cmd_resume),
+    "/sessions": ("List saved sessions", _cmd_sessions),
+    "/compact": ("Summarize the conversation to free up context", _cmd_compact),
+    "/clear": ("Start over with an empty conversation", _cmd_clear),
+    "/model": ("Choose the model: /model [id]", _cmd_model),
+    "/exit": ("Quit Eustace", _cmd_exit),
+}
+_COMMAND_ALIASES = {"/quit": "/exit", "exit": "/exit", "quit": "/exit"}
+
+
 def main():
     _init_client()
     cwd = os.getcwd()
@@ -3349,7 +3825,7 @@ def main():
             title_line
             + f"[dim]Workspace:[/dim] {escape(cwd)}\n"
             f"[dim]Audit Log:[/dim] {escape(AUDIT_LOG_PATH)}\n"
-            "[dim]Commands:[/dim] [cyan]/save [name][/cyan], [cyan]/resume [name|#][/cyan], [cyan]/sessions[/cyan], "
+            "[dim]Commands:[/dim] [cyan]/help[/cyan], [cyan]/save [name][/cyan], [cyan]/resume [name|#][/cyan], [cyan]/sessions[/cyan], "
             "[cyan]/compact[/cyan], [cyan]/clear[/cyan], [cyan]/model[/cyan], [cyan]/exit[/cyan]\n"
             "[dim]Tip:[/dim] Press [bold]ESC[/bold] or [bold]Ctrl+C[/bold] while generating to stop mid-reply"
             f"{session_hint}",
@@ -3357,73 +3833,31 @@ def main():
         )
     )
 
-    messages = [{"role": "system", "content": build_system_prompt()}]
+    state = {"messages": [{"role": "system", "content": build_system_prompt()}]}
 
     while True:
         try:
-            console.print("\n[bold cyan]>[/bold cyan] ", end="")
-            user_input = input().strip()
-
+            user_input = _read_user_input(state["messages"]).strip()
             if not user_input:
                 continue
 
-            cmd_parts = user_input.split(maxsplit=1)
-            cmd = cmd_parts[0].lower()
-            cmd_arg = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
-
-            if cmd in ["/exit", "/quit", "exit", "quit"]:
-                console.print("[dim]Goodbye![/dim]")
-                break
-
-            if cmd == "/clear":
-                messages = [{"role": "system", "content": build_system_prompt()}]
-                console.print("[dim cyan]✓ Context cleared & system_prompt.md reloaded[/dim cyan]")
+            word, _, arg = user_input.partition(" ")
+            name = _COMMAND_ALIASES.get(word.lower(), word.lower())
+            if name in COMMANDS:
+                COMMANDS[name][1](state, arg.strip())
                 continue
-            
-            if cmd == "/model":
-                select_model_interactive(cmd_arg)
-                # Re-initialize the system prompt with the newly selected model name
-                messages[0]["content"] = build_system_prompt()
+            if re.fullmatch(r"/[a-z]+", name) and "\n" not in user_input:
+                console.print(f"[dim yellow]Unknown command {escape(word)}. Type /help for the list.[/dim yellow]")
                 continue
 
-            if cmd == "/sessions":
-                saved = list_saved_sessions()
-                if not saved:
-                    console.print("[dim yellow]No saved sessions yet.[/dim yellow]")
-                else:
-                    console.print("[bold cyan]Saved Sessions (~/.eustace/sessions/):[/bold cyan]")
-                    for idx, s in enumerate(saved, start=1):
-                        prev = escape(s["preview"].replace("\n", " "))
-                        console.print(
-                            f"  [bold]{idx}.[/bold] [cyan]{escape(s['name'])}[/cyan] "
-                            f"[dim]({s['turn_count']} turns | {s['updated_at']})[/dim] — \"{prev}\""
-                        )
-                continue
-
-            if cmd == "/save":
-                save_session(messages, name=cmd_arg or datetime.now().strftime("session_%Y%m%d_%H%M"))
-                continue
-
-            if cmd == "/resume":
-                restored = load_session(cmd_arg)
-                if restored is not None:
-                    messages = restored
-                continue
-
-            if cmd == "/compact":
-                try:
-                    messages = compact_messages(messages)
-                    save_session(messages, quiet=True)
-                    console.print("[dim cyan]✓ Context compacted into a summary[/dim cyan]")
-                except Exception as e:
-                    console.print(f"[bold red]Compact failed:[/bold red] {escape(str(e))}")
-                continue
-
-            messages.append({"role": "user", "content": user_input})
-            run_agent_turn(messages)
+            state["messages"].append({"role": "user", "content": user_input})
+            run_agent_turn(state["messages"])
             # Checkpoint every completed turn to this run's autosave file
-            save_session(messages, quiet=True)
+            save_session(state["messages"], quiet=True)
 
+        except _Quit:
+            console.print("[dim]Goodbye![/dim]")
+            break
         except KeyboardInterrupt:
             console.print("\n[dim yellow]Interrupted. Type /exit to quit, or enter your next prompt.[/dim yellow]")
             continue
@@ -3432,9 +3866,8 @@ def main():
             break
         except Exception as e:
             console.print(f"\n[bold red]Error:[/bold red] {escape(str(e))}")
-            if messages and messages[-1].get("role") == "user":
-                messages.pop()
-
+            if state["messages"] and state["messages"][-1].get("role") == "user":
+                state["messages"].pop()
 
 
 if __name__ == "__main__":
