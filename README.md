@@ -13,11 +13,11 @@ A local CLI agent powered by **GenAI.mil** models with built-in tools for local 
 **Option A - Using Git:**
 Open PowerShell and run:
 ```powershell
-git clone github.com/Colciferr/eustace
+git clone https://github.com/Colciferr/eustace
 ```
 or
 ```powershell
-git clone gitlab.com/Colciferr/eustace
+git clone https://gitlab.com/Colciferr/eustace
 ```
 
 **Option B - Without Git (ZIP Download):**

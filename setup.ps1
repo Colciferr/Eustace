@@ -20,6 +20,23 @@ function Test-Python {
     } catch { return $false }
 }
 
+function Test-Quiet {
+    # Runs a native command with its output discarded; returns $true when it exits 0.
+    # Windows PowerShell 5.1 wraps redirected stderr in error records, which "Stop" would turn into a
+    # script-ending error, so the probe runs under "Continue".
+    param([scriptblock]$Command)
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Command *> $null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+}
+
 Write-Host "== Eustace setup ==" -ForegroundColor Cyan
 Write-Host "Source: $here"
 
@@ -43,13 +60,16 @@ if (Test-Python) {
 }
 
 # 2. pipx
-& python -m pipx --version *> $null
-if ($LASTEXITCODE -eq 0) {
+if (Test-Quiet { python -m pipx --version }) {
     Write-Host "[ok] pipx present"
 } else {
     Write-Host "[..] Installing pipx..." -ForegroundColor Yellow
     & python -m pip install --user --quiet pipx
-    & python -m pipx ensurepath *> $null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Quiet { python -m pipx --version })) {
+        Write-Host "[!!] Could not install pipx. See output above." -ForegroundColor Red
+        exit 1
+    }
+    Test-Quiet { python -m pipx ensurepath } | Out-Null
     Refresh-Path
     Write-Host "[ok] pipx installed"
 }
