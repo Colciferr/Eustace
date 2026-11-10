@@ -37,6 +37,11 @@ function Test-Quiet {
     }
 }
 
+# pip gives up on a download after 15 seconds of silence and 5 tries. Networks that scan downloads in transit
+# can hold a file longer than that, so allow more unless the user has already chosen their own values.
+if (-not $env:PIP_DEFAULT_TIMEOUT) { $env:PIP_DEFAULT_TIMEOUT = "180" }
+if (-not $env:PIP_RETRIES) { $env:PIP_RETRIES = "10" }
+
 Write-Host "== Eustace setup ==" -ForegroundColor Cyan
 Write-Host "Source: $here"
 
@@ -75,10 +80,11 @@ if (Test-Quiet { python -m pipx --version }) {
 }
 
 # 3. Eustace (install or upgrade)
-Write-Host "[..] Installing eustace from $here ..." -ForegroundColor Yellow
+Write-Host "[..] Installing eustace from $here (downloads dependencies; can take several minutes) ..." -ForegroundColor Yellow
 & python -m pipx install "$here" --force
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[!!] pipx install failed. See output above." -ForegroundColor Red
+    Write-Host "     If the error is a timeout, run this script again: finished downloads are cached, so each run gets further."
     exit 1
 }
 
