@@ -1665,6 +1665,8 @@ def search_files(
             return f"Error: Search path does not exist: {path}"
         if not os.path.isdir(root_dir):
             return f"Error: Search path is not a directory: {path}"
+        if _is_sensitive_canon(root_dir):
+            return f"Security Error: '{path}' is a protected location and will not be searched."
         if not _confirm_outside_workspace(root_dir, "Search files"):
             return "Operation aborted: User did NOT approve searching outside the working directory."
 
