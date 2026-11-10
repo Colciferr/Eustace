@@ -1392,7 +1392,18 @@ def update_excel(
             return "Security Error: Writing to protected or system paths is prohibited."
 
         exists = os.path.exists(target)
+        is_macro = target.lower().endswith(".xlsm")
+        if is_macro and not exists:
+            return (
+                "Error: a new macro-enabled workbook (.xlsm) cannot be created by this tool; use .xlsx. "
+                "Existing .xlsm workbooks can be updated."
+            )
         preview = [f"Workbook: {target} ({'existing' if exists else 'new file'})"]
+        if exists:
+            preview.append(
+                "Note:     the whole workbook is rewritten. Content the library does not model (shapes, form "
+                "controls, some formatting) can be lost; keep a copy of anything important."
+            )
         if sheet_name:
             preview.append(f"Sheet:    {sheet_name}")
         if append_rows:
@@ -1420,7 +1431,9 @@ def update_excel(
             return err
 
         if exists:
-            wb = load_workbook(target)
+            # Without keep_vba the macro project is dropped and the file is saved as a plain workbook under an
+            # .xlsm name, which Excel then refuses to open.
+            wb = load_workbook(target, keep_vba=is_macro)
             if sheet_name:
                 ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(title=sheet_name)
             else:
