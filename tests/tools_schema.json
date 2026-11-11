@@ -63,7 +63,7 @@
     "type": "function",
     "function": {
       "name": "edit_file",
-      "description": "Search and replace a specific block of text/code within an existing file.",
+      "description": "Search and replace specific blocks of text/code within an existing file: one block with old_text and new_text, or several at once with edits.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -73,17 +73,36 @@
           },
           "old_text": {
             "type": "string",
-            "description": "The exact string block currently in the file that you want to replace."
+            "description": "The exact string block currently in the file that you want to replace (single edit)."
           },
           "new_text": {
             "type": "string",
-            "description": "The replacement string block to insert."
+            "description": "The replacement string block to insert (single edit)."
+          },
+          "edits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "old_text": {
+                  "type": "string",
+                  "description": "Exact text currently in the file (after earlier edits in this list)."
+                },
+                "new_text": {
+                  "type": "string",
+                  "description": "Replacement text."
+                }
+              },
+              "required": [
+                "old_text",
+                "new_text"
+              ]
+            },
+            "description": "Several replacements in one file, applied in order and approved as one diff. If any edit fails, nothing is written. Use this instead of old_text/new_text when changing more than one place."
           }
         },
         "required": [
-          "path",
-          "old_text",
-          "new_text"
+          "path"
         ]
       }
     }

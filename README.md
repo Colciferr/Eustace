@@ -62,6 +62,19 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 
 ---
 
+## Approvals, Auto Mode & Undo
+By default, Eustace asks before it writes a file, runs a command, or reads outside the folder you started it in.
+
+* **Auto mode:** press **Shift+Tab** in the input box, type `/auto`, or start with `eustace --auto`. The status line shows `⏵⏵ AUTO`. File reads (anywhere), file writes, and PowerShell commands then run without asking. Auto mode is off each time Eustace starts.
+* **Still asks in auto mode:**
+  * Shell commands on the deny-list: deleting, registry, accounts, downloads, scheduled tasks and services, remoting, security settings, encoded or dynamically built commands, other interpreters, script files, `git push`/`reset --hard`/`clean`, and any script Eustace itself wrote this session. The prompt says which pattern matched. Add your own patterns (regular expressions) under `"shell_deny"` in `~/.eustace/config.json`; the built-in list can't be shortened.
+  * Writes to `AGENT.md`, `system_prompt.md`, `.git`, `.github`, and `.eustace` (these change Eustace's instructions or run automatically).
+  * Outlook actions, the clipboard, opening files, and dev-mode data.
+* **Never allowed in any mode:** system folders, secrets and credential files, PHI.
+* **Known limit:** the deny-list matches command text. A command that builds its text at runtime in a way the list doesn't recognize can get past it. Auto mode reduces prompts for trusted work; it isn't a sandbox.
+* **Allow rules:** choose **"Yes, and always allow"** in an approval (or type `r` at the plain prompt) to stop being asked for that exact command, or for that tool in that folder. Rules are saved under `"allow"` in `~/.eustace/config.json`, for example `run_powershell(git status)`, `run_powershell(pytest*)`, `read(C:/Users/me/Documents/regs/**)` (reading outside the working folder, by any tool), or `write_docx(./out/**)` (that tool's writes). A read rule never covers a write. A shell rule never matches a command that chains, pipes, or redirects (`; | & > <`, backticks, `$(`). `/permissions` lists rules and `/permissions remove <number>` deletes one.
+* **Undo:** `/undo` restores every file Eustace's file tools changed in the most recent turn that wrote anything (and deletes files that turn created), after one confirmation. Run it again to step back further. Changes made by shell commands aren't covered. Checkpoints are kept for 7 days, up to 200 MB.
+
 ## Customization & Updating
 * **Custom Persona:** You can edit `~/.eustace/system_prompt.md` at any time to customize Eustace's instructions or tone.
 * **Updating:** Pull or download the latest files from GitHub and re-run `powershell -ExecutionPolicy Bypass -File .\setup.ps1`.
