@@ -54,6 +54,7 @@ if "--help" in _ARGS or "-h" in _ARGS:
         "usage: eustace [--auto] [--devmode] [--version]\n\n"
         "  --auto      Start in auto mode: file reads, file writes and shell commands run without asking,\n"
         "              except shell commands on the deny-list. Shift+Tab or /auto switches it off.\n"
+        "              Ignored when Eustace runs as Administrator (elevated).\n"
         "  --devmode   Use the PUBLIC Google Gemini API (GEMINI_API_KEY, config in ~/.eustace-dev)\n"
         "              for functional testing off DODIN. Synthetic test data only; never CUI/PII/PHI.\n"
         "  --version   Print the version and exit.\n"
@@ -862,12 +863,47 @@ ALWAYS_ASK_KINDS = {"read_outside", "shell", "dev_data", "write_instructions"}  
 NEVER_AUTOMATIC_KINDS = {"write_instructions", "dev_data", "outlook", "clipboard_read", "clipboard_write", "open_file"}
 AUTO_KINDS = {"read_outside", "write", "shell"}  # what auto mode approves, and what allow rules may cover
 
-PERMISSION_MODE = "auto" if START_IN_AUTO_MODE else "default"
+def _process_is_elevated() -> bool:
+    """True when this process runs with an elevated (administrator) token. A non-elevated session of an admin
+    account cannot use admin rights without a UAC prompt, so it does not count. Any failure reads as False."""
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        adv.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        adv.OpenProcessToken.restype = wintypes.BOOL
+        adv.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                            ctypes.POINTER(wintypes.DWORD)]
+        adv.GetTokenInformation.restype = wintypes.BOOL
+        token = wintypes.HANDLE()
+        if not adv.OpenProcessToken(k32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+            return False
+        try:
+            elevation, size = wintypes.DWORD(0), wintypes.DWORD(0)
+            ok = adv.GetTokenInformation(token, 20, ctypes.byref(elevation), ctypes.sizeof(elevation), ctypes.byref(size))  # TokenElevation
+            return bool(ok) and bool(elevation.value)
+        finally:
+            k32.CloseHandle(token)
+    except Exception:
+        return False
 
 
-def set_permission_mode(mode: str) -> None:
+# Running elevated, everything Eustace runs gets admin rights, so auto mode is unavailable and every prompt says so.
+ELEVATED = _process_is_elevated()
+PERMISSION_MODE = "auto" if START_IN_AUTO_MODE and not ELEVATED else "default"
+ELEVATED_AUTO_REFUSAL = "Auto mode is off while running as Administrator"
+
+
+def set_permission_mode(mode: str) -> bool:
+    """Switches between "auto" and "default". Returns False (and stays in default) when auto mode is asked for
+    in an elevated session."""
     global PERMISSION_MODE
+    if mode == "auto" and ELEVATED:
+        PERMISSION_MODE = "default"
+        return False
     PERMISSION_MODE = "auto" if mode == "auto" else "default"
+    return True
 
 
 # Files that change Eustace's own instructions, or that run automatically later (git hooks, CI workflows), are
@@ -1071,7 +1107,7 @@ def decide(kind: str, tool_name: str = "", target: str | None = None, command: s
         hit = shell_deny_match(command or "")
         if hit:
             return "ask", f"deny-list ({hit})"
-    if PERMISSION_MODE == "auto":
+    if PERMISSION_MODE == "auto" and not ELEVATED:
         return "allow", "auto_mode"
     rule = matching_allow_rule(kind, tool_name, target, command)
     if rule:
@@ -1091,10 +1127,14 @@ def _permission(kind: str, title: str, detail: str = "", diff: str = "", target:
         handler.last_decision = reason
         how = "auto" if reason == "auto_mode" else f"allowed by rule {reason.split(':', 1)[1]}"
         what = f"{title}: {command}" if command else title if not target or target in title else f"{title} ({target})"
-        console.print(f"  [dim green]✓ {escape(_visible_controls(how))}: {escape(_visible_controls(what))}[/dim green]")
+        admin = " [bold red]\\[admin][/bold red]" if ELEVATED else ""
+        console.print(f"  [dim green]✓ {escape(_visible_controls(how))}: {escape(_visible_controls(what))}[/dim green]{admin}")
         return True
     if reason:
         note = f"[bold yellow]Always asks: matches the shell {escape(_visible_controls(reason))}[/bold yellow]"
+        detail = f"{detail}\n{note}" if detail else note
+    if ELEVATED:
+        note = f"[bold red]Runs as Administrator: this {'command' if kind == 'shell' else 'action'} gets admin rights.[/bold red]"
         detail = f"{detail}\n{note}" if detail else note
     try:
         handler.rule_candidate = None if reason else rule_candidate(kind, tool_name, target, command)
@@ -3891,8 +3931,9 @@ _DEL_STYLE, _ADD_STYLE = "#ffc1c5 on #4a1519", "#b9f0c0 on #12361a"
 _UI_STYLE = {
     "frame.border": "#6a6a6a", "prompt": "bold ansicyan", "status": "#8f8f8f",
     "menu.current": "bg:#1f3a3a #ffffff", "menu.meta": "#8f8f8f", "question": "bold", "current": "ansicyan",
-    "auto": "bold ansiyellow",
+    "auto": "bold ansiyellow", "admin": "bg:ansired #0c0c0c bold", "flash": "ansiyellow",
 }
+ADMIN_BADGE = " ⚠ ADMIN "
 AUTO_BADGE = "⏵⏵ AUTO "
 
 
@@ -4142,6 +4183,8 @@ def _prompt_box(status_left: str, status_right: str) -> str:
     os.makedirs(EUSTACE_HOME, exist_ok=True)
     buf = Buffer(multiline=True, completer=Completer(), complete_while_typing=True,
                  history=FileHistory(os.path.join(EUSTACE_HOME, "history")))
+    flash = {"text": ""}
+    buf.on_text_changed += lambda _: flash.update(text="")
 
     @kb.add("enter")
     def _(event):
@@ -4169,8 +4212,8 @@ def _prompt_box(status_left: str, status_right: str) -> str:
         # Steps back through an open completion list; otherwise switches auto mode (shown in the status line)
         if buf.complete_state:
             buf.complete_previous()
-        else:
-            set_permission_mode("default" if PERMISSION_MODE == "auto" else "auto")
+        elif not set_permission_mode("default" if PERMISSION_MODE == "auto" else "auto"):
+            flash["text"] = ELEVATED_AUTO_REFUSAL  # shown in the status line until the next key
 
     @kb.add("c-c")
     def _(event):
@@ -4185,13 +4228,18 @@ def _prompt_box(status_left: str, status_right: str) -> str:
 
     def status():
         # The right side (token estimate) always stays visible; a long folder path loses its beginning instead
+        admin = ADMIN_BADGE + " " if ELEVATED else ""
         badge = AUTO_BADGE if PERMISSION_MODE == "auto" else ""
-        room = max(event_size().columns - cell_len(status_right) - cell_len(badge) - 3, 0)
-        left = status_left if cell_len(status_left) <= room else "…" + status_left[-max(room - 1, 0):] if room else ""
+        text = flash["text"] or status_left
+        room = max(event_size().columns - cell_len(status_right) - cell_len(badge) - cell_len(admin) - 3, 0)
+        left = text if cell_len(text) <= room else "…" + text[-max(room - 1, 0):] if room else ""
         parts = [("class:status", " ")]
+        if admin:
+            parts += [("class:admin", ADMIN_BADGE), ("class:status", " ")]
         if badge:
             parts.append(("class:auto", badge))
-        parts.append(("class:status", f"{set_cell_size(left, room)} {status_right}"))
+        parts.append(("class:flash" if flash["text"] else "class:status", set_cell_size(left, room)))
+        parts.append(("class:status", f" {status_right}"))
         return parts
 
     def suggestions():
@@ -4235,7 +4283,7 @@ def _short_count(n: int) -> str:
 def _read_user_input(messages: list[dict]) -> str:
     """One message from the user: the input box on a real console, a plain prompt otherwise."""
     if not _ui_enabled():
-        badge = "[bold yellow]AUTO[/bold yellow] " if PERMISSION_MODE == "auto" else ""
+        badge = ("[bold red]ADMIN[/bold red] " if ELEVATED else "") + ("[bold yellow]AUTO[/bold yellow] " if PERMISSION_MODE == "auto" else "")
         console.print(f"\n{badge}[bold cyan]>[/bold cyan] ", end="")
         return input()
     home = os.path.expanduser("~")
@@ -4272,7 +4320,8 @@ def _cmd_status(state: dict, arg: str) -> None:
         f"  [dim]Folder:[/dim]   {escape(os.getcwd())}\n"
         f"  [dim]Session:[/dim]  {escape(AUTOSAVE_NAME)} [dim]({turns} turns, about {_short_count(_estimate_tokens(state['messages']))} tokens)[/dim]\n"
         f"  [dim]Mode:[/dim]     {'auto' if PERMISSION_MODE == 'auto' else 'default (asks before writes and commands)'} "
-        f"[dim]· {len(get_allow_rules())} allow rule(s)[/dim]\n"
+        f"[dim]· {len(get_allow_rules())} allow rule(s)[/dim]"
+        + (" [bold red]· running as Administrator: auto mode unavailable[/bold red]" if ELEVATED else "") + "\n"
         f"  [dim]Audit log:[/dim] {escape(AUDIT_LOG_PATH)}"
     )
 
@@ -4338,7 +4387,12 @@ def _cmd_auto(state: dict, arg: str) -> None:
     if a not in ("", "on", "off"):
         console.print("[dim yellow]Usage: /auto [on|off][/dim yellow]")
         return
-    set_permission_mode(("default" if PERMISSION_MODE == "auto" else "auto") if not a else "auto" if a == "on" else "default")
+    wanted = ("default" if PERMISSION_MODE == "auto" else "auto") if not a else "auto" if a == "on" else "default"
+    if not set_permission_mode(wanted):
+        console.print("[bold red]Auto mode isn't available while Eustace runs as Administrator.[/bold red]\n"
+                      "[dim]Restart Eustace from a normal (non-elevated) PowerShell window to use it.\n"
+                      "Approvals, \"approve all this turn\", and allow rules still work as usual.[/dim]")
+        return
     if PERMISSION_MODE == "auto":
         console.print(f"[bold yellow]Auto mode on.[/bold yellow] [dim]{AUTO_MODE_SUMMARY}[/dim]")
     else:
@@ -4366,8 +4420,9 @@ def _cmd_permissions(state: dict, arg: str) -> None:
     if word:
         console.print("[dim yellow]Usage: /permissions, or /permissions remove <number>[/dim yellow]")
         return
-    console.print(f"  [dim]Mode:[/dim] {'[bold yellow]auto[/bold yellow]' if PERMISSION_MODE == 'auto' else 'default'}"
-                  "  [dim](Shift+Tab or /auto to switch)[/dim]")
+    switch = ("  [red](auto mode unavailable: running as Administrator)[/red]" if ELEVATED
+              else "  [dim](Shift+Tab or /auto to switch)[/dim]")
+    console.print(f"  [dim]Mode:[/dim] {'[bold yellow]auto[/bold yellow]' if PERMISSION_MODE == 'auto' else 'default'}{switch}")
     rules = _config_list("allow")
     if not rules:
         console.print("  [dim]No allow rules. Choose \"Yes, and always allow\" in an approval to add one.[/dim]")
@@ -4422,6 +4477,9 @@ def main():
         )
     else:
         title_line = f"[bold cyan]GenAI.mil CLI — Eustace v{VERSION}[/bold cyan] ([dim]{escape(MODEL)} | {len(TOOLS)} tools[/dim])\n"
+    if ELEVATED:
+        title_line += ("[bold red]⚠  Running as Administrator (elevated)[/bold red]\n"
+                       "[red]   Everything Eustace runs gets admin rights. Auto mode is off for this session.[/red]\n")
     console.print(
         Panel.fit(
             title_line
@@ -4434,9 +4492,12 @@ def main():
             "[bold]Shift+Tab[/bold] switches auto mode"
             + ("\n[bold yellow]Auto mode is on[/bold yellow] [dim](started with --auto)[/dim]" if PERMISSION_MODE == "auto" else "")
             + session_hint,
-            border_style="yellow" if DEV_MODE else "cyan",
+            border_style="red" if ELEVATED else "yellow" if DEV_MODE else "cyan",
         )
     )
+    if ELEVATED and START_IN_AUTO_MODE:
+        console.print("[yellow]--auto was ignored: auto mode isn't available while Eustace runs as Administrator.\n"
+                      "Start Eustace from a normal (non-elevated) PowerShell window to use it.[/yellow]")
 
     state = {"messages": [{"role": "system", "content": build_system_prompt()}]}
     prune_checkpoints()

@@ -295,6 +295,54 @@ class ModeSwitchTests(unittest.TestCase):
             self.assertIn("Usage", output())
 
 
+class ElevatedTests(unittest.TestCase):
+    """Running as Administrator: auto mode is unavailable and every prompt says the action gets admin rights."""
+
+    def test_detection_returns_a_bool(self):
+        self.assertIsInstance(cli._process_is_elevated(), bool)
+
+    def test_auto_mode_cannot_be_switched_on(self):
+        with sandbox():
+            cli.ELEVATED = True
+            self.assertFalse(cli.set_permission_mode("auto"))
+            self.assertEqual(cli.PERMISSION_MODE, "default")
+            self.assertTrue(cli.set_permission_mode("default"))
+            cli._cmd_auto({}, "on")
+            self.assertEqual(cli.PERMISSION_MODE, "default")
+            self.assertIn("isn't available while Eustace runs as Administrator", output())
+            cli._cmd_permissions({}, "")
+            self.assertIn("auto mode unavailable", output())
+
+    def test_even_a_forced_auto_mode_asks(self):
+        with sandbox():
+            cli.ELEVATED = True
+            cli.PERMISSION_MODE = "auto"  # however it got set, elevated means ask
+            self.assertEqual(cli.decide("write", "write_file", target="x")[0], "ask")
+
+    def test_shift_tab_does_not_switch(self):
+        with sandbox():
+            cli.ELEVATED = True
+            with keys(SHIFT_TAB, "hi", ENTER):
+                self.assertEqual(cli._prompt_box("m · ~", "~0 tokens"), "hi")
+            self.assertEqual(cli.PERMISSION_MODE, "default")
+
+    def test_prompts_say_admin_and_rule_approvals_are_marked(self):
+        approval = RecordingApproval(default=True)
+        with sandbox(approval=approval) as (ws, home):
+            cli.ELEVATED = True
+            approval.current_tool = "run_powershell"
+            cli._permission("shell", "Run PowerShell command", command="git log")
+            self.assertIn("this command gets admin rights", approval.calls[-1][1])
+            approval.current_tool = "write_file"
+            cli.write_file("a.txt", "x")
+            self.assertIn("this action gets admin rights", approval.calls[-1][1])
+            write_config(home, allow=["run_powershell(git status)"])
+            approval.current_tool = "run_powershell"
+            self.assertTrue(cli._permission("shell", "Run PowerShell command", command="git status"))
+            self.assertIn("[admin]", output())
+        self.assertEqual(len(approval.calls), 2)
+
+
 class BatchEditTests(unittest.TestCase):
     def edit(self, data: bytes, approve=True, **kwargs):
         approval = RecordingApproval(default=approve)
