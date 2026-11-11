@@ -1,5 +1,6 @@
 # Electronic Utility for Scripting, Tasks, and Automated Command Execution (EUSTACE)
 A local CLI agent powered by **GenAI.mil** models with built-in tools for local files, PowerShell, Microsoft Office (Word, Excel, PowerPoint, PDF), and Classic Outlook.
+Although this was built with GenAI.mil in mind, it can technically access any OpenAI-compatible API endpoint and isn't strictly a DoD tool.
 
 ## Prerequisites
 * **Windows Workstation** (No administrator rights required)
