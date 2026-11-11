@@ -37,7 +37,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 # When output is redirected to a file or pipe, Windows uses the ANSI code page, which cannot encode the symbols
 # printed here; degrade to "?" instead of crashing mid-turn.
@@ -51,7 +51,10 @@ for _stream in (sys.stdout, sys.stderr):
 _ARGS = sys.argv[1:]
 if "--help" in _ARGS or "-h" in _ARGS:
     print(
-        "usage: eustace [--devmode] [--version]\n\n"
+        "usage: eustace [--auto] [--devmode] [--version]\n\n"
+        "  --auto      Start in auto mode: file reads, file writes and shell commands run without asking,\n"
+        "              except shell commands on the deny-list. Shift+Tab or /auto switches it off.\n"
+        "              Ignored when Eustace runs as Administrator (elevated).\n"
         "  --devmode   Use the PUBLIC Google Gemini API (GEMINI_API_KEY, config in ~/.eustace-dev)\n"
         "              for functional testing off DODIN. Synthetic test data only; never CUI/PII/PHI.\n"
         "  --version   Print the version and exit.\n"
@@ -61,6 +64,7 @@ if "--version" in _ARGS:
     print(f"Eustace v{VERSION}")
     raise SystemExit(0)
 DEV_MODE = "--devmode" in _ARGS
+START_IN_AUTO_MODE = "--auto" in _ARGS
 
 # Look for .env in C:\Users\<Username>\.eustace\.env  (dev mode: ~\.eustace-dev\.env)
 EUSTACE_HOME = os.path.join(os.path.expanduser("~"), ".eustace-dev" if DEV_MODE else ".eustace")
@@ -622,22 +626,26 @@ def _guard_write(path: str, ext: tuple[str, ...] = ()) -> tuple[str | None, str 
 
 
 def _approve_and_recheck(target: str, title: str, detail: str = "", diff: str = "", writing: bool = True) -> str | None:
-    """Asks the user, then re-validates the target right before the caller acts on it. Returns None to go
-    ahead or the message to hand back to the model."""
-    if not APPROVAL_HANDLER.request_approval(title, detail_text=detail, diff_text=diff):
+    """Asks for permission, then re-validates the target right before the caller acts on it. A write is
+    checkpointed for /undo once it is cleared. Returns None to go ahead or the message to hand back to the model."""
+    if not _permission("write" if writing else "open_file", title, detail, diff, target=target):
         return "Operation aborted: User did NOT approve this action."
-    return _recheck_after_approval(target, writing)
+    err = _recheck_after_approval(target, writing)
+    if err is None and writing:
+        _checkpoint(target)
+    return err
 
 
 def _confirm_outside_workspace(canon: str, action: str) -> bool:
-    """Reads inside the working directory stay approval-free; anything else must be approved like a write."""
+    """Reads inside the working directory stay approval-free; anything else needs permission like a write."""
     ws = _workspace_root()
     if _is_under(canon, ws):
         return True
-    return APPROVAL_HANDLER.request_approval(
+    return _permission(
+        "read_outside",
         f"{action} outside the working directory",
-        detail_text=f"[dim]Path:      {escape(_visible_controls(canon))}\nWorkspace: {escape(ws)}[/dim]",
-        always_ask=True,
+        f"[dim]Path:      {escape(_visible_controls(canon))}\nWorkspace: {escape(ws)}[/dim]",
+        target=canon,
     )
 
 
@@ -722,13 +730,15 @@ def build_unified_diff(old_text: str, new_text: str, path: str) -> str:
 class CLIApprovalHandler:
     """Approval prompt with a diff preview: an arrow-key menu on a real console, a typed letter otherwise.
     "Approve all" covers further calls of the *same tool* for the rest of the turn; requests marked always_ask (shell commands, access outside the working directory, dev-mode data
-    warnings) are never covered by it."""
+    warnings, instruction files) are never covered by it. Callers go through _permission(), which decides first
+    whether the prompt is needed at all (auto mode, allow rules)."""
 
     def __init__(self):
         self.approved_tools: set[str] = set()
         self.current_tool = ""   # set by the agent loop before each tool runs
         self.last_decision = "auto"
         self.last_feedback = ""  # what the user typed when denying with "tell Eustace what to do instead"
+        self.rule_candidate = None  # set by _permission(): the allow rule "Yes, and always allow" would save
 
     def reset_turn(self):
         self.approved_tools.clear()
@@ -755,10 +765,13 @@ class CLIApprovalHandler:
             body = detail_text or escape(action_title)
 
         can_approve_all = not always_ask and bool(self.current_tool)
+        rule = self.rule_candidate
         interactive = _ui_enabled()
         keys = "[bold yellow]\\[Y][/bold yellow] Approve   [bold yellow]\\[N][/bold yellow] Deny"
         if can_approve_all:
             keys += f"   [bold yellow]\\[A][/bold yellow] Approve all {escape(self.current_tool)} this turn"
+        if rule:
+            keys += f"   [bold yellow]\\[R][/bold yellow] Always allow {escape(_visible_controls(rule))}"
         if hidden > 0:
             keys += "   [bold yellow]\\[V][/bold yellow] View Full Diff"
 
@@ -777,11 +790,18 @@ class CLIApprovalHandler:
         )
 
         while True:
-            choice = self._ask_menu(can_approve_all, hidden > 0) if interactive else self._ask_typed(can_approve_all, hidden > 0)
+            choice = (self._ask_menu(can_approve_all, hidden > 0, rule) if interactive
+                      else self._ask_typed(can_approve_all, hidden > 0, rule))
             if choice != "view":
                 break
             console.print(_render_diff(rows, max(console.width, 40)))
 
+        if choice == "rule":
+            saved = add_allow_rule(rule)
+            console.print(f"  [dim green]✓ Approved, and {'saved' if saved else 'could not save'} the rule "
+                          f"{escape(_visible_controls(rule))}[/dim green]")
+            self.last_decision = "approved_rule_saved" if saved else "approved_user"
+            return True
         if choice == "all":
             self.approved_tools.add(self.current_tool)
             self.last_decision = "approved_all_turn"
@@ -793,9 +813,9 @@ class CLIApprovalHandler:
         self.last_decision = "denied_user"
         return False
 
-    def _ask_typed(self, can_approve_all: bool, can_view: bool) -> str:
+    def _ask_typed(self, can_approve_all: bool, can_view: bool, rule: str | None = None) -> str:
         """Plain typed prompt (no real console, EUSTACE_PLAIN=1, or prompt_toolkit unavailable)."""
-        options = ["y", "n"] + (["a"] if can_approve_all else []) + (["v"] if can_view else [])
+        options = ["y", "n"] + (["a"] if can_approve_all else []) + (["r"] if rule else []) + (["v"] if can_view else [])
         console.print(f"  [bold yellow]Choice ({'/'.join(options)}) \\[default: N]:[/bold yellow] ", end="")
         # Whole-word answers only: stray typed-ahead text that merely starts with "y" must not approve
         answer = input().strip().lower()
@@ -803,15 +823,19 @@ class CLIApprovalHandler:
             return "view"
         if answer in ("a", "all") and can_approve_all:
             return "all"
+        if answer in ("r", "rule") and rule:
+            return "rule"
         return "yes" if answer in ("y", "yes") else "no"
 
-    def _ask_menu(self, can_approve_all: bool, can_view: bool) -> str:
+    def _ask_menu(self, can_approve_all: bool, can_view: bool, rule: str | None = None) -> str:
         """Arrow-key menu. Choosing "tell Eustace what to do instead" denies the action and records the user's
         words in last_feedback, which the agent loop passes to the model with the tool result."""
         options = [("yes", "Yes")]
         if can_approve_all:
             options.append(("all", f"Yes, and don't ask again for {self.current_tool} this turn"))
         options.append(("tell", "No, and tell Eustace what to do instead"))
+        if rule:  # last, so the numbers of the existing choices never move (3 stays "No" where it was)
+            options.append(("rule", f"Yes, and always allow {_visible_controls(rule)}"))
         choice = _ask_menu("Do you want to proceed?", options, allow_view=can_view)
         if choice == "tell":
             self.last_feedback = _ask_line("What should Eustace do instead? ")
@@ -825,6 +849,504 @@ class CLIApprovalHandler:
 DIFF_PREVIEW_LINES = 100
 
 APPROVAL_HANDLER = CLIApprovalHandler()
+
+
+# ---------------------------------------------------------------------
+# PERMISSIONS: one decision point in front of the approval prompt.
+#
+# Every request has a kind. decide() says whether it may go ahead without a prompt (auto mode, an allow rule)
+# or must ask. Hard blocks (protected and secrets paths, PHI, links, the post-approval recheck) run inside the
+# tools before and after this and are never affected by it.
+# ---------------------------------------------------------------------
+
+ALWAYS_ASK_KINDS = {"read_outside", "shell", "dev_data", "write_instructions"}  # never covered by per-turn "approve all"
+NEVER_AUTOMATIC_KINDS = {"write_instructions", "dev_data", "outlook", "clipboard_read", "clipboard_write", "open_file"}
+AUTO_KINDS = {"read_outside", "write", "shell"}  # what auto mode approves, and what allow rules may cover
+
+def _process_is_elevated() -> bool:
+    """True when this process runs with an elevated (administrator) token. A non-elevated session of an admin
+    account cannot use admin rights without a UAC prompt, so it does not count. Any failure reads as False."""
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        adv.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        adv.OpenProcessToken.restype = wintypes.BOOL
+        adv.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                            ctypes.POINTER(wintypes.DWORD)]
+        adv.GetTokenInformation.restype = wintypes.BOOL
+        token = wintypes.HANDLE()
+        if not adv.OpenProcessToken(k32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+            return False
+        try:
+            elevation, size = wintypes.DWORD(0), wintypes.DWORD(0)
+            ok = adv.GetTokenInformation(token, 20, ctypes.byref(elevation), ctypes.sizeof(elevation), ctypes.byref(size))  # TokenElevation
+            return bool(ok) and bool(elevation.value)
+        finally:
+            k32.CloseHandle(token)
+    except Exception:
+        return False
+
+
+# Running elevated, everything Eustace runs gets admin rights, so auto mode is unavailable and every prompt says so.
+ELEVATED = _process_is_elevated()
+PERMISSION_MODE = "auto" if START_IN_AUTO_MODE and not ELEVATED else "default"
+ELEVATED_AUTO_REFUSAL = "Auto mode is off while running as Administrator"
+
+
+def set_permission_mode(mode: str) -> bool:
+    """Switches between "auto" and "default". Returns False (and stays in default) when auto mode is asked for
+    in an elevated session."""
+    global PERMISSION_MODE
+    if mode == "auto" and ELEVATED:
+        PERMISSION_MODE = "default"
+        return False
+    PERMISSION_MODE = "auto" if mode == "auto" else "default"
+    return True
+
+
+# Files that change Eustace's own instructions, or that run automatically later (git hooks, CI workflows), are
+# always shown and asked about, in every mode.
+_INSTRUCTION_FILE_NAMES = {"agent.md", "system_prompt.md"}
+_INSTRUCTION_DIRS = {".eustace", ".eustace-dev", ".git", ".github"}
+
+
+def _is_instruction_file(canon: str) -> bool:
+    # Windows drops trailing dots and spaces from a name when it creates the file, so "AGENT.md." is AGENT.md
+    parts = [p.rstrip(" .") for p in os.path.normpath(canon).lower().split(os.sep) if p.rstrip(" .")]
+    return bool(parts) and (parts[-1] in _INSTRUCTION_FILE_NAMES or any(p in _INSTRUCTION_DIRS for p in parts[:-1]))
+
+
+def _alias(name: str) -> str:
+    """Regex for a short command name or alias (optionally with .exe) that is not part of a longer word, file
+    name or path."""
+    return r"(?<![\w.\\/-])(?:" + name + r")(?:\.exe)?(?![\w.\\/:-])"
+
+
+# (pattern, label). Matched case-insensitively against the command after line continuations and backticks are
+# removed. A match never blocks a command; it only means the command always asks, even in auto mode.
+SHELL_DENY_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"remove-item|clear-content|clear-item|clear-recyclebin", "deletes files"),
+    ("|".join(_alias(a) for a in ("rm", "del", "erase", "rd", "rmdir", "ri", "clc")), "deletes files"),
+    (r"::delete|\.delete\(", "deletes files"),
+    (r"format-volume|initialize-disk|clear-disk|stop-computer|restart-computer|" + _alias("shutdown")
+     + "|" + _alias("bcdedit") + "|" + _alias("diskpart"), "changes the system"),
+    (_alias(r"reg(\.exe)?") + r"\s|(set|new|remove|rename)-itemproperty|hklm:|hkcu:|registry::", "changes the registry"),
+    (_alias(r"net(\.exe)?") + r"\s+(user|localgroup|group|accounts)|-localuser|-localgroupmember", "changes accounts"),
+    (r"invoke-webrequest|invoke-restmethod|start-bitstransfer|bitsadmin|net\.webclient|system\.net\.http|"
+     r"downloadstring|downloadfile|" + "|".join(_alias(a) for a in ("iwr", "irm", "curl", "wget", "certutil")),
+     "downloads or uploads"),
+    (r"(?<![\w-])-e(c|n|nc|ncodedcommand)?\s|frombase64string|invoke-expression|" + _alias("iex") + r"|\[scriptblock\]|"
+     r"invokecommand|add-type|&\s*[\$(]|(?<![\w.])\.\s*[\$(]", "hides what runs"),
+    ("|".join(_alias(a) for a in (r"(powershell|pwsh)(\.exe)?", r"cmd(\.exe)?", "mshta", "rundll32", "regsvr32",
+                                  "wscript", "cscript", "msiexec")), "starts another interpreter"),
+    (r"-verb\s+runas|" + _alias("runas"), "runs elevated"),
+    (r"schtasks|-scheduledtask|new-service|set-service|" + _alias(r"sc(\.exe)?") + r"\s+(create|config|delete)",
+     "creates tasks or services"),
+    (r"invoke-command|enter-pssession|new-pssession|" + _alias("icm"), "runs on other computers"),
+    (r"set-executionpolicy|set-mppreference|add-mppreference", "changes security settings"),
+    (r"icacls|takeown|set-acl", "changes permissions"),
+    (r"stop-process|taskkill|" + _alias("kill"), "stops processes"),
+    (r"invoke-item|" + _alias("ii"), "opens files with their default program"),
+    (r"startup|\$profile|currentversion\\run", "touches startup locations"),
+    (r"git\s+(push|clean)|git\s+reset\s+--hard|git\s+checkout\s+--\s|git\s+branch\s+-d", "changes git history or remotes"),
+    (r"agent\.md|system_prompt\.md|\.git[\\/]|\.github|\.eustace", "touches Eustace's instruction files or git internals"),
+    (r"[\w-]\.(ps1|psm1|bat|cmd|vbs|vbe|wsf|hta)(?![\w.-])", "runs or writes a script file"),
+)
+_SHELL_DENY_COMPILED = [(re.compile(p, re.IGNORECASE), label) for p, label in SHELL_DENY_PATTERNS]
+
+# File types that run as code: a command that runs one Eustace wrote this session always asks, so auto mode
+# cannot be used to write a script around the deny-list and then run it.
+_SCRIPT_EXTENSIONS = (".ps1", ".psm1", ".psd1", ".bat", ".cmd", ".py", ".pyw", ".js", ".vbs", ".wsf", ".hta", ".sh", ".exe")
+_SESSION_WRITTEN_SCRIPTS: set[str] = set()
+
+
+def _normalize_command(command: str) -> str:
+    """The command as the deny-list sees it: continuations joined and backticks dropped (PowerShell lets a
+    backtick sit inside a word, so Re`move-Item runs Remove-Item)."""
+    return re.sub(r"`\s*\n", " ", str(command)).replace("`", "")
+
+
+def _user_shell_deny() -> list[tuple[re.Pattern, str]]:
+    """Extra deny patterns (regular expressions) from config.json "shell_deny"; invalid ones are skipped."""
+    out = []
+    for pat in _config_list("shell_deny"):
+        try:
+            out.append((re.compile(pat, re.IGNORECASE), f"your pattern {pat}"))
+        except re.error:
+            continue
+    return out
+
+
+def shell_deny_match(command: str) -> str | None:
+    """Why this command must always ask, or None. The built-in list cannot be shortened from config."""
+    norm = _normalize_command(command)
+    for rx, label in _SHELL_DENY_COMPILED + _user_shell_deny():
+        m = rx.search(norm)
+        if m:
+            return f"{label}: {m.group(0).strip()}"
+    low = norm.lower()
+    for name in _SESSION_WRITTEN_SCRIPTS:
+        if re.search(r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])", low):  # a path may come before it
+            return f"runs a file Eustace wrote this session: {name}"
+    return None
+
+
+# --- Allow rules: entries in config.json "allow". run_powershell(<command>) covers a command, read(<path>) covers
+# reading by any tool outside the working directory, and <write tool>(<path>) covers that tool's writes. A read
+# rule never covers a write, even by a tool that also reads (write_pptx reading its template, for example).
+READ_RULE_NAME = "read"
+
+_RULE_RE = re.compile(r"^([a-z_]+)\((.*)\)$", re.DOTALL)
+# A shell rule never matches a command that chains, pipes, redirects, or substitutes another command
+_SHELL_RULE_FORBIDDEN = re.compile(r"[;|&\n\r`<>]|[$@]\(")
+
+
+def _config_list(key: str) -> list[str]:
+    value = _read_config().get(key, [])
+    return [x.strip() for x in value if isinstance(x, str) and x.strip()] if isinstance(value, list) else []
+
+
+def get_allow_rules() -> list[str]:
+    return [r for r in _config_list("allow") if _RULE_RE.match(r)]
+
+
+def invalid_allow_rules() -> list[str]:
+    return [r for r in _config_list("allow") if not _RULE_RE.match(r)]
+
+
+def add_allow_rule(rule: str) -> bool:
+    """Saves a rule (once). Returns False if config.json could not be written."""
+    rules = _config_list("allow")
+    if rule not in rules:
+        rules.append(rule)
+    try:
+        _write_json_atomic(CONFIG_PATH, {**_read_config(), "allow": rules})
+        return True
+    except OSError:
+        return False
+
+
+def remove_allow_rule(index: int) -> str | None:
+    """Removes the index-th (1-based) entry of "allow" as listed by /permissions; returns it, or None."""
+    rules = _config_list("allow")
+    if not 1 <= index <= len(rules):
+        return None
+    removed = rules.pop(index - 1)
+    _update_config(allow=rules)
+    return removed
+
+
+def _rule_path_matches(pattern: str, target: str) -> bool:
+    """`folder/**` covers everything under folder; anything else must name the exact path. A leading ./ is
+    relative to the working directory at the time of the call."""
+    p = pattern.strip().replace("/", os.sep)
+    subtree = p.endswith(os.sep + "**")
+    if subtree:
+        p = p[:-3]
+    if not p or "*" in p or "?" in p:
+        return False
+    base = os.path.realpath(os.path.join(os.getcwd(), os.path.expanduser(p)))
+    if subtree:
+        return _is_under(target, base)
+    return os.path.normcase(os.path.normpath(target)) == os.path.normcase(base)
+
+
+def _shell_rule_matches(pattern: str, command: str) -> bool:
+    """Exact command, or a prefix when the rule ends in *. Chained or redirected commands never match."""
+    cmd, pat = command.strip(), pattern.strip()
+    if not cmd or not pat or _SHELL_RULE_FORBIDDEN.search(cmd):
+        return False
+    if pat.endswith("*"):
+        return cmd.casefold().startswith(pat[:-1].casefold())
+    return cmd.casefold() == pat.casefold()
+
+
+def _rule_name_for(kind: str, tool_name: str) -> str:
+    return READ_RULE_NAME if kind == "read_outside" else tool_name
+
+
+def matching_allow_rule(kind: str, tool_name: str, target: str | None = None, command: str | None = None) -> str | None:
+    if kind not in AUTO_KINDS or not tool_name:
+        return None
+    wanted = _rule_name_for(kind, tool_name)
+    if kind == "write" and wanted == READ_RULE_NAME:
+        return None
+    for rule in get_allow_rules():
+        name, pattern = _RULE_RE.match(rule).groups()
+        if name != wanted:
+            continue
+        if kind == "shell" and command is not None and _shell_rule_matches(pattern, command):
+            return rule
+        if kind != "shell" and target and _rule_path_matches(pattern, target):
+            return rule
+    return None
+
+
+def rule_candidate(kind: str, tool_name: str, target: str | None = None, command: str | None = None) -> str | None:
+    """The rule "Yes, and always allow" would save: the exact command, or the containing folder."""
+    if kind not in AUTO_KINDS or not tool_name:
+        return None
+    if kind == "shell":
+        cmd = (command or "").strip()
+        if not cmd or len(cmd) > 300 or cmd.endswith("*") or _SHELL_RULE_FORBIDDEN.search(cmd) or shell_deny_match(cmd):
+            return None
+        return f"{tool_name}({cmd})"
+    if not target:
+        return None
+    folder = target if os.path.isdir(target) else os.path.dirname(target)
+    return f"{_rule_name_for(kind, tool_name)}({folder.replace(os.sep, '/')}/**)"
+
+
+def decide(kind: str, tool_name: str = "", target: str | None = None, command: str | None = None) -> tuple[str, str]:
+    """("allow", reason) when the request may go ahead without a prompt, else ("ask", note). Unknown kinds ask."""
+    if kind in NEVER_AUTOMATIC_KINDS or kind not in AUTO_KINDS:
+        return "ask", ""
+    if kind == "shell":
+        hit = shell_deny_match(command or "")
+        if hit:
+            return "ask", f"deny-list ({hit})"
+    if PERMISSION_MODE == "auto" and not ELEVATED:
+        return "allow", "auto_mode"
+    rule = matching_allow_rule(kind, tool_name, target, command)
+    if rule:
+        return "allow", f"allow_rule:{rule}"
+    return "ask", ""
+
+
+def _permission(kind: str, title: str, detail: str = "", diff: str = "", target: str | None = None,
+                command: str | None = None) -> bool:
+    """The single entry point tools use to ask for permission: decides, then prompts only when needed."""
+    handler = APPROVAL_HANDLER
+    tool_name = getattr(handler, "current_tool", "") or ""
+    if kind == "write" and target and _is_instruction_file(target):
+        kind = "write_instructions"
+    verdict, reason = decide(kind, tool_name, target, command)
+    if verdict == "allow":
+        handler.last_decision = reason
+        how = "auto" if reason == "auto_mode" else f"allowed by rule {reason.split(':', 1)[1]}"
+        what = f"{title}: {command}" if command else title if not target or target in title else f"{title} ({target})"
+        admin = " [bold red]\\[admin][/bold red]" if ELEVATED else ""
+        console.print(f"  [dim green]✓ {escape(_visible_controls(how))}: {escape(_visible_controls(what))}[/dim green]{admin}")
+        return True
+    if reason:
+        note = f"[bold yellow]Always asks: matches the shell {escape(_visible_controls(reason))}[/bold yellow]"
+        detail = f"{detail}\n{note}" if detail else note
+    if ELEVATED:
+        note = f"[bold red]Runs as Administrator: this {'command' if kind == 'shell' else 'action'} gets admin rights.[/bold red]"
+        detail = f"{detail}\n{note}" if detail else note
+    try:
+        handler.rule_candidate = None if reason else rule_candidate(kind, tool_name, target, command)
+    except AttributeError:
+        pass
+    try:
+        return handler.request_approval(title, detail_text=detail, diff_text=diff, always_ask=kind in ALWAYS_ASK_KINDS)
+    finally:
+        try:
+            handler.rule_candidate = None
+        except AttributeError:
+            pass
+
+
+# ---------------------------------------------------------------------
+# CHECKPOINTS (/undo): the bytes of every file a write tool is about to change, saved per turn.
+# ---------------------------------------------------------------------
+
+_TURN = {"id": 0}  # incremented at the start of each agent turn
+MAX_CHECKPOINT_FILE_BYTES = 100 * 1024 * 1024
+CHECKPOINT_MAX_AGE_DAYS = 7
+CHECKPOINT_MAX_TOTAL_BYTES = 200 * 1024 * 1024
+
+
+def _checkpoints_base() -> str:
+    return os.path.join(EUSTACE_HOME, "checkpoints")
+
+
+def _checkpoints_root() -> str:
+    """This run's checkpoints (one folder per Eustace run, named like its autosave)."""
+    return os.path.join(_checkpoints_base(), AUTOSAVE_NAME)
+
+
+def _turn_dir(turn: int) -> str:
+    return os.path.join(_checkpoints_root(), f"turn_{turn:05d}")
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _load_manifest(turn_dir: str) -> dict | None:
+    try:
+        with open(os.path.join(turn_dir, "manifest.json"), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) and isinstance(data.get("files"), list) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _checkpoint(target: str) -> None:
+    """Saves target's current bytes (or the fact that it does not exist yet) before a write tool changes it.
+    Only the first write to a file in a turn is recorded, which is the state /undo should return to. Failure
+    to save is reported, never fatal."""
+    if target.lower().endswith(_SCRIPT_EXTENSIONS):
+        _SESSION_WRITTEN_SCRIPTS.add(os.path.basename(target).lower())
+    if os.path.isdir(target):
+        return
+    turn_dir = _turn_dir(_TURN["id"])
+    try:
+        manifest = _load_manifest(turn_dir) or {
+            "turn": _TURN["id"], "created": datetime.now(timezone.utc).isoformat(), "files": []}
+        key = os.path.normcase(target)
+        if any(os.path.normcase(f.get("path", "")) == key for f in manifest["files"]):
+            return
+        entry = {"path": target, "existed": os.path.isfile(target)}
+        if entry["existed"]:
+            if os.path.getsize(target) > MAX_CHECKPOINT_FILE_BYTES:
+                raise OSError(f"larger than {MAX_CHECKPOINT_FILE_BYTES // (1024 * 1024)} MB")
+            data = _read_bytes_or_none(target)
+            if data is None:
+                raise OSError("could not read it")
+            entry["blob"] = f"{len(manifest['files']):04d}.bin"
+            entry["sha256_before"] = _sha256(data)
+            os.makedirs(turn_dir, exist_ok=True)
+            with open(os.path.join(turn_dir, entry["blob"]), "wb") as f:
+                f.write(data)
+        manifest["files"].append(entry)
+        _write_json_atomic(os.path.join(turn_dir, "manifest.json"), manifest)
+    except (OSError, ValueError) as e:
+        console.print(f"  [yellow]Could not save an undo checkpoint for {escape(target)} ({escape(str(e))}); "
+                      "/undo will not restore this file.[/yellow]")
+
+
+def _finalize_checkpoints(turn: int) -> None:
+    """Records what each checkpointed file looks like after the turn, so /undo can tell when it was changed
+    again afterwards."""
+    turn_dir = _turn_dir(turn)
+    manifest = _load_manifest(turn_dir)
+    if not manifest:
+        return
+    for entry in manifest["files"]:
+        data = _read_bytes_or_none(entry["path"]) if os.path.isfile(entry["path"]) else None
+        entry["sha256_after"] = _sha256(data) if data is not None else None
+    try:
+        _write_json_atomic(os.path.join(turn_dir, "manifest.json"), manifest)
+    except OSError:
+        pass
+
+
+def _latest_checkpoint_turn() -> tuple[str, dict] | None:
+    root = _checkpoints_root()
+    try:
+        names = sorted((n for n in os.listdir(root) if re.fullmatch(r"turn_\d{5}", n)), reverse=True)
+    except OSError:
+        return None
+    for name in names:
+        manifest = _load_manifest(os.path.join(root, name))
+        if manifest and manifest["files"]:
+            return os.path.join(root, name), manifest
+    return None
+
+
+def undo_last_turn() -> str | None:
+    """Restores the files the most recent writing turn changed, after one confirmation. Returns a note for
+    the model describing what was reverted, or None when nothing was undone."""
+    found = _latest_checkpoint_turn()
+    if not found:
+        console.print("[dim yellow]Nothing to undo: no file changes from Eustace are on record for this run.[/dim yellow]")
+        return None
+    turn_dir, manifest = found
+    lines, changed_since = [], 0
+    for entry in reversed(manifest["files"]):
+        now = _read_bytes_or_none(entry["path"]) if os.path.isfile(entry["path"]) else None
+        now_sha = _sha256(now) if now is not None else None
+        drifted = "sha256_after" in entry and now_sha != entry["sha256_after"]
+        changed_since += drifted
+        action = "restore" if entry["existed"] else "delete (created that turn)" if now is not None else "already gone"
+        lines.append(f"{action:<26} {entry['path']}" + ("   [changed since; those changes will be lost]" if drifted else ""))
+    detail = "[dim]" + escape(_visible_controls("\n".join(lines))) + "[/dim]"
+    if changed_since:
+        detail += f"\n[bold yellow]{changed_since} file(s) changed after Eustace wrote them.[/bold yellow]"
+    previous_tool = getattr(APPROVAL_HANDLER, "current_tool", "")
+    APPROVAL_HANDLER.current_tool = ""
+    try:
+        ok = APPROVAL_HANDLER.request_approval(f"Undo file changes from turn {manifest.get('turn', '?')}",
+                                               detail_text=detail, always_ask=True)
+    finally:
+        APPROVAL_HANDLER.current_tool = previous_tool
+    if not ok:
+        console.print("[dim]Undo cancelled.[/dim]")
+        return None
+
+    done, failed = [], []
+    for entry in reversed(manifest["files"]):
+        path = entry["path"]
+        try:
+            if _has_link_component(path) or _is_protected_path(path) or _is_sensitive_canon(path):
+                raise OSError("the location is now protected or passes through a link")
+            if entry["existed"]:
+                with open(os.path.join(turn_dir, entry["blob"]), "rb") as f:
+                    data = f.read()
+                if _sha256(data) != entry.get("sha256_before"):
+                    raise OSError("the saved copy is damaged")
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                tmp = f"{path}.{os.getpid()}.undo.tmp"
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                os.replace(tmp, path)
+                done.append(f"restored {path}")
+            elif os.path.isfile(path):
+                os.remove(path)
+                done.append(f"deleted {path}")
+        except OSError as e:
+            failed.append(f"{path}: {e}")
+    if failed:
+        # Keep the checkpoint so the files that could not be restored can be tried again after fixing the cause
+        manifest["files"] = [e for e in manifest["files"] if any(e["path"] in f for f in failed)]
+        try:
+            _write_json_atomic(os.path.join(turn_dir, "manifest.json"), manifest)
+        except OSError:
+            pass
+    else:
+        shutil.rmtree(turn_dir, ignore_errors=True)
+    for line in done:
+        console.print(f"  [green]✓ {escape(_visible_controls(line))}[/green]")
+    for line in failed:
+        console.print(f"  [bold red]✗ {escape(_visible_controls(line))}[/bold red]")
+    if not done:
+        return None
+    return "The user ran /undo, which reverted these file changes: " + "; ".join(done) + "."
+
+
+def prune_checkpoints(max_age_days: int = CHECKPOINT_MAX_AGE_DAYS, max_total_bytes: int = CHECKPOINT_MAX_TOTAL_BYTES) -> None:
+    """Deletes turn checkpoints older than max_age_days, then the oldest ones until the rest fit in max_total_bytes."""
+    base = _checkpoints_base()
+    try:
+        runs = [os.path.join(base, d) for d in os.listdir(base)]
+    except OSError:
+        return
+    turns = []
+    for run in runs:
+        try:
+            for name in os.listdir(run):
+                path = os.path.join(run, name)
+                size = sum(os.path.getsize(os.path.join(path, f)) for f in os.listdir(path))
+                turns.append((os.path.getmtime(path), size, path))
+        except OSError:
+            continue
+    cutoff = time.time() - max_age_days * 86400
+    turns.sort()
+    total = sum(t[1] for t in turns)
+    for mtime, size, path in turns:
+        if mtime < cutoff or total > max_total_bytes:
+            shutil.rmtree(path, ignore_errors=True)
+            total -= size
+    for run in runs:
+        try:
+            if not os.listdir(run):
+                os.rmdir(run)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------
@@ -1110,15 +1632,48 @@ def write_file(path: str, content: str) -> str:
         return f"Error writing file '{path}': {e}"
 
 
+MAX_EDITS_PER_CALL = 50
+_EDITS_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "old_text": {"type": "string", "description": "Exact text currently in the file (after earlier edits in this list)."},
+            "new_text": {"type": "string", "description": "Replacement text."},
+        },
+        "required": ["old_text", "new_text"],
+    },
+    "description": "Several replacements in one file, applied in order and approved as one diff. If any edit fails, "
+                   "nothing is written. Use this instead of old_text/new_text when changing more than one place.",
+}
+
+
 @tool(
     "Editing file",
     path="Relative or absolute path to the file to edit.",
-    old_text="The exact string block currently in the file that you want to replace.",
-    new_text="The replacement string block to insert.",
+    old_text="The exact string block currently in the file that you want to replace (single edit).",
+    new_text="The replacement string block to insert (single edit).",
+    edits=_EDITS_SCHEMA,
 )
-def edit_file(path: str, old_text: str, new_text: str) -> str:
-    """Search and replace a specific block of text/code within an existing file."""
+def edit_file(path: str, old_text: str = "", new_text: str = "", edits: list[dict] | None = None) -> str:
+    """Search and replace specific blocks of text/code within an existing file: one block with old_text and
+    new_text, or several at once with edits."""
     try:
+        if edits is not None and (old_text or new_text):
+            return "Error: pass either old_text/new_text or edits, not both. No changes made."
+        if edits is None:
+            pairs = [(old_text, new_text)]
+        else:
+            if not isinstance(edits, list) or not edits:
+                return "Error: 'edits' must be a non-empty list of {old_text, new_text} objects. No changes made."
+            if len(edits) > MAX_EDITS_PER_CALL:
+                return f"Error: at most {MAX_EDITS_PER_CALL} edits per call. No changes made."
+            pairs = []
+            for n, e in enumerate(edits, start=1):
+                if not (isinstance(e, dict) and isinstance(e.get("old_text"), str) and isinstance(e.get("new_text"), str)):
+                    return f"Error: edit {n} must be an object with string old_text and new_text. No changes made."
+                pairs.append((e["old_text"], e["new_text"]))
+
         target, err = _guard_write(path)
         if err:
             return err
@@ -1133,31 +1688,37 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
                 "without corrupting it. No changes made."
             )
         text, enc = decoded
+        newline = _dominant_newline(text)
+        original_norm = text.replace("\r\n", "\n")
 
         # Match with line endings normalized (the model writes \n), then splice into the original text so every
-        # byte outside the replaced span, including each untouched line ending, is preserved.
-        norm = text.replace("\r\n", "\n")
-        old_n = old_text.replace("\r\n", "\n")
-        new_n = new_text.replace("\r\n", "\n")
-        if not old_n:
-            return "Error: 'old_text' is empty. No changes made."
-        if old_n == new_n:
-            return "Error: 'old_text' and 'new_text' are identical. No changes made."
-        hits = norm.count(old_n)
-        if hits == 0:
-            return "Error: Target text block ('old_text') was not found in the file. No changes made."
-        if hits > 1:
-            return (
-                f"Error: 'old_text' matches {hits} places in the file. Include more surrounding lines so it "
-                "identifies exactly one. No changes made."
-            )
+        # byte outside the replaced span, including each untouched line ending, is preserved. Each edit sees the
+        # result of the ones before it.
+        for n, (old, new) in enumerate(pairs, start=1):
+            which = f"edit {n}: " if len(pairs) > 1 else ""
+            norm = text.replace("\r\n", "\n")
+            old_n, new_n = old.replace("\r\n", "\n"), new.replace("\r\n", "\n")
+            if not old_n:
+                return f"Error: {which}'old_text' is empty. No changes made."
+            if old_n == new_n:
+                return f"Error: {which}'old_text' and 'new_text' are identical. No changes made."
+            hits = norm.count(old_n)
+            if hits == 0:
+                return f"Error: {which}Target text block ('old_text') was not found in the file. No changes made."
+            if hits > 1:
+                return (
+                    f"Error: {which}'old_text' matches {hits} places in the file. Include more surrounding lines so it "
+                    "identifies exactly one. No changes made."
+                )
+            at = norm.index(old_n)
+            start, end = _raw_index(text, at), _raw_index(text, at + len(old_n))
+            text = text[:start] + new_n.replace("\n", newline) + text[end:]
 
-        at = norm.index(old_n)
-        start, end = _raw_index(text, at), _raw_index(text, at + len(old_n))
-        updated = text[:start] + new_n.replace("\n", _dominant_newline(text)) + text[end:]
-        diff_str = build_unified_diff(norm, norm[:at] + new_n + norm[at + len(old_n):], target)
+        updated = text
+        diff_str = build_unified_diff(original_norm, updated.replace("\r\n", "\n"), target)
+        title = f"Edit file: {target}" + (f" ({len(pairs)} edits)" if len(pairs) > 1 else "")
 
-        err = _approve_and_recheck(target, f"Edit file: {target}", diff=diff_str)
+        err = _approve_and_recheck(target, title, diff=diff_str)
         if err:
             return err
         # The approved diff must describe the bytes actually on disk; re-read and compare before writing.
@@ -1168,7 +1729,7 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
             f.write(updated.encode(enc))
 
         console.print(f"[bold green]✓ File edited: {escape(target)}[/bold green]\n")
-        return f"Success: File edited successfully at {target}"
+        return f"Success: File edited successfully at {target}" + (f" ({len(pairs)} edits)" if len(pairs) > 1 else "")
     except Exception as e:
         return f"Error editing file '{path}': {e}"
 
@@ -1194,13 +1755,11 @@ def run_powershell(command: str) -> str:
         if not shell:
             return "Error: No trusted PowerShell host found (pwsh.exe under Program Files or powershell.exe under System32)."
 
-        if not APPROVAL_HANDLER.request_approval(
+        if not _permission(
+            "shell",  # every command is its own decision; "approve all" never covers the shell
             "Run PowerShell command",
-            detail_text=(
-                f"[bold cyan]{escape(_visible_controls(command))}[/bold cyan]\n"
-                f"[dim]Interpreter: {escape(shell)}[/dim]"
-            ),
-            always_ask=True,  # every command is its own decision; "approve all" never covers the shell
+            f"[bold cyan]{escape(_visible_controls(command))}[/bold cyan]\n[dim]Interpreter: {escape(shell)}[/dim]",
+            command=command,
         ):
             return "Operation aborted: User did NOT approve running the command."
 
@@ -1305,9 +1864,10 @@ def read_clipboard(max_chars: int = 30000) -> str:
     peek = [ln[:80] + ("..." if len(ln) > 80 else "") for ln in lines[:3]]
     if len(lines) > 3:
         peek.append(f"... (+{len(lines) - 3} more lines)")
-    if not APPROVAL_HANDLER.request_approval(
+    if not _permission(
+        "clipboard_read",
         "Send clipboard text to the model",
-        detail_text=f"[dim]{len(text)} characters:[/dim]\n[cyan]" + escape(_visible_controls("\n".join(peek))) + "[/cyan]",
+        f"[dim]{len(text)} characters:[/dim]\n[cyan]" + escape(_visible_controls("\n".join(peek))) + "[/cyan]",
     ):
         return "Operation aborted: User did NOT approve reading the clipboard."
 
@@ -1322,9 +1882,10 @@ def write_clipboard(text: str) -> str:
     Outlook, Word, or Teams."""
     try:
         # What lands on the clipboard gets pasted somewhere later, possibly into a terminal
-        if not APPROVAL_HANDLER.request_approval(
+        if not _permission(
+            "clipboard_write",
             "Copy to clipboard",
-            detail_text="[cyan]" + escape(_visible_controls(_head_lines(text, 40))) + "[/cyan]",
+            "[cyan]" + escape(_visible_controls(_head_lines(text, 40))) + "[/cyan]",
         ):
             return "Operation aborted: User did NOT approve writing to the clipboard."
         data = text.encode("utf-16-le") + b"\x00\x00"
@@ -2372,14 +2933,12 @@ def _dev_mode_gate(what: str) -> str | None:
     message unless the user explicitly allows this one read (always None outside dev mode)."""
     if not DEV_MODE:
         return None
-    ok = APPROVAL_HANDLER.request_approval(
+    ok = _permission(
+        "dev_data",
         f"DEV MODE: send {what} to the public Gemini API",
-        detail_text=(
-            "[bold yellow]This session is NOT GenAI.mil.[/bold yellow] "
-            f"Approving sends {escape(what)} from this machine's Outlook profile to Google's public API. "
-            "Approve only on a machine with test data."
-        ),
-        always_ask=True,
+        "[bold yellow]This session is NOT GenAI.mil.[/bold yellow] "
+        f"Approving sends {escape(what)} from this machine's Outlook profile to Google's public API. "
+        "Approve only on a machine with test data.",
     )
     return None if ok else f"Operation aborted: User did NOT approve sending {what} to the public API in dev mode."
 
@@ -2548,7 +3107,7 @@ def open_email(entry_id: str, open_reply_window: bool = False) -> str:
         subj = str(_safe_prop(item, "Subject", "(Email)"))
 
         action = f"Open Outlook Reply window for: {subj}" if open_reply_window else f"Display Outlook email on screen: {subj}"
-        if not APPROVAL_HANDLER.request_approval(action):
+        if not _permission("outlook", action):
             return "Operation aborted: User declined to open the Outlook item."
 
         if open_reply_window:
@@ -2584,9 +3143,10 @@ def create_draft_email(subject: str, body: str, to_hint: str = "") -> str:
         preview_lines.append("--- Draft Body ---")
         preview_lines.append(_head_lines(body, 40))
 
-        if not APPROVAL_HANDLER.request_approval(
+        if not _permission(
+            "outlook",
             f"Create Outlook Draft: {subject}",
-            detail_text="[cyan]" + escape(_visible_controls("\n".join(preview_lines))) + "[/cyan]",
+            "[cyan]" + escape(_visible_controls("\n".join(preview_lines))) + "[/cyan]",
         ):
             return "Operation aborted: User did NOT approve creating the Outlook draft."
 
@@ -2968,6 +3528,8 @@ def run_agent_turn(messages: list[dict]):
     turn_start_len = len(messages)
     partial_reply = ""
     APPROVAL_HANDLER.reset_turn()
+    _TURN["id"] += 1
+    turn = _TURN["id"]
 
     try:
         for round_no in range(MAX_TOOL_ROUNDS + 1):
@@ -3134,6 +3696,8 @@ def run_agent_turn(messages: list[dict]):
         if ran:
             note += "\nTool calls that completed before the failure:\n" + "\n".join(ran)
         messages.append({"role": "assistant", "content": note})
+    finally:
+        _finalize_checkpoints(turn)
 
 
 COMPACT_INSTRUCTION = (
@@ -3367,7 +3931,10 @@ _DEL_STYLE, _ADD_STYLE = "#ffc1c5 on #4a1519", "#b9f0c0 on #12361a"
 _UI_STYLE = {
     "frame.border": "#6a6a6a", "prompt": "bold ansicyan", "status": "#8f8f8f",
     "menu.current": "bg:#1f3a3a #ffffff", "menu.meta": "#8f8f8f", "question": "bold", "current": "ansicyan",
+    "auto": "bold ansiyellow", "admin": "bg:ansired #0c0c0c bold", "flash": "ansiyellow",
 }
+ADMIN_BADGE = " ⚠ ADMIN "
+AUTO_BADGE = "⏵⏵ AUTO "
 
 
 def _ui_enabled() -> bool:
@@ -3616,6 +4183,8 @@ def _prompt_box(status_left: str, status_right: str) -> str:
     os.makedirs(EUSTACE_HOME, exist_ok=True)
     buf = Buffer(multiline=True, completer=Completer(), complete_while_typing=True,
                  history=FileHistory(os.path.join(EUSTACE_HOME, "history")))
+    flash = {"text": ""}
+    buf.on_text_changed += lambda _: flash.update(text="")
 
     @kb.add("enter")
     def _(event):
@@ -3640,7 +4209,11 @@ def _prompt_box(status_left: str, status_right: str) -> str:
 
     @kb.add("s-tab")
     def _(event):
-        buf.complete_previous()
+        # Steps back through an open completion list; otherwise switches auto mode (shown in the status line)
+        if buf.complete_state:
+            buf.complete_previous()
+        elif not set_permission_mode("default" if PERMISSION_MODE == "auto" else "auto"):
+            flash["text"] = ELEVATED_AUTO_REFUSAL  # shown in the status line until the next key
 
     @kb.add("c-c")
     def _(event):
@@ -3655,9 +4228,19 @@ def _prompt_box(status_left: str, status_right: str) -> str:
 
     def status():
         # The right side (token estimate) always stays visible; a long folder path loses its beginning instead
-        room = max(event_size().columns - cell_len(status_right) - 3, 0)
-        left = status_left if cell_len(status_left) <= room else "…" + status_left[-max(room - 1, 0):] if room else ""
-        return [("class:status", f" {set_cell_size(left, room)} {status_right}")]
+        admin = ADMIN_BADGE + " " if ELEVATED else ""
+        badge = AUTO_BADGE if PERMISSION_MODE == "auto" else ""
+        text = flash["text"] or status_left
+        room = max(event_size().columns - cell_len(status_right) - cell_len(badge) - cell_len(admin) - 3, 0)
+        left = text if cell_len(text) <= room else "…" + text[-max(room - 1, 0):] if room else ""
+        parts = [("class:status", " ")]
+        if admin:
+            parts += [("class:admin", ADMIN_BADGE), ("class:status", " ")]
+        if badge:
+            parts.append(("class:auto", badge))
+        parts.append(("class:flash" if flash["text"] else "class:status", set_cell_size(left, room)))
+        parts.append(("class:status", f" {status_right}"))
+        return parts
 
     def suggestions():
         state = buf.complete_state
@@ -3700,7 +4283,8 @@ def _short_count(n: int) -> str:
 def _read_user_input(messages: list[dict]) -> str:
     """One message from the user: the input box on a real console, a plain prompt otherwise."""
     if not _ui_enabled():
-        console.print("\n[bold cyan]>[/bold cyan] ", end="")
+        badge = ("[bold red]ADMIN[/bold red] " if ELEVATED else "") + ("[bold yellow]AUTO[/bold yellow] " if PERMISSION_MODE == "auto" else "")
+        console.print(f"\n{badge}[bold cyan]>[/bold cyan] ", end="")
         return input()
     home = os.path.expanduser("~")
     cwd = os.getcwd()
@@ -3724,7 +4308,8 @@ def _cmd_help(state: dict, arg: str) -> None:
     console.print(table)
     console.print(
         "  [dim]Enter sends · Alt+Enter or a trailing \\ adds a line · ↑↓ history · @ completes a file path\n"
-        "  ESC or Ctrl+C stops a reply · EUSTACE_PLAIN=1 switches back to the plain prompt[/dim]"
+        "  Shift+Tab switches auto mode · ESC or Ctrl+C stops a reply · EUSTACE_PLAIN=1 switches back to the plain prompt\n"
+        "  /undo restores files changed by Eustace's file tools; changes made by shell commands are not covered[/dim]"
     )
 
 
@@ -3734,6 +4319,9 @@ def _cmd_status(state: dict, arg: str) -> None:
         f"  [dim]Model:[/dim]    {escape(MODEL)} [dim]({escape(BACKEND_NAME)})[/dim]\n"
         f"  [dim]Folder:[/dim]   {escape(os.getcwd())}\n"
         f"  [dim]Session:[/dim]  {escape(AUTOSAVE_NAME)} [dim]({turns} turns, about {_short_count(_estimate_tokens(state['messages']))} tokens)[/dim]\n"
+        f"  [dim]Mode:[/dim]     {'auto' if PERMISSION_MODE == 'auto' else 'default (asks before writes and commands)'} "
+        f"[dim]· {len(get_allow_rules())} allow rule(s)[/dim]"
+        + (" [bold red]· running as Administrator: auto mode unavailable[/bold red]" if ELEVATED else "") + "\n"
         f"  [dim]Audit log:[/dim] {escape(AUDIT_LOG_PATH)}"
     )
 
@@ -3773,6 +4361,7 @@ def _cmd_compact(state: dict, arg: str) -> None:
 
 def _cmd_clear(state: dict, arg: str) -> None:
     state["messages"] = [{"role": "system", "content": build_system_prompt()}]
+    state.pop("pending_note", None)
     console.print("[dim cyan]✓ Context cleared & system_prompt.md reloaded[/dim cyan]")
 
 
@@ -3785,6 +4374,71 @@ def _cmd_exit(state: dict, arg: str) -> None:
     raise _Quit
 
 
+AUTO_MODE_SUMMARY = (
+    "Runs without asking: file reads anywhere, file writes, and shell commands.\n"
+    "  Still asks: shell commands on the deny-list (deleting, registry, downloads, and similar), writes to\n"
+    "  AGENT.md, system_prompt.md, .git, .github and .eustace, Outlook, clipboard, opening files, and dev-mode data.\n"
+    "  Never allowed in any mode: protected folders, secrets files, PHI."
+)
+
+
+def _cmd_auto(state: dict, arg: str) -> None:
+    a = arg.strip().lower()
+    if a not in ("", "on", "off"):
+        console.print("[dim yellow]Usage: /auto [on|off][/dim yellow]")
+        return
+    wanted = ("default" if PERMISSION_MODE == "auto" else "auto") if not a else "auto" if a == "on" else "default"
+    if not set_permission_mode(wanted):
+        console.print("[bold red]Auto mode isn't available while Eustace runs as Administrator.[/bold red]\n"
+                      "[dim]Restart Eustace from a normal (non-elevated) PowerShell window to use it.\n"
+                      "Approvals, \"approve all this turn\", and allow rules still work as usual.[/dim]")
+        return
+    if PERMISSION_MODE == "auto":
+        console.print(f"[bold yellow]Auto mode on.[/bold yellow] [dim]{AUTO_MODE_SUMMARY}[/dim]")
+    else:
+        console.print("[dim cyan]Auto mode off: Eustace asks before writes and commands again.[/dim cyan]")
+
+
+def _cmd_undo(state: dict, arg: str) -> None:
+    note = undo_last_turn()
+    if note:
+        state["pending_note"] = (state.get("pending_note", "") + "\n" + note).strip()
+
+
+def _cmd_permissions(state: dict, arg: str) -> None:
+    word, _, rest = arg.strip().partition(" ")
+    if word.lower() == "remove":
+        if not rest.strip().isdigit():
+            console.print("[dim yellow]Usage: /permissions remove <number>[/dim yellow]")
+            return
+        removed = remove_allow_rule(int(rest.strip()))
+        if removed is None:
+            console.print("[bold red]No rule with that number.[/bold red] [dim]/permissions lists them.[/dim]")
+        else:
+            console.print(f"[dim cyan]✓ Removed {escape(_visible_controls(removed))}[/dim cyan]")
+        return
+    if word:
+        console.print("[dim yellow]Usage: /permissions, or /permissions remove <number>[/dim yellow]")
+        return
+    switch = ("  [red](auto mode unavailable: running as Administrator)[/red]" if ELEVATED
+              else "  [dim](Shift+Tab or /auto to switch)[/dim]")
+    console.print(f"  [dim]Mode:[/dim] {'[bold yellow]auto[/bold yellow]' if PERMISSION_MODE == 'auto' else 'default'}{switch}")
+    rules = _config_list("allow")
+    if not rules:
+        console.print("  [dim]No allow rules. Choose \"Yes, and always allow\" in an approval to add one.[/dim]")
+    for i, rule in enumerate(rules, start=1):
+        bad = "" if _RULE_RE.match(rule) else "  [bold red](not a valid rule; ignored)[/bold red]"
+        console.print(f"  [bold]{i}.[/bold] [cyan]{escape(_visible_controls(rule))}[/cyan]{bad}")
+    extra = _config_list("shell_deny")
+    if extra:
+        valid = {p for p, _ in ((rx.pattern, l) for rx, l in _user_shell_deny())}
+        console.print("  [dim]Your extra shell deny patterns:[/dim]")
+        for pat in extra:
+            note = "" if pat in valid else "  [bold red](invalid regular expression; ignored)[/bold red]"
+            console.print(f"    {escape(_visible_controls(pat))}{note}")
+    console.print(f"  [dim]Rules live in {escape(CONFIG_PATH)} under \"allow\". Remove one with /permissions remove <number>.[/dim]")
+
+
 # The one list of slash commands: the main loop dispatches from it and the input box's "/" menu shows it.
 COMMANDS: dict[str, tuple[str, typing.Callable[[dict, str], None]]] = {
     "/help": ("Show commands and keys", _cmd_help),
@@ -3795,6 +4449,9 @@ COMMANDS: dict[str, tuple[str, typing.Callable[[dict, str], None]]] = {
     "/compact": ("Summarize the conversation to free up context", _cmd_compact),
     "/clear": ("Start over with an empty conversation", _cmd_clear),
     "/model": ("Choose the model: /model [id]", _cmd_model),
+    "/auto": ("Switch auto mode (also Shift+Tab): /auto [on|off]", _cmd_auto),
+    "/undo": ("Restore the files changed in the last turn that wrote any", _cmd_undo),
+    "/permissions": ("List allow rules: /permissions [remove N]", _cmd_permissions),
     "/exit": ("Quit Eustace", _cmd_exit),
 }
 _COMMAND_ALIASES = {"/quit": "/exit", "exit": "/exit", "quit": "/exit"}
@@ -3820,20 +4477,30 @@ def main():
         )
     else:
         title_line = f"[bold cyan]GenAI.mil CLI — Eustace v{VERSION}[/bold cyan] ([dim]{escape(MODEL)} | {len(TOOLS)} tools[/dim])\n"
+    if ELEVATED:
+        title_line += ("[bold red]⚠  Running as Administrator (elevated)[/bold red]\n"
+                       "[red]   Everything Eustace runs gets admin rights. Auto mode is off for this session.[/red]\n")
     console.print(
         Panel.fit(
             title_line
             + f"[dim]Workspace:[/dim] {escape(cwd)}\n"
             f"[dim]Audit Log:[/dim] {escape(AUDIT_LOG_PATH)}\n"
             "[dim]Commands:[/dim] [cyan]/help[/cyan], [cyan]/save [name][/cyan], [cyan]/resume [name|#][/cyan], [cyan]/sessions[/cyan], "
-            "[cyan]/compact[/cyan], [cyan]/clear[/cyan], [cyan]/model[/cyan], [cyan]/exit[/cyan]\n"
-            "[dim]Tip:[/dim] Press [bold]ESC[/bold] or [bold]Ctrl+C[/bold] while generating to stop mid-reply"
-            f"{session_hint}",
-            border_style="yellow" if DEV_MODE else "cyan",
+            "[cyan]/compact[/cyan], [cyan]/clear[/cyan], [cyan]/model[/cyan], [cyan]/auto[/cyan], [cyan]/undo[/cyan], "
+            "[cyan]/permissions[/cyan], [cyan]/exit[/cyan]\n"
+            "[dim]Tip:[/dim] Press [bold]ESC[/bold] or [bold]Ctrl+C[/bold] while generating to stop mid-reply · "
+            "[bold]Shift+Tab[/bold] switches auto mode"
+            + ("\n[bold yellow]Auto mode is on[/bold yellow] [dim](started with --auto)[/dim]" if PERMISSION_MODE == "auto" else "")
+            + session_hint,
+            border_style="red" if ELEVATED else "yellow" if DEV_MODE else "cyan",
         )
     )
+    if ELEVATED and START_IN_AUTO_MODE:
+        console.print("[yellow]--auto was ignored: auto mode isn't available while Eustace runs as Administrator.\n"
+                      "Start Eustace from a normal (non-elevated) PowerShell window to use it.[/yellow]")
 
     state = {"messages": [{"role": "system", "content": build_system_prompt()}]}
+    prune_checkpoints()
 
     while True:
         try:
@@ -3850,7 +4517,9 @@ def main():
                 console.print(f"[dim yellow]Unknown command {escape(word)}. Type /help for the list.[/dim yellow]")
                 continue
 
-            state["messages"].append({"role": "user", "content": user_input})
+            note = state.pop("pending_note", "")
+            content = f"[Note from Eustace: {note}]\n\n{user_input}" if note else user_input
+            state["messages"].append({"role": "user", "content": content})
             run_agent_turn(state["messages"])
             # Checkpoint every completed turn to this run's autosave file
             save_session(state["messages"], quiet=True)
