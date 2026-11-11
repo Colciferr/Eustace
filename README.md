@@ -11,7 +11,7 @@ A local CLI agent powered by **GenAI.mil** models with built-in tools for local 
 
 ### 1. Download Eustace
 **Option A - Using Git:**
-Open PowerShell and run:
+Open PowerShell and run: (use http to bypass signing in)
 ```powershell
 git clone https://github.com/Colciferr/eustace
 ```
@@ -40,7 +40,7 @@ On GitHub, click into each of those four files, click the "Copy Raw File" button
 ---
 
 ### 2. Run the Installer Script
-In your PowerShell window inside the folder, run:
+In your PowerShell window, from the `\eustace` folder, run:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 ```
