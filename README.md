@@ -81,4 +81,4 @@ By default, Eustace asks before it writes a file, runs a command, or reads outsi
 * **Updating:** Pull or download the latest files from GitHub and re-run `powershell -ExecutionPolicy Bypass -File .\setup.ps1`.
 
 ## AI Disclaimer
-Codebase built with Gemini 4 Argon, with some reviews and edits by Claude Fable 5.1.
+Codebase built with Claude Fable 5.1/2 and Gemini 4 Argon. Hardening and security audits mostly done by [Cloudflare](https://github.com/cloudflare/security-audit-skill).
