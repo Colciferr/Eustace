@@ -252,7 +252,7 @@ class CompletionTests(unittest.TestCase):
 
     def test_slash_commands_filter_as_you_type(self):
         self.assertEqual(self.names("/"), list(cli.COMMANDS))
-        self.assertEqual(self.names("/s"), ["/status", "/save", "/sessions"])
+        self.assertEqual(self.names("/s"), ["/status", "/save", "/sessions", "/skills"])
         self.assertEqual(self.names("/SA"), ["/save"])
         self.assertEqual(self.names("/save notes"), [])     # past the first word: no menu
         self.assertEqual(self.names("see /s"), [])          # only at the start of the message
