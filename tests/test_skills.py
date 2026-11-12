@@ -130,7 +130,7 @@ class DiscoveryTests(unittest.TestCase):
             os.makedirs(os.path.join(root, "not-a-skill"))  # no SKILL.md: ignored silently
             make_skill(root, "good")
             self.assertEqual(list(cli.discover_skills(ws)), ["good"])
-            log = output()
+            log = " ".join(output().split())  # long temp paths wrap the console output
         for reason in ("doesn't match its folder name", "lowercase letters", "has no description",
                        "built-in command", "no instructions", "larger than"):
             self.assertIn(reason, log)
@@ -141,7 +141,7 @@ class DiscoveryTests(unittest.TestCase):
             mine = make_skill(user_root(home), "report", description="mine")
             make_skill(project_root(ws), "report", description="theirs")
             skills = cli.discover_skills(ws)
-            log = output()
+            log = " ".join(output().split())
         self.assertEqual(skills["report"]["dir"], os.path.realpath(mine))
         self.assertIn("already loaded", log)
 
