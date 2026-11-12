@@ -37,7 +37,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 # When output is redirected to a file or pipe, Windows uses the ANSI code page, which cannot encode the symbols
 # printed here; degrade to "?" instead of crashing mid-turn.
@@ -919,9 +919,9 @@ def _is_instruction_file(canon: str) -> bool:
 
 
 def _alias(name: str) -> str:
-    """Regex for a short command name or alias (optionally with .exe) that is not part of a longer word, file
-    name or path."""
-    return r"(?<![\w.\\/-])(?:" + name + r")(?:\.exe)?(?![\w.\\/:-])"
+    """Regex for a short command name or alias (optionally with .exe) that is not part of a longer word or file
+    name. A leading folder path is allowed, so C:\\Windows\\System32\\curl.exe matches like curl does."""
+    return r"(?<![\w.\\/-])(?:[^\s\"'|;&(){}]*[\\/])?(?:" + name + r")(?:\.exe)?(?![\w.\\/:-])"
 
 
 # (pattern, label). Matched case-insensitively against the command after line continuations and backticks are
@@ -937,6 +937,12 @@ SHELL_DENY_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"invoke-webrequest|invoke-restmethod|start-bitstransfer|bitsadmin|net\.webclient|system\.net\.http|"
      r"downloadstring|downloadfile|" + "|".join(_alias(a) for a in ("iwr", "irm", "curl", "wget", "certutil")),
      "downloads or uploads"),
+    (_alias("npx|pnpx|pipx|winget|choco|scoop|nuget") + r"|" + _alias(r"npm|pnpm|yarn") + r"\s+(install|i|ci|add|exec|x|"
+     r"dlx|update|up|upgrade)\b|" + _alias(r"pip[0-9.]*") + r"\s+(install|download)\b|(?<![\w-])-m\s+(pip|ensurepip)\b|"
+     + _alias("uv") + r"\s+(pip|tool|add|run)\b|(install|save|update)-(module|package|script|psresource)|"
+     r"dotnet\s+tool\s+install|git\s+clone", "installs or downloads software"),
+    (_alias(r"python[0-9.]*|pythonw|py|node") + r"[\"']?(\s+-[XW]\s*\S+|\s+-[\w.:-]+)*?\s+(-c|-e|-p|--eval|--print|-)"
+     r"(?=\s|$|[\"'])", "runs inline code"),
     (r"(?<![\w-])-e(c|n|nc|ncodedcommand)?\s|frombase64string|invoke-expression|" + _alias("iex") + r"|\[scriptblock\]|"
      r"invokecommand|add-type|&\s*[\$(]|(?<![\w.])\.\s*[\$(]", "hides what runs"),
     ("|".join(_alias(a) for a in (r"(powershell|pwsh)(\.exe)?", r"cmd(\.exe)?", "mshta", "rundll32", "regsvr32",

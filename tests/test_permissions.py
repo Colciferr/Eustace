@@ -72,12 +72,28 @@ class ShellDenyListTests(unittest.TestCase):
         "Add-Content $PROFILE 'x'", "git push origin main", "git reset --hard HEAD~1", "git clean -fdx",
         "git checkout -- .", "git branch -D feature", "Set-Content AGENT.md 'x'", "Copy-Item x .git\\hooks\\pre-commit",
         ".\\build.ps1", "Set-Content run.bat ('a'+'b')", "& .\\deploy.cmd", "Get-ChildItem *.tmp `\n  | Remove-Item",
+        # installers and package managers download and run outside code
+        "npx skills add foo/bar", "npm install left-pad", "npm i x", "pnpm add x", "yarn dlx x", "pip install requests",
+        "pip3.11 install x", "py -m pip install x", "python -m ensurepip", "uv pip install x", "pipx run x",
+        "winget install foo", "choco install foo", "scoop install foo", "Install-Module PSReadLine",
+        "Install-PSResource x", "dotnet tool install x", "git clone https://github.com/x/y",
+        # inline code gets past every other pattern (urllib can do what iwr does)
+        "python -c \"import urllib.request\"", "py -3.11 -c \"print(1)\"", "python3 -c print(1)",
+        "python -X utf8 -c 1", "node -e 1", "node --eval \"1\"", "Get-Content a.py | python -",
+        # a full path doesn't hide the command name
+        "C:\\Windows\\System32\\curl.exe http://x", "C:\\Python314\\python.exe -c 1",
+        "& \"C:\\Program Files\\Python314\\python.exe\" -c \"1\"", ".\\node_modules\\.bin\\npx foo",
+        "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command x", "/usr/bin/curl x",
     ]
     ALLOWED = [
         "git status", "git log --oneline -5", "git diff", "pytest -q", "python -m unittest discover -s tests",
         "python cli.py --version", "Get-ChildItem", "dir", "Get-Content log.txt | Select-String error",
         "npm test", "Get-Content a.txt -Encoding utf8", "Where-Object { $_ -eq 1 }", "git commit -m 'remove dead code'",
         "Select-String -Path *.py -Pattern model", "Get-Date", "Measure-Object", "git add .",
+        "npm run build", "python -m pytest -q", "python cli.py -c config", "pip list", "pip show rich",
+        "py -3 build.py", "git pull", "git fetch origin", "node app.js", "Get-Content C:\\logs\\curl-output.txt",
+        "Get-ChildItem C:\\tools\\rm\\x.txt", "Copy-Item .\\del\\a.txt b", "Get-Content docs/node.md",
+        "python .\\tools\\py_helper.py",
     ]
 
     def setUp(self):
