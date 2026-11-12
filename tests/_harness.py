@@ -83,7 +83,8 @@ def sandbox(client=None, approval=None):
     os.makedirs(home)
     os.makedirs(ws)
     names = ("console", "EUSTACE_HOME", "CONFIG_PATH", "AUDIT_LOG_PATH", "DENY_LIST_PATH", "SESSIONS_DIR",
-             "GLOBAL_PROMPT_PATH", "client", "APPROVAL_HANDLER", "check_user_abort", "ELEVATED", "PERMISSION_MODE")
+             "GLOBAL_PROMPT_PATH", "client", "APPROVAL_HANDLER", "check_user_abort", "ELEVATED", "PERMISSION_MODE",
+             "AGENTS_SKILLS_HOME")
     saved = {n: getattr(cli, n) for n in names if hasattr(cli, n)}
     cwd = os.getcwd()
     cli.console = cli.Console(file=io.StringIO(), width=120)  # keep test logs readable; inspect via cli.console.file
@@ -95,6 +96,9 @@ def sandbox(client=None, approval=None):
     cli.GLOBAL_PROMPT_PATH = os.path.join(home, "system_prompt.md")
     cli.ELEVATED = False  # CI runners are often elevated; tests opt in to the elevated behavior explicitly
     cli.PERMISSION_MODE = "default"
+    cli.AGENTS_SKILLS_HOME = os.path.join(home, ".agents", "skills")
+    cli.SKILLS.clear()
+    cli._SKILL_SESSION_DENIED.clear()
     if client is not None:
         cli.client = client
     if approval is not None:
@@ -106,6 +110,7 @@ def sandbox(client=None, approval=None):
         os.chdir(cwd)
         for n, v in saved.items():
             setattr(cli, n, v)
+        cli.SKILLS.clear()
         shutil.rmtree(tmp, ignore_errors=True)
 
 

@@ -37,7 +37,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 
 # When output is redirected to a file or pipe, Windows uses the ANSI code page, which cannot encode the symbols
 # printed here; degrade to "?" instead of crashing mid-turn.
@@ -909,7 +909,7 @@ def set_permission_mode(mode: str) -> bool:
 # Files that change Eustace's own instructions, or that run automatically later (git hooks, CI workflows), are
 # always shown and asked about, in every mode.
 _INSTRUCTION_FILE_NAMES = {"agent.md", "system_prompt.md"}
-_INSTRUCTION_DIRS = {".eustace", ".eustace-dev", ".git", ".github"}
+_INSTRUCTION_DIRS = {".eustace", ".eustace-dev", ".git", ".github", ".agents"}  # .agents holds skills
 
 
 def _is_instruction_file(canon: str) -> bool:
@@ -957,7 +957,8 @@ SHELL_DENY_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"invoke-item|" + _alias("ii"), "opens files with their default program"),
     (r"startup|\$profile|currentversion\\run", "touches startup locations"),
     (r"git\s+(push|clean)|git\s+reset\s+--hard|git\s+checkout\s+--\s|git\s+branch\s+-d", "changes git history or remotes"),
-    (r"agent\.md|system_prompt\.md|\.git[\\/]|\.github|\.eustace", "touches Eustace's instruction files or git internals"),
+    (r"agent\.md|system_prompt\.md|\.git[\\/]|\.github|\.eustace|\.agents[\\/]",
+     "touches Eustace's instruction files, skills or git internals"),
     (r"[\w-]\.(ps1|psm1|bat|cmd|vbs|vbe|wsf|hta)(?![\w.-])", "runs or writes a script file"),
 )
 _SHELL_DENY_COMPILED = [(re.compile(p, re.IGNORECASE), label) for p, label in SHELL_DENY_PATTERNS]
@@ -3176,6 +3177,67 @@ def create_draft_email(subject: str, body: str, to_hint: str = "") -> str:
 
 
 # =====================================================================
+# SKILLS
+# =====================================================================
+
+def _skill_file_blocked(canon: str) -> bool:
+    """Secrets patterns and the custom deny list still apply inside a skill folder. (The Eustace-home check in
+    _is_sensitive_canon is skipped: ~/.eustace/skills is where your own skills live, and only this tool reads it.)"""
+    name = os.path.basename(canon).lower()
+    norm = os.path.normcase(os.path.normpath(canon))
+    return any(fnmatch.fnmatch(name, p.lower()) or fnmatch.fnmatch(norm, p.lower())
+               for p in SENSITIVE_PATTERNS | _load_custom_deny_patterns())
+
+
+@tool(
+    "Loading skill",
+    name="The skill's name, from the Skills list in your instructions.",
+    file="Optional: a text file inside the skill's folder to read instead of SKILL.md, as a relative path such as 'references/forms.md'.",
+)
+def load_skill(name: str, file: str = "") -> str:
+    """Load a skill's full instructions (its SKILL.md), or a file the skill points to. Call it when a request
+    matches a skill in the Skills list, before starting the work."""
+    skill = SKILLS.get(str(name).strip().lower())
+    if not skill:
+        available = ", ".join(SKILLS) or "none in this session"
+        return f"Error: no skill named '{name}'. Available skills: {available}."
+    digest, err = _skill_digest(skill["dir"])
+    if err or digest != skill["digest"]:
+        return (f"Error: the files of skill '{skill['name']}' changed after it was loaded at startup"
+                f"{f' ({err})' if err else ''}, so it was not read. Tell the user; it loads again after they run "
+                "/clear or restart Eustace and approve the new version.")
+    rel = str(file or "SKILL.md").strip().replace("\\", "/")
+    target = os.path.realpath(os.path.join(skill["dir"], *[p for p in rel.split("/") if p]))
+    inside = os.path.normcase(target).startswith(os.path.normcase(skill["dir"]) + os.sep)
+    if not inside or os.path.isabs(rel) or ":" in rel:
+        return f"Error: '{rel}' is not inside the skill's folder."
+    if not os.path.isfile(target):
+        return f"Error: skill '{skill['name']}' has no file '{rel}'."
+    if _skill_file_blocked(target):
+        return f"Security Policy Block: '{rel}' matches a secrets or deny-list pattern."
+    try:
+        with open(target, "rb") as f:
+            raw = f.read(MAX_SKILL_FILE_CHARS * 4 + 1)
+    except OSError as e:
+        return f"Error reading '{rel}': {e.strerror or e}"
+    if b"\0" in raw[:8192]:
+        return f"Error: '{rel}' is not a text file. Use read_file with the path {target} for documents."
+    text = raw.decode("utf-8-sig", errors="replace")
+    phi = _check_phi_guardrail(target, text)
+    if phi:
+        return phi
+    if rel.lower() == "skill.md":
+        text = (_parse_frontmatter(text) or ({}, text))[1]
+        header = (f"[Skill '{skill['name']}' from {skill['dir']}. Relative paths in it are relative to that folder: "
+                  f"read files with load_skill(name, file=...); run scripts by their full path.]\n\n")
+    else:
+        header = f"[File '{rel}' of skill '{skill['name']}']\n\n"
+    if len(text) > MAX_SKILL_FILE_CHARS:
+        text = text[:MAX_SKILL_FILE_CHARS] + f"\n\n[Truncated at {MAX_SKILL_FILE_CHARS} characters.]"
+    return header + text
+
+
+# =====================================================================
 # SYSTEM PROMPT AND AGENT STREAMING LOOP
 # =====================================================================
 
@@ -3254,6 +3316,12 @@ def build_system_prompt() -> str:
         if text:
             env_context += f"\n# Office / Project Instructions ({p})\n{text}\n"
             console.print(f"  [dim]Loaded instructions: {escape(p)}[/dim]")
+
+    SKILLS.clear()
+    SKILLS.update(discover_skills(cwd))
+    if SKILLS:
+        console.print(f"  [dim]Loaded {len(SKILLS)} skill{'s' if len(SKILLS) != 1 else ''}: {escape(', '.join(SKILLS))}[/dim]")
+    env_context += _skills_prompt_section(SKILLS)
 
     return base_prompt + env_context
 
@@ -3338,6 +3406,236 @@ def _load_trusted_agent_md(path: str) -> str | None:
     _AGENT_MD_SESSION_DENIED[key] = digest
     console.print(f"  [dim]Skipped {escape(path)} for this session.[/dim]")
     return None
+
+
+# ---------------------------------------------------------------------
+# AGENT SKILLS (the open SKILL.md format): <skills dir>/<name>/SKILL.md, whose frontmatter has a name and a
+# description. Only the name and description go in the system prompt; load_skill returns the rest on demand.
+# Skills in ~/.eustace/skills load silently (that folder is protected, like ~/.eustace/AGENT.md). Skills in
+# ~/.agents/skills and in a project's .agents/skills load only after a trust decision pinned to a hash of the
+# whole skill folder, so a changed SKILL.md, reference file or script prompts again.
+# ---------------------------------------------------------------------
+
+SKILL_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+MAX_SKILL_NAME = 64
+MAX_SKILL_DESCRIPTION = 1024
+MAX_SKILL_MD_BYTES = 32 * 1024
+MAX_SKILL_FILE_CHARS = 30000
+MAX_SKILL_FOLDER_BYTES = 4 * 1024 * 1024
+MAX_SKILL_FILES = 200
+MAX_SKILLS = 50
+AGENTS_SKILLS_HOME = os.path.join(os.path.expanduser("~"), ".agents", "skills")
+SKILLS: dict[str, dict] = {}  # name -> {name, description, dir, source, digest}; rebuilt with the system prompt
+_SKILL_SESSION_DENIED: dict[str, str] = {}  # normcased skill folder -> digest declined for this process
+
+
+def _parse_frontmatter(text: str) -> tuple[dict, str] | None:
+    """The top-level `key: value` pairs between the opening and closing --- lines, and the body after them.
+    Handles quoted values and | or > block values; nested keys (such as under metadata:) are ignored."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        return None
+    meta: dict[str, str] = {}
+    key, block, sep = None, None, " "
+    for line in lines[1:end] + ["end:"]:
+        if block is not None:
+            if line[:1] in (" ", "\t") or not line.strip():
+                block.append(line.strip())
+                continue
+            meta[key] = sep.join(block).strip()
+            key, block = None, None
+        m = re.match(r"([A-Za-z0-9_-]+):(?:\s+(.*))?$", line)
+        if not m:
+            continue
+        k, v = m.group(1).lower(), (m.group(2) or "").strip()
+        if v in ("", "|", "|-", "|+", ">", ">-", ">+"):
+            key, block, sep = k, [], "\n" if v.startswith("|") else " "
+            continue
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        meta[k] = v
+    return meta, "\n".join(lines[end + 1:]).strip()
+
+
+def _skill_digest(folder: str) -> tuple[str | None, str | None]:
+    """(sha256 over every file's relative path and bytes, None), or (None, why the folder can't be used).
+    A link or junction anywhere inside makes the whole skill unusable rather than being followed."""
+    h = hashlib.sha256()
+    count = total = 0
+    for root, dirs, files in os.walk(folder):
+        dirs.sort()
+        for d in dirs:
+            if _is_link_or_junction(os.path.join(root, d)):
+                return None, f"contains a link or junction ({d})"
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            if _is_link_or_junction(path):
+                return None, f"contains a link ({name})"
+            count += 1
+            if count > MAX_SKILL_FILES:
+                return None, f"has more than {MAX_SKILL_FILES} files"
+            try:
+                with open(path, "rb") as f:
+                    data = f.read(MAX_SKILL_FOLDER_BYTES + 1)
+            except OSError as e:
+                return None, f"can't read {name} ({e.strerror or e})"
+            total += len(data)
+            if total > MAX_SKILL_FOLDER_BYTES:
+                return None, f"is larger than {MAX_SKILL_FOLDER_BYTES // (1024 * 1024)} MiB"
+            rel = os.path.relpath(path, folder).replace(os.sep, "/")
+            h.update(rel.encode("utf-8") + b"\0" + str(len(data)).encode() + b"\0" + data)
+    return h.hexdigest(), None
+
+
+def _read_skill(folder: str, source: str) -> tuple[dict | None, str | None]:
+    """The skill in `folder` as a dict, or (None, why it was skipped)."""
+    dirname = os.path.basename(os.path.normpath(folder))
+    md = os.path.join(folder, "SKILL.md")
+    if not os.path.isfile(md):
+        return None, None  # not a skill folder; skipped without a warning
+    if _is_link_or_junction(folder) or _is_link_or_junction(md):
+        return None, "is a link or junction"
+    try:
+        with open(md, "rb") as f:
+            raw = f.read(MAX_SKILL_MD_BYTES + 1)
+    except OSError as e:
+        return None, f"can't be read ({e.strerror or e})"
+    if len(raw) > MAX_SKILL_MD_BYTES:
+        return None, f"SKILL.md is larger than {MAX_SKILL_MD_BYTES // 1024} KiB"
+    parsed = _parse_frontmatter(raw.decode("utf-8-sig", errors="replace"))
+    if parsed is None:
+        return None, "SKILL.md has no --- frontmatter"
+    meta, body = parsed
+    name, description = meta.get("name", "").strip(), " ".join(meta.get("description", "").split())
+    if not (SKILL_NAME_RE.fullmatch(name) and len(name) <= MAX_SKILL_NAME):
+        return None, "name must be lowercase letters, digits and single hyphens (at most 64)"
+    if name != dirname:
+        return None, f"name '{name}' doesn't match its folder name '{dirname}'"
+    if not description:
+        return None, "has no description"
+    if not body:
+        return None, "SKILL.md has no instructions after the frontmatter"
+    digest, err = _skill_digest(folder)
+    if err:
+        return None, err
+    return {"name": name, "description": _visible_controls(description[:MAX_SKILL_DESCRIPTION]),
+            "dir": os.path.realpath(folder), "source": source, "digest": digest}, None
+
+
+def _skill_roots(cwd: str) -> list[tuple[str, str, bool]]:
+    """(skills folder, source label, needs trust) in precedence order: your own skills before a project's, so a
+    repository can't replace one of yours by reusing its name. Project folders run from cwd up to the git root."""
+    roots = [(os.path.join(EUSTACE_HOME, "skills"), "~/.eustace/skills", False),
+             (AGENTS_SKILLS_HOME, "~/.agents/skills", True)]
+    curr = os.path.realpath(cwd)
+    top = _git_root(curr)
+    while True:
+        roots.append((os.path.join(curr, ".agents", "skills"), "project", True))
+        if top is None or os.path.normcase(curr) == os.path.normcase(top):
+            break
+        parent = os.path.dirname(curr)
+        if parent == curr:
+            break
+        curr = parent
+    return roots
+
+
+def _confirm_skills(pending: list[dict]) -> list[dict]:
+    """Shows the untrusted skills and returns the ones the user trusts; trust is saved per folder hash."""
+    lines = []
+    for n, s in enumerate(pending, start=1):
+        lines.append(f"{n}. {s['name']}  ({s['dir']})\n   {s['description']}")
+    console.print()
+    console.print(Panel(
+        escape(_visible_controls("\n".join(lines))),
+        title=f"[bold yellow]⚠️  {len(pending)} untrusted skill{'s' if len(pending) != 1 else ''}[/bold yellow]",
+        subtitle="[dim]a trusted skill's instructions are followed like AGENT.md; its scripts still ask before running[/dim]",
+        border_style="yellow", box=box.ROUNDED, padding=(0, 1),
+    ))
+    console.print("  [bold yellow]Trust which? (a = all, numbers like 1,3, or Enter for none):[/bold yellow] ", end="")
+    choice = input().strip().lower()
+    if choice in ("a", "all", "y", "yes"):
+        picked = list(range(len(pending)))
+    else:
+        picked = sorted({int(x) - 1 for x in re.findall(r"\d+", choice) if 0 < int(x) <= len(pending)})
+    trusted = _read_config().get("trusted_skills")
+    trusted = trusted if isinstance(trusted, dict) else {}
+    chosen = [pending[i] for i in picked]
+    for i, s in enumerate(pending):
+        if i not in picked:
+            _SKILL_SESSION_DENIED[os.path.normcase(s["dir"])] = s["digest"]
+    if chosen:
+        _update_config(trusted_skills={**trusted, **{os.path.normcase(s["dir"]): s["digest"] for s in chosen}})
+    if len(chosen) < len(pending):
+        console.print(f"  [dim]Skipped {len(pending) - len(chosen)} skill(s) for this session.[/dim]")
+    return chosen
+
+
+def discover_skills(cwd: str) -> dict[str, dict]:
+    """Finds, validates and (where needed) asks about skills; returns name -> skill for this session."""
+    found: dict[str, dict] = {}
+    pending: list[dict] = []
+    trusted = _read_config().get("trusted_skills")
+    trusted = trusted if isinstance(trusted, dict) else {}
+    seen_roots: set[str] = set()
+    full = False
+    for root, source, needs_trust in _skill_roots(cwd):
+        if full:
+            break
+        real = os.path.normcase(os.path.realpath(root))
+        if real in seen_roots or not os.path.isdir(root) or _is_link_or_junction(root):
+            continue
+        seen_roots.add(real)
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for entry in entries:
+            folder = os.path.join(root, entry)
+            if not os.path.isdir(folder):
+                continue
+            skill, why = _read_skill(folder, source)
+            if why:
+                console.print(f"  [dim yellow]Skipped skill {escape(folder)}: {escape(why)}[/dim yellow]")
+            if not skill:
+                continue
+            name = skill["name"]
+            if f"/{name}" in COMMANDS or name in _COMMAND_ALIASES:
+                console.print(f"  [dim yellow]Skipped skill {escape(name)}: /{escape(name)} is a built-in command.[/dim yellow]")
+                continue
+            if name in found or any(p["name"] == name for p in pending):
+                console.print(f"  [dim yellow]Skipped skill {escape(folder)}: a skill named {escape(name)} is already loaded.[/dim yellow]")
+                continue
+            if len(found) + len(pending) >= MAX_SKILLS:
+                console.print(f"  [dim yellow]More than {MAX_SKILLS} skills; the rest were skipped.[/dim yellow]")
+                full = True
+                break
+            key = os.path.normcase(skill["dir"])
+            if not needs_trust or trusted.get(key) == skill["digest"]:
+                found[name] = skill
+            elif _SKILL_SESSION_DENIED.get(key) != skill["digest"]:
+                pending.append(skill)
+    if pending:
+        for s in _confirm_skills(pending):
+            found[s["name"]] = s
+    return dict(sorted(found.items()))
+
+
+def _skills_prompt_section(skills: dict[str, dict]) -> str:
+    if not skills:
+        return ""
+    rows = "\n".join(f"- `{s['name']}`: {s['description']}" for s in skills.values())
+    return (
+        "\n# Skills\n"
+        "Skills are instruction packages for particular kinds of work. When a request matches a skill's description, "
+        "call `load_skill` with its name before starting, then follow what it says. Load only skills that match. "
+        "Files a skill mentions (such as references/...) are read with `load_skill(name, file=...)`; scripts it "
+        "mentions are run with `run_powershell` using the folder path that `load_skill` reports.\n"
+        f"{rows}\n"
+    )
 
 
 # --- ESC detection: peek the console input buffer without consuming typed-ahead text ---
@@ -4162,7 +4460,11 @@ def _completions_for(text: str) -> list[tuple[str, int, str]]:
     """Completions for the text before the cursor as (replacement, start offset, description): slash commands
     while typing the first word, file paths after an @."""
     if text.startswith("/") and not any(c.isspace() for c in text):
-        return [(name, -len(text), desc) for name, (desc, _) in COMMANDS.items() if name.startswith(text.lower())]
+        typed_text = text.lower()
+        rows = [(name, -len(text), desc) for name, (desc, _) in COMMANDS.items() if name.startswith(typed_text)]
+        rows += [(f"/{n}", -len(text), f"Skill: {s['description'][:70]}") for n, s in SKILLS.items()
+                 if f"/{n}".startswith(typed_text)]
+        return rows
     at = re.search(r"(?:^|\s)@([^\s@]*)$", text)
     if at:
         return [(path, -len(at.group(1)), "") for path in _complete_paths(at.group(1))]
@@ -4311,6 +4613,8 @@ def _cmd_help(state: dict, arg: str) -> None:
     table = Table(box=None, show_header=False, padding=(0, 2, 0, 2))
     for name, (desc, _) in COMMANDS.items():
         table.add_row(f"[cyan]{escape(name)}[/cyan]", escape(desc))  # "[name]" in a description is text, not markup
+    for name in SKILLS:
+        table.add_row(f"[cyan]/{escape(name)}[/cyan]", "Run this skill: /" + escape(name) + " [request]")
     console.print(table)
     console.print(
         "  [dim]Enter sends · Alt+Enter or a trailing \\ adds a line · ↑↓ history · @ completes a file path\n"
@@ -4446,6 +4750,28 @@ def _cmd_permissions(state: dict, arg: str) -> None:
 
 
 # The one list of slash commands: the main loop dispatches from it and the input box's "/" menu shows it.
+def _cmd_skills(state: dict, arg: str) -> None:
+    if not SKILLS:
+        console.print("[dim]No skills loaded. Put skill folders (each with a SKILL.md) in .agents/skills in your project, "
+                      f"~/.agents/skills, or {escape(os.path.join(EUSTACE_HOME, 'skills'))}.[/dim]")
+        return
+    table = Table(box=None, show_header=False, padding=(0, 2, 0, 2))
+    for s in SKILLS.values():
+        table.add_row(f"[cyan]/{escape(s['name'])}[/cyan]", escape(s["description"]), f"[dim]{escape(s['dir'])}[/dim]")
+    console.print(table)
+
+
+def _skill_invocation(name: str, request: str) -> str | None:
+    """The user message for /<skill> [request]: the skill's instructions, then the request."""
+    loaded = load_skill(name)
+    if not loaded.startswith("[Skill "):
+        console.print(f"[bold red]{escape(loaded)}[/bold red]")
+        return None
+    console.print(f"  [dim]Loaded skill {escape(name)}[/dim]")
+    ask = request or "(no further details; follow the skill)"
+    return f"{loaded}\n\n[The user ran /{name}. Follow the skill above for this request.]\n\n{ask}"
+
+
 COMMANDS: dict[str, tuple[str, typing.Callable[[dict, str], None]]] = {
     "/help": ("Show commands and keys", _cmd_help),
     "/status": ("Model, folder, session and token estimate", _cmd_status),
@@ -4458,6 +4784,7 @@ COMMANDS: dict[str, tuple[str, typing.Callable[[dict, str], None]]] = {
     "/auto": ("Switch auto mode (also Shift+Tab): /auto [on|off]", _cmd_auto),
     "/undo": ("Restore the files changed in the last turn that wrote any", _cmd_undo),
     "/permissions": ("List allow rules: /permissions [remove N]", _cmd_permissions),
+    "/skills": ("List the skills loaded for this folder", _cmd_skills),
     "/exit": ("Quit Eustace", _cmd_exit),
 }
 _COMMAND_ALIASES = {"/quit": "/exit", "exit": "/exit", "quit": "/exit"}
@@ -4493,7 +4820,7 @@ def main():
             f"[dim]Audit Log:[/dim] {escape(AUDIT_LOG_PATH)}\n"
             "[dim]Commands:[/dim] [cyan]/help[/cyan], [cyan]/save [name][/cyan], [cyan]/resume [name|#][/cyan], [cyan]/sessions[/cyan], "
             "[cyan]/compact[/cyan], [cyan]/clear[/cyan], [cyan]/model[/cyan], [cyan]/auto[/cyan], [cyan]/undo[/cyan], "
-            "[cyan]/permissions[/cyan], [cyan]/exit[/cyan]\n"
+            "[cyan]/permissions[/cyan], [cyan]/skills[/cyan], [cyan]/exit[/cyan]\n"
             "[dim]Tip:[/dim] Press [bold]ESC[/bold] or [bold]Ctrl+C[/bold] while generating to stop mid-reply · "
             "[bold]Shift+Tab[/bold] switches auto mode"
             + ("\n[bold yellow]Auto mode is on[/bold yellow] [dim](started with --auto)[/dim]" if PERMISSION_MODE == "auto" else "")
@@ -4519,6 +4846,10 @@ def main():
             if name in COMMANDS:
                 COMMANDS[name][1](state, arg.strip())
                 continue
+            if name.startswith("/") and name[1:] in SKILLS and "\n" not in word:
+                user_input = _skill_invocation(name[1:], arg.strip())
+                if user_input is None:
+                    continue
             if re.fullmatch(r"/[a-z]+", name) and "\n" not in user_input:
                 console.print(f"[dim yellow]Unknown command {escape(word)}. Type /help for the list.[/dim yellow]")
                 continue

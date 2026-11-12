@@ -512,5 +512,28 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "load_skill",
+      "description": "Load a skill's full instructions (its SKILL.md), or a file the skill points to. Call it when a request matches a skill in the Skills list, before starting the work.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The skill's name, from the Skills list in your instructions."
+          },
+          "file": {
+            "type": "string",
+            "description": "Optional: a text file inside the skill's folder to read instead of SKILL.md, as a relative path such as 'references/forms.md'."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
   }
 ]
