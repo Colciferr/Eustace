@@ -63,6 +63,17 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 
 ---
 
+## Agent Skills
+Eustace supports [Agent Skills](https://agentskills.io): folders of instructions it loads only when a task needs them. Each skill is a folder with a `SKILL.md` file. That file starts with a `name` (lowercase letters, digits, and hyphens, matching the folder name) and a `description` of when to use it.
+
+* **Where to put skills:**
+  * `~/.eustace/skills/<name>/` loads without asking.
+  * `~/.agents/skills/<name>/` and `.agents/skills/<name>/` (in the folder you start Eustace in, or any folder above it up to the repo root) ask once before loading.
+  * If a project skill has the same name as one of yours, yours wins.
+* **Trust:** at startup, untrusted skills are listed together. Type `a` for all, numbers like `1,3` for some, or press Enter for none. Your approval covers that exact version of every file in the skill's folder. If any file changes, Eustace asks again.
+* **Using skills:** only each skill's name and description go into Eustace's instructions. When a request matches one, Eustace loads the full skill itself. You can also run one directly with `/<name> [request]`. `/skills` lists what's loaded.
+* **Still asks in every mode:** writing anything under a `.agents` folder, and any shell command that touches one. That includes running a skill's scripts.
+
 ## Approvals, Auto Mode & Undo
 By default, Eustace asks before it writes a file, runs a command, or reads outside the folder you started it in.
 
@@ -73,8 +84,6 @@ By default, Eustace asks before it writes a file, runs a command, or reads outsi
   * Outlook actions, the clipboard, opening files, and dev-mode data.
 * **Never allowed in any mode:** system folders, secrets and credential files, PHI.
 * **Running as Administrator:** if Eustace runs elevated, the banner and status line show a red `⚠ ADMIN` warning, auto mode is unavailable (`--auto`, Shift+Tab, and `/auto` are refused with a reason), and every approval prompt says the action gets admin rights. Approvals and allow rules still work. Start Eustace from a normal PowerShell window to use auto mode.
-* **Known limit:** the deny-list matches command text. A command that builds its text at runtime in a way the list doesn't recognize can get past it. Auto mode reduces prompts for trusted work; it isn't a sandbox.
-* **Allow rules:** choose **"Yes, and always allow"** in an approval (or type `r` at the plain prompt) to stop being asked for that exact command, or for that tool in that folder. Rules are saved under `"allow"` in `~/.eustace/config.json`, for example `run_powershell(git status)`, `run_powershell(pytest*)`, `read(C:/Users/me/Documents/regs/**)` (reading outside the working folder, by any tool), or `write_docx(./out/**)` (that tool's writes). A read rule never covers a write. A shell rule never matches a command that chains, pipes, or redirects (`; | & > <`, backticks, `$(`). `/permissions` lists rules and `/permissions remove <number>` deletes one.
 * **Undo:** `/undo` restores every file Eustace's file tools changed in the most recent turn that wrote anything (and deletes files that turn created), after one confirmation. Run it again to step back further. Changes made by shell commands aren't covered. Checkpoints are kept for 7 days, up to 200 MB.
 
 ## Customization & Updating
