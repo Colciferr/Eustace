@@ -50,6 +50,17 @@ jobs:
         run: |
           $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
           eustace --version
+      - name: setup.ps1 installed the star font for this user
+        shell: powershell
+        run: |
+          $file = "$env:LOCALAPPDATA\Microsoft\Windows\Fonts\EustaceMono-Regular.ttf"
+          if (-not (Test-Path $file)) { Write-Host "setup.ps1 did not install the font."; exit 1 }
+          $key = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Fonts"
+          if ((Get-ItemProperty $key)."Eustace Mono (TrueType)" -ne $file) { exit 1 }
+          # remove it, so the update below has to put it back
+          $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
+          eustace --remove-font
+          if (Test-Path $file) { Write-Host "The font file is still there."; exit 1 }
       - name: eustace --update replaces the folder install with this commit
         shell: powershell
         env:
@@ -66,6 +77,8 @@ jobs:
           Start-Sleep -Seconds 10
           eustace --version
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          # the update put the star font back
+          if (-not (Test-Path "$env:LOCALAPPDATA\Microsoft\Windows\Fonts\EustaceMono-Regular.ttf")) { Write-Host "The update did not install the font."; exit 1 }
           # the install now knows which commit it came from, so asking again installs nothing
           $again = (eustace --update $env:GITHUB_SHA) -join "`n"
           $again

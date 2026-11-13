@@ -223,6 +223,10 @@ def _post_update(args: list[str]) -> int:
         print(f"\n[ok] Eustace updated: v{old_version} -> v{VERSION}{at}")
     else:
         print(f"\n[ok] Eustace v{VERSION} is now at the newest commit{at}")
+    try:
+        _install_star_font(brief=True)  # the font travels with every version; an update keeps it current
+    except Exception as e:
+        print(f"[!!] Could not check the star font ({e}).")
 
     mine_path = os.path.join(_UPDATE_HOME, "system_prompt.md")
     mine, shipped = _persona_text(mine_path), _persona_text(SHIPPED_PROMPT_PATH)
@@ -312,9 +316,22 @@ def _same_file_bytes(a: str, b: str) -> bool:
         return False
 
 
-def _install_star_font() -> int:
+def _star_opted_out() -> bool:
+    """True when config.json says "star": "off": setup and updates then leave the font alone."""
+    try:
+        with open(os.path.join(_UPDATE_HOME, "config.json"), encoding="utf-8") as f:
+            value = json.load(f).get("star")
+        return isinstance(value, str) and value.strip().lower() == "off"
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _install_star_font(brief: bool = False) -> int:
     """eustace --install-font: copies the font into the user's own font folder, registers it under HKCU and
-    loads it. Returns the exit code."""
+    loads it. Returns the exit code. brief is how setup.ps1 and an update call it: nothing happens when the
+    user switched the star off, and nothing is printed when the font was already in place."""
+    if brief and _star_opted_out():
+        return 0
     src = _star_font_source()
     if src is None:
         print(f"[!!] The font file is missing from this install (expected {SHIPPED_FONT_PATH}).")
@@ -322,7 +339,8 @@ def _install_star_font() -> int:
     dest = _user_font_path()
     try:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        if not _same_file_bytes(src, dest):  # Windows will not overwrite a font a console window has loaded
+        copied = not _same_file_bytes(src, dest)
+        if copied:  # Windows will not overwrite a font a console window has loaded
             shutil.copyfile(src, dest)
     except OSError as e:
         print(f"[!!] Could not copy the font to {dest} ({e}).\n"
@@ -335,6 +353,11 @@ def _install_star_font() -> int:
         print(f"[!!] Copied the font to {dest}, but could not register it for your account ({e}).")
         return 1
     loaded = _announce_font(dest, add=True)
+    if brief:
+        if copied:
+            print(f"[ok] Star font installed for your account ({STAR_FONT_FAMILY}). To see the star while Eustace\n"
+                  f"     thinks, set the window's font: title bar > Properties > Font > {STAR_FONT_FAMILY}.")
+        return 0
     print(f"[ok] {STAR_FONT_FAMILY} is installed for your account only (no admin rights used):\n     {dest}")
     if not loaded:
         print("[!!] Windows did not load it. A policy on this PC may block fonts that are not installed for all\n"
@@ -372,7 +395,8 @@ def _remove_star_font() -> int:
         print(f"[ok] {STAR_FONT_FAMILY} is no longer registered, but its file is still in use ({e}).\n"
               f"     Close the windows that use it, then delete {dest}")
         return 0
-    print(f"[ok] Removed {STAR_FONT_FAMILY}. Windows that still use it keep it until they are closed.")
+    print(f"[ok] Removed {STAR_FONT_FAMILY}. Windows that still use it keep it until they are closed.\n"
+          '     An update installs it again unless config.json in your .eustace folder has  "star": "off".')
     return 0
 
 
@@ -391,7 +415,8 @@ if "--help" in _ARGS or "-h" in _ARGS:
         "  --update    Install the newest commit on the main branch of the Eustace repository over this\n"
         "              install, in a new window. Name a branch, tag or full commit hash to get that instead:\n"
         "              eustace --update v1.5.0\n"
-        "  --install-font  Install the Eustace Mono font for your account (no admin rights). With it as the\n"
+        "  --install-font  Install the Eustace Mono font for your account (no admin rights; setup and updates\n"
+        "              already do this unless config.json has \"star\": \"off\"). With it as the\n"
         "              window's font, a star spins and bounces in front of \"Thinking...\" while Eustace works.\n"
         "  --remove-font   Remove that font again.\n"
     )
@@ -404,8 +429,8 @@ if "--post-update" in _ARGS:  # run by the update window, with the version it ju
 if "--update" in _ARGS:
     _rest = _ARGS[_ARGS.index("--update") + 1:]
     raise SystemExit(_self_update(_rest[:1] if _rest and not _rest[0].startswith("-") else []))
-if "--install-font" in _ARGS:
-    raise SystemExit(_install_star_font())
+if "--install-font" in _ARGS:  # "--install-font auto" is how setup.ps1 calls it
+    raise SystemExit(_install_star_font(brief=_ARGS[_ARGS.index("--install-font") + 1:][:1] == ["auto"]))
 if "--remove-font" in _ARGS:
     raise SystemExit(_remove_star_font())
 DEV_MODE = "--devmode" in _ARGS
@@ -5003,7 +5028,7 @@ _UI_STYLE = {
     "auto": "bold ansiyellow", "admin": "bg:ansired #0c0c0c bold", "flash": "ansiyellow",
 }
 ADMIN_BADGE = " ⚠ ADMIN "
-AUTO_BADGE = "⏵⏵ AUTO "
+AUTO_BADGE = ">> AUTO "  # plain characters: the arrows used before are in neither Consolas nor Cascadia Mono
 
 
 def _ui_enabled() -> bool:

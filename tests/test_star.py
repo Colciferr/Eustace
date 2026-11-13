@@ -560,6 +560,61 @@ class InstallTests(unittest.TestCase):
         with mock.patch.object(cli, "SHIPPED_FONT_PATH", os.path.join(ROOT, "nowhere", "x.ttf")):
             self.assertEqual(os.path.normcase(cli._star_font_source()), os.path.normcase(FONT))
 
+    def test_setup_and_updates_install_once_and_then_stay_silent(self):
+        with self.machine() as (dest, registry, announced, printed):
+            self.assertEqual(cli._install_star_font(brief=True), 0)
+            self.assertTrue(os.path.isfile(dest))
+            self.assertEqual(registry.values, {"Eustace Mono (TrueType)": (registry.REG_SZ, dest)})
+            first = printed.getvalue()
+            self.assertIn("Properties > Font > Eustace Mono", first)
+            self.assertLessEqual(first.count("\n"), 2)
+            self.assertEqual(cli._install_star_font(brief=True), 0)
+            self.assertEqual(printed.getvalue(), first, "nothing more is printed once the font is in place")
+
+    def test_star_off_keeps_setup_and_updates_from_installing_but_not_the_explicit_flag(self):
+        with self.machine() as (dest, registry, announced, printed), tempfile.TemporaryDirectory() as home, \
+                mock.patch.object(cli, "_UPDATE_HOME", home):
+            for off in ("off", " OFF "):
+                with open(os.path.join(home, "config.json"), "w", encoding="utf-8") as f:
+                    json.dump({"star": off}, f)
+                self.assertEqual(cli._install_star_font(brief=True), 0)
+                self.assertFalse(os.path.exists(dest))
+                self.assertEqual((registry.values, announced, printed.getvalue()), ({}, [], ""))
+            self.assertEqual(cli._install_star_font(), 0)
+            self.assertTrue(os.path.isfile(dest))
+
+    def test_anything_but_off_does_not_opt_out(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.object(cli, "_UPDATE_HOME", home):
+            self.assertFalse(cli._star_opted_out())  # no config at all
+            for content in ('{"star": "auto"}', '{"star": "on"}', '{"star": false}', '{}', '[]', 'not json'):
+                with open(os.path.join(home, "config.json"), "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.assertFalse(cli._star_opted_out(), content)
+
+    def test_an_update_installs_the_font_and_survives_its_failure(self):
+        from _harness import sandbox as box
+        with box(), contextlib.redirect_stdout(io.StringIO()) as printed:
+            calls = []
+            cli._install_star_font = lambda brief=False: calls.append(brief) or 0
+            self.assertEqual(cli._post_update(["1.7.0", "-"]), 0)
+            self.assertEqual(calls, [True])
+
+            def broken(brief=False):
+                raise OSError("font folder is read-only")
+            cli._install_star_font = broken
+            self.assertEqual(cli._post_update(["1.7.0", "-"]), 0)
+            self.assertIn("font folder is read-only", printed.getvalue())
+
+    def test_setup_installs_the_font_through_the_installed_command(self):
+        with open(os.path.join(ROOT, "setup.ps1"), encoding="utf-8") as f:
+            setup = f.read()
+        self.assertIn("--install-font auto", setup)
+        self.assertLess(setup.index("pipx install"), setup.index("--install-font auto"))
+
+    def test_the_auto_badge_uses_only_plain_characters(self):
+        self.assertTrue(cli.AUTO_BADGE.isascii(), "the arrows used before showed as boxes in the console")
+        self.assertIn("AUTO", cli.AUTO_BADGE)
+
     def test_remove_undoes_install(self):
         with self.machine() as (dest, registry, announced, printed):
             cli._install_star_font()

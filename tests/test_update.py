@@ -58,6 +58,8 @@ def _patched(run=None, installed="", git="C:\\Git\\cmd\\git.exe"):
         stack.enter_context(mock.patch.object(cli, "_installed_commit", lambda: installed))
         stack.enter_context(mock.patch.object(cli, "_UPDATE_HOME", os.path.join(home, ".eustace")))
         stack.enter_context(mock.patch.object(cli, "SHIPPED_PROMPT_PATH", os.path.join(home, "shipped.md")))
+        # an update also installs the star font; never on the machine running the tests (test_star covers it)
+        stack.enter_context(mock.patch.object(cli, "_install_star_font", lambda brief=False: 0))
         out = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         yield NS(home=home, run=run, popen=popen, out=out)
 
