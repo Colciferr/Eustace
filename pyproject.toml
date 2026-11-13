@@ -28,9 +28,10 @@ eustace = "cli:main"
 [tool.setuptools]
 py-modules = ["cli"]
 
-# The persona ships with the package (to <prefix>/share/eustace) so "eustace --update" can offer its changes
+# The persona ships with the package (to <prefix>/share/eustace) so "eustace --update" can offer its changes.
+# The star font ships the same way so "eustace --install-font" works on a PC with no access to the repository.
 [tool.setuptools.data-files]
-"share/eustace" = ["system_prompt.md"]
+"share/eustace" = ["system_prompt.md", "fonts/EustaceMono-Regular.ttf", "fonts/OFL.txt"]
 
 # Single source of truth: VERSION in cli.py (read statically, without importing the module)
 [tool.setuptools.dynamic]

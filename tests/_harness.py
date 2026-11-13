@@ -84,7 +84,7 @@ def sandbox(client=None, approval=None):
     os.makedirs(ws)
     names = ("console", "EUSTACE_HOME", "CONFIG_PATH", "AUDIT_LOG_PATH", "DENY_LIST_PATH", "SESSIONS_DIR",
              "GLOBAL_PROMPT_PATH", "client", "APPROVAL_HANDLER", "check_user_abort", "ELEVATED", "PERMISSION_MODE",
-             "AGENTS_SKILLS_HOME", "SHIPPED_PROMPT_PATH", "_UPDATE_HOME")
+             "AGENTS_SKILLS_HOME", "SHIPPED_PROMPT_PATH", "_UPDATE_HOME", "_console_font_face", "_console_is_hosted")
     saved = {n: getattr(cli, n) for n in names if hasattr(cli, n)}
     cwd = os.getcwd()
     cli.console = cli.Console(file=io.StringIO(), width=120)  # keep test logs readable; inspect via cli.console.file
@@ -99,6 +99,10 @@ def sandbox(client=None, approval=None):
     cli._UPDATE_HOME = home
     cli.ELEVATED = False  # CI runners are often elevated; tests opt in to the elevated behavior explicitly
     cli.PERMISSION_MODE = "default"
+    # the star depends on the font of the window the tests happen to run in; tests that want it say so (star_font)
+    cli._console_font_face = lambda: "Consolas"
+    cli._console_is_hosted = lambda: False
+    cli._STAR.update(on=False, text=None, frame=0, drawn=0.0)
     cli.AGENTS_SKILLS_HOME = os.path.join(home, ".agents", "skills")
     cli.SKILLS.clear()
     cli._SKILL_SESSION_DENIED.clear()
@@ -114,6 +118,7 @@ def sandbox(client=None, approval=None):
         for n, v in saved.items():
             setattr(cli, n, v)
         cli.SKILLS.clear()
+        cli._STAR.update(on=False, text=None, frame=0, drawn=0.0)
         shutil.rmtree(tmp, ignore_errors=True)
 
 

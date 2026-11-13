@@ -1,3 +1,4 @@
+import atexit
 import ctypes
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ import typing
 import zipfile
 
 import truststore
+import winreg
 truststore.inject_into_ssl()
 
 from dotenv import load_dotenv
@@ -37,7 +39,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 # When output is redirected to a file or pipe, Windows uses the ANSI code page, which cannot encode the symbols
 # printed here; degrade to "?" instead of crashing mid-turn.
@@ -261,11 +263,125 @@ def _post_update(args: list[str]) -> int:
     return 0
 
 
+# --- The star font (eustace --install-font / --remove-font) ---
+# The star in the prompt and on the "Thinking..." line is drawn with sixteen glyphs that only this font has: a
+# console cell shows one character, and no standard character can turn or move inside its cell. The font is
+# Cascadia Mono plus those glyphs (tools/build_star_font.py, license in fonts/OFL.txt). Installing it is the
+# user's choice and needs no admin rights; without it Eustace looks exactly as it did before.
+STAR_FONT_FAMILY = "Eustace Mono"
+STAR_FONT_FILE = "EustaceMono-Regular.ttf"
+SHIPPED_FONT_PATH = os.path.join(sys.prefix, "share", "eustace", STAR_FONT_FILE)
+_FONT_REG_KEY = r"Software\Microsoft\Windows NT\CurrentVersion\Fonts"
+_FONT_REG_VALUE = f"{STAR_FONT_FAMILY} (TrueType)"
+_HWND_BROADCAST, _WM_FONTCHANGE, _SMTO_ABORTIFHUNG = 0xFFFF, 0x001D, 0x0002
+
+
+def _star_font_source() -> str | None:
+    """The font file that came with this install, or the one in a source checkout."""
+    for path in (SHIPPED_FONT_PATH, os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", STAR_FONT_FILE)):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _user_font_path() -> str:
+    """Where Windows keeps fonts installed for one user (the "Install" button in Explorer puts them here)."""
+    local = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    return os.path.join(local, "Microsoft", "Windows", "Fonts", STAR_FONT_FILE)
+
+
+def _announce_font(path: str, add: bool) -> int:
+    """Loads (or unloads) the font for this logon session and tells running programs the font list changed.
+    Returns how many fonts Windows loaded or unloaded: 0 means it refused."""
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    change = gdi32.AddFontResourceW if add else gdi32.RemoveFontResourceW
+    change.argtypes, change.restype = [wintypes.LPCWSTR], ctypes.c_int
+    count = change(path)
+    user32.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                                           wintypes.UINT, wintypes.UINT, ctypes.c_void_p]
+    user32.SendMessageTimeoutW(_HWND_BROADCAST, _WM_FONTCHANGE, 0, 0, _SMTO_ABORTIFHUNG, 1000, None)
+    return count
+
+
+def _same_file_bytes(a: str, b: str) -> bool:
+    try:
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            return fa.read() == fb.read()
+    except OSError:
+        return False
+
+
+def _install_star_font() -> int:
+    """eustace --install-font: copies the font into the user's own font folder, registers it under HKCU and
+    loads it. Returns the exit code."""
+    src = _star_font_source()
+    if src is None:
+        print(f"[!!] The font file is missing from this install (expected {SHIPPED_FONT_PATH}).")
+        return 1
+    dest = _user_font_path()
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if not _same_file_bytes(src, dest):  # Windows will not overwrite a font a console window has loaded
+            shutil.copyfile(src, dest)
+    except OSError as e:
+        print(f"[!!] Could not copy the font to {dest} ({e}).\n"
+              f"     If a window is using {STAR_FONT_FAMILY}, close it and run  eustace --install-font  again.")
+        return 1
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _FONT_REG_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, _FONT_REG_VALUE, 0, winreg.REG_SZ, dest)
+    except OSError as e:
+        print(f"[!!] Copied the font to {dest}, but could not register it for your account ({e}).")
+        return 1
+    loaded = _announce_font(dest, add=True)
+    print(f"[ok] {STAR_FONT_FAMILY} is installed for your account only (no admin rights used):\n     {dest}")
+    if not loaded:
+        print("[!!] Windows did not load it. A policy on this PC may block fonts that are not installed for all\n"
+              "     users; the steps below will show whether it is available.")
+    print(
+        "\nTo see the star, set the font of the window Eustace runs in:\n"
+        "  Windows PowerShell / Command Prompt window: open a NEW window, right-click its title bar >\n"
+        f"    Properties > Font > {STAR_FONT_FAMILY} > OK. Eustace notices by itself at the next prompt.\n"
+        f"  Windows Terminal: Settings > your profile > Appearance > Font face > {STAR_FONT_FAMILY}, then add\n"
+        '    "star": "on"  to config.json in your .eustace folder (Eustace cannot read that terminal\'s font).\n'
+        f"The font is Cascadia Mono with the star added, so the window's text changes to that typeface.\n"
+        "Inside Eustace, /status says whether the star is on and why. Undo with  eustace --remove-font."
+    )
+    return 0
+
+
+def _remove_star_font() -> int:
+    """eustace --remove-font: the reverse of --install-font. Returns the exit code."""
+    dest = _user_font_path()
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _FONT_REG_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, _FONT_REG_VALUE)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"[!!] Could not remove the font's registration ({e}).")
+        return 1
+    if not os.path.exists(dest):
+        print(f"[ok] {STAR_FONT_FAMILY} is not installed.")
+        return 0
+    _announce_font(dest, add=False)
+    try:
+        os.remove(dest)
+    except OSError as e:
+        print(f"[ok] {STAR_FONT_FAMILY} is no longer registered, but its file is still in use ({e}).\n"
+              f"     Close the windows that use it, then delete {dest}")
+        return 0
+    print(f"[ok] Removed {STAR_FONT_FAMILY}. Windows that still use it keep it until they are closed.")
+    return 0
+
+
 # --- Command-line flags (read before any path or client is derived from them) ---
 _ARGS = sys.argv[1:]
 if "--help" in _ARGS or "-h" in _ARGS:
     print(
-        "usage: eustace [--auto] [--devmode] [--version] [--update [BRANCH|TAG|COMMIT]]\n\n"
+        "usage: eustace [--auto] [--devmode] [--version] [--update [BRANCH|TAG|COMMIT]]\n"
+        "               [--install-font | --remove-font]\n\n"
         "  --auto      Start in auto mode: file reads, file writes and shell commands run without asking,\n"
         "              except shell commands on the deny-list. Shift+Tab or /auto switches it off.\n"
         "              Ignored when Eustace runs as Administrator (elevated).\n"
@@ -275,6 +391,9 @@ if "--help" in _ARGS or "-h" in _ARGS:
         "  --update    Install the newest commit on the main branch of the Eustace repository over this\n"
         "              install, in a new window. Name a branch, tag or full commit hash to get that instead:\n"
         "              eustace --update v1.5.0\n"
+        "  --install-font  Install the Eustace Mono font for your account (no admin rights). With it as the\n"
+        "              window's font, the prompt marker becomes a star that spins while Eustace is thinking.\n"
+        "  --remove-font   Remove that font again.\n"
     )
     raise SystemExit(0)
 if "--version" in _ARGS:
@@ -285,6 +404,10 @@ if "--post-update" in _ARGS:  # run by the update window, with the version it ju
 if "--update" in _ARGS:
     _rest = _ARGS[_ARGS.index("--update") + 1:]
     raise SystemExit(_self_update(_rest[:1] if _rest and not _rest[0].startswith("-") else []))
+if "--install-font" in _ARGS:
+    raise SystemExit(_install_star_font())
+if "--remove-font" in _ARGS:
+    raise SystemExit(_remove_star_font())
 DEV_MODE = "--devmode" in _ARGS
 START_IN_AUTO_MODE = "--auto" in _ARGS
 
@@ -484,6 +607,7 @@ class _StreamWorker:
     def __iter__(self):
         while True:
             check_user_abort()  # raises KeyboardInterrupt on ESC
+            _star_tick()        # the main thread is already waking every 100 ms; no second thread draws
             try:
                 kind, payload = self._q.get(timeout=0.1)  # returns every 100 ms so a pending Ctrl+C is delivered
             except queue.Empty:
@@ -1162,7 +1286,7 @@ SHELL_DENY_PATTERNS: tuple[tuple[str, str], ...] = (
     (_alias("npx|pnpx|pipx|winget|choco|scoop|nuget") + r"|" + _alias(r"npm|pnpm|yarn") + r"\s+(install|i|ci|add|exec|x|"
      r"dlx|update|up|upgrade)\b|" + _alias(r"pip[0-9.]*") + r"\s+(install|download)\b|(?<![\w-])-m\s+(pip|ensurepip)\b|"
      + _alias("uv") + r"\s+(pip|tool|add|run)\b|(install|save|update)-(module|package|script|psresource)|"
-     r"dotnet\s+tool\s+install|git\s+clone|(?<![\w-])--(post-)?update(?![\w-])", "installs or downloads software"),
+     r"dotnet\s+tool\s+install|git\s+clone|(?<![\w-])--((post-)?update|(install|remove)-font)(?![\w-])", "installs or downloads software"),
     (_alias(r"python[0-9.]*|pythonw|py|node") + r"[\"']?(\s+-[XW]\s*\S+|\s+-[\w.:-]+)*?\s+(-c|-e|-p|--eval|--print|-)"
      r"(?=\s|$|[\"'])", "runs inline code"),
     (r"(?<![\w-])-e(c|n|nc|ncodedcommand)?\s|frombase64string|invoke-expression|" + _alias("iex") + r"|\[scriptblock\]|"
@@ -4320,9 +4444,156 @@ def _ran_tool_calls(messages: list[dict], turn_start: int) -> list[str]:
     return lines
 
 
+# --- The star: prompt marker and "Thinking..." animation, drawn with glyphs only the Eustace Mono font has ---
+# glyph = STAR_BASE + width index * len(STAR_HEIGHTS) + height index. These three constants are repeated in
+# tools/build_star_font.py, which draws the glyphs; tests/test_star.py holds the two copies and the font together.
+STAR_BASE = 0xE900
+STAR_WIDTHS = (7, 5, 3, 1)                 # pixel widths: face on, turning, turning, edge on
+STAR_HEIGHTS = (0, 2, 4, 5)                # pixels above the baseline
+_STAR_SPIN = (0, 1, 2, 3, 2, 1)            # width index per frame. Half a turn; on a symmetric star it reads as whole
+_STAR_BOUNCE = (0, 1, 2, 3, 3, 2, 1, 0)    # height index per frame. Out of step with the spin: repeats every 24 frames
+STAR_FRAME_SECONDS = 0.1                   # one frame per wake-up of _StreamWorker's wait loop
+STAR_IDLE = chr(STAR_BASE)
+_STAR: dict = {"on": False, "text": None, "frame": 0, "drawn": 0.0}
+_STD_OUTPUT_HANDLE = wintypes.DWORD(-11 & 0xFFFFFFFF)
+
+
+class _ConsoleFontInfoEx(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.ULONG), ("nFont", wintypes.DWORD), ("dwFontSize", wintypes._COORD),
+                ("FontFamily", wintypes.UINT), ("FontWeight", wintypes.UINT), ("FaceName", wintypes.WCHAR * 32)]
+
+
+_kernel32.GetCurrentConsoleFontEx.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(_ConsoleFontInfoEx)]
+_kernel32.GetCurrentConsoleFontEx.restype = wintypes.BOOL
+_kernel32.GetConsoleWindow.argtypes = []
+_kernel32.GetConsoleWindow.restype = wintypes.HWND
+_user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_user32.GetClassNameW.restype = ctypes.c_int
+_CLASSIC_CONSOLE_WINDOW = "ConsoleWindowClass"
+
+
+def star_frame(n: int) -> str:
+    """The character for frame n of the thinking animation."""
+    return chr(STAR_BASE + _STAR_SPIN[n % len(_STAR_SPIN)] * len(STAR_HEIGHTS) + _STAR_BOUNCE[n % len(_STAR_BOUNCE)])
+
+
+def _accent() -> str:
+    """The color of the startup banner's border; the star uses the same one."""
+    return "red" if ELEVATED else "yellow" if DEV_MODE else "cyan"
+
+
+def get_star_mode() -> str:
+    """config.json "star": "auto" (default: on when this console's font is Eustace Mono), "on" or "off"."""
+    value = _read_config().get("star", "auto")
+    value = value.strip().lower() if isinstance(value, str) else ""
+    return value if value in ("auto", "on", "off") else "auto"
+
+
+def _console_font_face() -> str:
+    """The font this console window draws with ("" when it cannot be read)."""
+    try:
+        info = _ConsoleFontInfoEx()
+        info.cbSize = ctypes.sizeof(info)
+        if _kernel32.GetCurrentConsoleFontEx(_kernel32.GetStdHandle(_STD_OUTPUT_HANDLE), False, ctypes.byref(info)):
+            return info.FaceName
+    except Exception:
+        pass
+    return ""
+
+
+def _console_window_class() -> str:
+    """The window class of this console's window ("" when there is none or it cannot be read)."""
+    try:
+        name = ctypes.create_unicode_buffer(64)
+        window = _kernel32.GetConsoleWindow()
+        return name.value if window and _user32.GetClassNameW(window, name, 64) else ""
+    except Exception:
+        return ""
+
+
+def _console_is_hosted() -> bool:
+    """True when another program draws this console (Windows Terminal, VS Code, ConEmu). The font Windows
+    reports for such a console is not the one on screen, so it proves nothing about the star's glyphs."""
+    if any(os.environ.get(v) for v in ("WT_SESSION", "TERM_PROGRAM", "ConEmuPID")):
+        return True
+    # A hosted console has a window too ("PseudoConsoleWindow"), and Windows even reports it as visible, so only
+    # the classic console's own window class counts. Anything unrecognized is treated as hosted.
+    return _console_window_class() != _CLASSIC_CONSOLE_WINDOW
+
+
+def _star_reason() -> tuple[bool, str]:
+    """(whether the star can be shown, why), decided fresh so a font change takes effect at the next prompt."""
+    mode = get_star_mode()
+    if mode == "off":
+        return False, 'switched off ("star": "off" in config.json)'
+    if not _ui_enabled():
+        return False, "the plain prompt is in use"
+    if mode == "on":
+        return True, f'"star": "on" in config.json (this needs {STAR_FONT_FAMILY} as the window\'s font)'
+    if _console_is_hosted():
+        return False, (f"this terminal's font cannot be checked; set its font to {STAR_FONT_FAMILY} and add "
+                       '"star": "on" to config.json')
+    face = _console_font_face()
+    if face == STAR_FONT_FAMILY:
+        return True, f"this window's font is {STAR_FONT_FAMILY}"
+    return False, (f"this window's font is {face or 'unknown'}; run  eustace --install-font  once, then pick "
+                   f"{STAR_FONT_FAMILY} under Properties > Font")
+
+
+def _prompt_marker() -> list[tuple[str, str]]:
+    """The two cells in front of the first line of the input box: the star when its font is in use, else '> '."""
+    return [(f"class:star-{_accent()}", STAR_IDLE), ("", " ")] if _STAR["on"] else [("class:prompt", "> ")]
+
+
+def _refresh_star() -> bool:
+    _STAR["on"] = _star_reason()[0]
+    return _STAR["on"]
+
+
+def _show_status_line(text: str) -> None:
+    """The transient line shown while waiting for the model. With the star it is redrawn by _star_tick and the
+    cursor is hidden so it does not sit beside the star; _clear_status_line undoes both."""
+    if not _STAR["on"]:
+        console.print(f"  [dim cyan]{escape(text)}[/dim cyan]", end="\r")
+        return
+    _STAR.update(text=text, frame=0, drawn=0.0)
+    console.show_cursor(False)
+    _star_tick()
+
+
+def _star_tick() -> None:
+    """Draws the next frame of the star if a status line is showing and a frame's time has passed."""
+    text = _STAR["text"]
+    now = time.monotonic()
+    if text is None or now - _STAR["drawn"] < STAR_FRAME_SECONDS * 0.8:
+        return
+    line = Text("  ")
+    line.append(star_frame(_STAR["frame"]), style=_accent())
+    line.append(" " + text, style="dim cyan")
+    # One row always: a line that wrapped would scroll the window a little further on every frame
+    console.print(line, end="\r", no_wrap=True, overflow="crop", width=max(console.width - 1, 1))
+    _STAR["frame"] += 1
+    _STAR["drawn"] = now
+
+
 def _clear_status_line() -> None:
-    """Blanks the transient 'Thinking...' line written with a carriage return."""
+    """Blanks the transient status line written with a carriage return and gives the cursor back."""
+    animated, _STAR["text"] = _STAR["text"] is not None, None
     print(" " * 70, end="\r", flush=True)
+    if animated:
+        console.show_cursor(True)
+
+
+def _abandon_status_line() -> None:
+    """Safety net for exits that skipped _clear_status_line: never leave the cursor hidden."""
+    if _STAR["text"] is not None:
+        try:
+            _clear_status_line()
+        except Exception:
+            pass
+
+
+atexit.register(_abandon_status_line)
 
 
 def run_agent_turn(messages: list[dict]):
@@ -4342,7 +4613,7 @@ def run_agent_turn(messages: list[dict]):
                 messages.append({"role": "assistant", "content": note})
                 break
             check_user_abort()
-            console.print("  [dim cyan]Thinking... (press ESC or Ctrl+C to stop)[/dim cyan]", end="\r")
+            _show_status_line("Thinking... (press ESC or Ctrl+C to stop)")
 
             stream = _StreamWorker(
                 model=MODEL,
@@ -4499,6 +4770,7 @@ def run_agent_turn(messages: list[dict]):
             note += "\nTool calls that completed before the failure:\n" + "\n".join(ran)
         messages.append({"role": "assistant", "content": note})
     finally:
+        _abandon_status_line()
         _finalize_checkpoints(turn)
 
 
@@ -4514,7 +4786,7 @@ def compact_messages(messages: list[dict]) -> list[dict]:
     if len(messages) <= 1:
         return messages
 
-    console.print("  [dim cyan]Compacting conversation... (press ESC or Ctrl+C to cancel)[/dim cyan]", end="\r")
+    _show_status_line("Compacting conversation... (press ESC or Ctrl+C to cancel)")
     # Same worker as a normal turn, so ESC cancels. The history contains tool calls, so the tool list must
     # accompany it; tool_choice "none" makes the model answer in text.
     worker = _StreamWorker(
@@ -4734,6 +5006,7 @@ _UI_STYLE = {
     "frame.border": "#6a6a6a", "prompt": "bold ansicyan", "status": "#8f8f8f",
     "menu.current": "bg:#1f3a3a #ffffff", "menu.meta": "#8f8f8f", "question": "bold", "current": "ansicyan",
     "auto": "bold ansiyellow", "admin": "bg:ansired #0c0c0c bold", "flash": "ansiyellow",
+    "star-cyan": "ansicyan", "star-yellow": "ansiyellow", "star-red": "ansired",
 }
 ADMIN_BADGE = " ⚠ ADMIN "
 AUTO_BADGE = "⏵⏵ AUTO "
@@ -5030,7 +5303,7 @@ def _prompt_box(status_left: str, status_right: str) -> str:
         buf.delete() if buf.text else event.app.exit(exception=EOFError())
 
     def line_prefix(lineno, wrap_count):
-        return [("class:prompt", "> ")] if lineno == 0 and wrap_count == 0 else [("", "  ")]
+        return _prompt_marker() if lineno == 0 and wrap_count == 0 else [("", "  ")]
 
     def status():
         # The right side (token estimate) always stays visible; a long folder path loses its beginning instead
@@ -5088,6 +5361,7 @@ def _short_count(n: int) -> str:
 
 def _read_user_input(messages: list[dict]) -> str:
     """One message from the user: the input box on a real console, a plain prompt otherwise."""
+    _refresh_star()
     if not _ui_enabled():
         badge = ("[bold red]ADMIN[/bold red] " if ELEVATED else "") + ("[bold yellow]AUTO[/bold yellow] " if PERMISSION_MODE == "auto" else "")
         console.print(f"\n{badge}[bold cyan]>[/bold cyan] ", end="")
@@ -5099,7 +5373,8 @@ def _read_user_input(messages: list[dict]) -> str:
     console.print()
     text = _prompt_box(left, f"~{_short_count(_estimate_tokens(messages))} tokens")
     # The box erases itself; leave the message in the transcript the way a plain prompt would
-    console.print("[bold cyan]>[/bold cyan] " + escape(_sanitize_for_display(text)).replace("\n", "\n  "))
+    marker = f"[{_accent()}]{STAR_IDLE}[/]" if _STAR["on"] else "[bold cyan]>[/bold cyan]"
+    console.print(f"{marker} " + escape(_sanitize_for_display(text)).replace("\n", "\n  "))
     return text
 
 
@@ -5130,7 +5405,8 @@ def _cmd_status(state: dict, arg: str) -> None:
         f"  [dim]Mode:[/dim]     {'auto' if PERMISSION_MODE == 'auto' else 'default (asks before writes and commands)'} "
         f"[dim]· {len(get_allow_rules())} allow rule(s)[/dim]"
         + (" [bold red]· running as Administrator: auto mode unavailable[/bold red]" if ELEVATED else "") + "\n"
-        f"  [dim]Audit log:[/dim] {escape(AUDIT_LOG_PATH)}"
+        f"  [dim]Audit log:[/dim] {escape(AUDIT_LOG_PATH)}\n"
+        f"  [dim]Star:[/dim]     {'on' if _star_reason()[0] else 'off'} [dim]· {escape(_star_reason()[1])}[/dim]"
     )
 
 
@@ -5323,7 +5599,7 @@ def main():
             "[bold]Shift+Tab[/bold] switches auto mode"
             + ("\n[bold yellow]Auto mode is on[/bold yellow] [dim](started with --auto)[/dim]" if PERMISSION_MODE == "auto" else "")
             + session_hint,
-            border_style="red" if ELEVATED else "yellow" if DEV_MODE else "cyan",
+            border_style=_accent(),
         )
     )
     if ELEVATED and START_IN_AUTO_MODE:
