@@ -400,12 +400,101 @@ def _remove_star_font() -> int:
     return 0
 
 
+# --- Uninstall (eustace --uninstall) ---
+# Runs in its own console window after this process has exited, under the Python Eustace's environment was made
+# from: neither eustace.exe nor the environment's own python.exe can be deleted while it is running.
+# argv: pid to wait for, the uninstall command as JSON, the font file to delete ("" for none), what to tell the
+# user if the command fails.
+_UNINSTALL_HELPER = r"""
+import ctypes, datetime, json, os, subprocess, sys, time
+pid, command, font, hint = int(sys.argv[1]), json.loads(sys.argv[2]), sys.argv[3], sys.argv[4]
+try:
+    k32 = ctypes.windll.kernel32
+    handle = k32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if handle:
+        k32.WaitForSingleObject(handle, 60000)
+        k32.CloseHandle(handle)
+except Exception:
+    pass
+time.sleep(1)
+print("== Eustace uninstall ==")
+code = 1
+try:
+    code = subprocess.call(command)
+except OSError as e:
+    print("[!!] Could not start", command[0], "(%s)" % e)
+if font and os.path.exists(font):  # the window that asked for the uninstall may have been the one using it
+    try:
+        os.remove(font)
+    except OSError:
+        print("[..] The font file is still in use by an open window. Delete it later:", font)
+try:
+    with open(os.path.join(os.getcwd(), "uninstall.log"), "a", encoding="utf-8") as log:
+        log.write("%s exit=%d\n" % (datetime.datetime.now().isoformat(timespec="seconds"), code))
+except OSError:
+    pass
+print()
+if code == 0:
+    print("[ok] Eustace is uninstalled. Your settings folder was kept:", os.getcwd())
+else:
+    print("[!!] The uninstall command failed. " + hint)
+if not os.environ.get("EUSTACE_UPDATE_NO_PAUSE"):
+    try:
+        input("\nPress Enter to close this window.")
+    except EOFError:
+        pass
+sys.exit(code)
+"""
+
+
+def _uninstall_command() -> tuple[list[str], str]:
+    """(the command that removes this install, what to tell the user if it fails). An install made by setup.ps1
+    is a pipx environment and is removed whole, with its eustace.exe; any other install is removed with pip."""
+    if os.path.isfile(os.path.join(sys.prefix, "pipx_metadata.json")):
+        base = getattr(sys, "_base_executable", None) or sys.executable
+        return ([base, "-m", "pipx", "uninstall", _DIST_NAME],
+                f"Close every Eustace window and run:  pipx uninstall {_DIST_NAME}")
+    return ([sys.executable, "-m", "pip", "uninstall", "-y", _DIST_NAME],
+            f"Close every Eustace window and run:  python -m pip uninstall {_DIST_NAME}")
+
+
+def _uninstall(args: list[str]) -> int:
+    """eustace --uninstall [--yes]: removes the star font and the program. The settings folder (API key, config,
+    saved sessions, audit log) is never deleted. Returns the exit code."""
+    if "--yes" not in args:
+        try:
+            answer = input(f"Uninstall Eustace v{VERSION} and its font? Your settings folder is kept\n"
+                           f"({_UPDATE_HOME}: API key, config, saved sessions, audit log). [y/N] ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Nothing was changed.")
+            return 0
+    font = _user_font_path()
+    try:
+        _remove_star_font()
+    except Exception as e:
+        print(f"[!!] Could not remove the font ({e}); carrying on with the program.")
+    command, hint = _uninstall_command()
+    os.makedirs(_UPDATE_HOME, exist_ok=True)
+    try:
+        subprocess.Popen(
+            [command[0], "-c", _UNINSTALL_HELPER, str(os.getpid()), json.dumps(command), font, hint],
+            cwd=_UPDATE_HOME, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0), close_fds=True)
+    except OSError as e:
+        print(f"Uninstall failed: the uninstaller could not be started ({e}). {hint}")
+        return 1
+    print("Uninstalling in a new window. Close any other Eustace windows.\n"
+          f"Your settings folder is kept: {_UPDATE_HOME}")
+    return 0
+
+
 # --- Command-line flags (read before any path or client is derived from them) ---
 _ARGS = sys.argv[1:]
 if "--help" in _ARGS or "-h" in _ARGS:
     print(
         "usage: eustace [--auto] [--devmode] [--version] [--update [BRANCH|TAG|COMMIT]]\n"
-        "               [--install-font | --remove-font]\n\n"
+        "               [--install-font | --remove-font] [--uninstall [--yes]]\n\n"
         "  --auto      Start in auto mode: file reads, file writes and shell commands run without asking,\n"
         "              except shell commands on the deny-list. Shift+Tab or /auto switches it off.\n"
         "              Ignored when Eustace runs as Administrator (elevated).\n"
@@ -419,6 +508,8 @@ if "--help" in _ARGS or "-h" in _ARGS:
         "              already do this unless config.json has \"star\": \"off\"). With it as the\n"
         "              window's font, a star spins and bounces in front of \"Thinking...\" while Eustace works.\n"
         "  --remove-font   Remove that font again.\n"
+        "  --uninstall     Remove Eustace and its font, in a new window, after asking (--yes skips the question).\n"
+        "              Your .eustace folder (API key, config, saved sessions, audit log) is kept.\n"
     )
     raise SystemExit(0)
 if "--version" in _ARGS:
@@ -433,6 +524,8 @@ if "--install-font" in _ARGS:  # "--install-font auto" is how setup.ps1 calls it
     raise SystemExit(_install_star_font(brief=_ARGS[_ARGS.index("--install-font") + 1:][:1] == ["auto"]))
 if "--remove-font" in _ARGS:
     raise SystemExit(_remove_star_font())
+if "--uninstall" in _ARGS:
+    raise SystemExit(_uninstall(_ARGS))
 DEV_MODE = "--devmode" in _ARGS
 START_IN_AUTO_MODE = "--auto" in _ARGS
 
@@ -1311,7 +1404,7 @@ SHELL_DENY_PATTERNS: tuple[tuple[str, str], ...] = (
     (_alias("npx|pnpx|pipx|winget|choco|scoop|nuget") + r"|" + _alias(r"npm|pnpm|yarn") + r"\s+(install|i|ci|add|exec|x|"
      r"dlx|update|up|upgrade)\b|" + _alias(r"pip[0-9.]*") + r"\s+(install|download)\b|(?<![\w-])-m\s+(pip|ensurepip)\b|"
      + _alias("uv") + r"\s+(pip|tool|add|run)\b|(install|save|update)-(module|package|script|psresource)|"
-     r"dotnet\s+tool\s+install|git\s+clone|(?<![\w-])--((post-)?update|(install|remove)-font)(?![\w-])", "installs or downloads software"),
+     r"dotnet\s+tool\s+install|git\s+clone|(?<![\w-])--((post-)?update|(install|remove)-font|uninstall)(?![\w-])", "installs or downloads software"),
     (_alias(r"python[0-9.]*|pythonw|py|node") + r"[\"']?(\s+-[XW]\s*\S+|\s+-[\w.:-]+)*?\s+(-c|-e|-p|--eval|--print|-)"
      r"(?=\s|$|[\"'])", "runs inline code"),
     (r"(?<![\w-])-e(c|n|nc|ncodedcommand)?\s|frombase64string|invoke-expression|" + _alias("iex") + r"|\[scriptblock\]|"
