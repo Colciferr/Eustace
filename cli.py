@@ -355,20 +355,20 @@ def _install_star_font(brief: bool = False) -> int:
     loaded = _announce_font(dest, add=True)
     if brief:
         if copied:
-            print(f"[ok] Star font installed for your account ({STAR_FONT_FAMILY}). To see the star while Eustace\n"
-                  f"     thinks, set the window's font: title bar > Properties > Font > {STAR_FONT_FAMILY}.")
+            print(f"[ok] Star font installed for your account ({STAR_FONT_FAMILY}). Eustace switches its own window to\n"
+                  "     it while it runs and puts your font back when it exits.")
         return 0
     print(f"[ok] {STAR_FONT_FAMILY} is installed for your account only (no admin rights used):\n     {dest}")
     if not loaded:
         print("[!!] Windows did not load it. A policy on this PC may block fonts that are not installed for all\n"
               "     users; the steps below will show whether it is available.")
     print(
-        "\nTo see the star, set the font of the window Eustace runs in:\n"
-        "  Windows PowerShell / Command Prompt window: open a NEW window, right-click its title bar >\n"
-        f"    Properties > Font > {STAR_FONT_FAMILY} > OK. Eustace notices by itself at the next prompt.\n"
+        "\nWhere the star shows:\n"
+        "  Windows PowerShell / Command Prompt window: nothing to do. Eustace switches its own window to the\n"
+        "    font when it starts and puts your font back when it exits.\n"
         f"  Windows Terminal: Settings > your profile > Appearance > Font face > {STAR_FONT_FAMILY}, then add\n"
         '    "star": "on"  to config.json in your .eustace folder (Eustace cannot read that terminal\'s font).\n'
-        f"The font is Cascadia Mono with the star added, so the window's text changes to that typeface.\n"
+        "The font is Cascadia Mono with the star added, so Eustace's window shows that typeface.\n"
         "Inside Eustace, /status says whether the star is on and why. Undo with  eustace --remove-font."
     )
     return 0
@@ -4490,6 +4490,10 @@ class _ConsoleFontInfoEx(ctypes.Structure):
 
 _kernel32.GetCurrentConsoleFontEx.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(_ConsoleFontInfoEx)]
 _kernel32.GetCurrentConsoleFontEx.restype = wintypes.BOOL
+_kernel32.SetCurrentConsoleFontEx.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(_ConsoleFontInfoEx)]
+_kernel32.SetCurrentConsoleFontEx.restype = wintypes.BOOL
+_FIXED_TRUETYPE_FONT = 0x36  # FF_MODERN | TMPF_VECTOR | TMPF_TRUETYPE
+_CONSOLE_FONT_BEFORE: list = []  # the font this window had when Eustace switched it; put back at exit
 _kernel32.GetConsoleWindow.argtypes = []
 _kernel32.GetConsoleWindow.restype = wintypes.HWND
 _user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
@@ -4514,16 +4518,31 @@ def get_star_mode() -> str:
     return value if value in ("auto", "on", "off") else "auto"
 
 
-def _console_font_face() -> str:
-    """The font this console window draws with ("" when it cannot be read)."""
+def _read_console_font():
+    """This console window's font as Windows describes it, or None when it cannot be read."""
     try:
         info = _ConsoleFontInfoEx()
         info.cbSize = ctypes.sizeof(info)
         if _kernel32.GetCurrentConsoleFontEx(_kernel32.GetStdHandle(_STD_OUTPUT_HANDLE), False, ctypes.byref(info)):
-            return info.FaceName
+            return info
     except Exception:
         pass
-    return ""
+    return None
+
+
+def _set_console_font(info) -> bool:
+    """Asks this console window to draw with the given font. The change lasts for the window's session only;
+    nothing is saved to the shortcut or the user's console defaults."""
+    try:
+        return bool(_kernel32.SetCurrentConsoleFontEx(_kernel32.GetStdHandle(_STD_OUTPUT_HANDLE), False, ctypes.byref(info)))
+    except Exception:
+        return False
+
+
+def _console_font_face() -> str:
+    """The font this console window draws with ("" when it cannot be read)."""
+    info = _read_console_font()
+    return info.FaceName if info is not None else ""
 
 
 def _console_window_class() -> str:
@@ -4546,6 +4565,36 @@ def _console_is_hosted() -> bool:
     return _console_window_class() != _CLASSIC_CONSOLE_WINDOW
 
 
+def _adopt_star_font() -> bool:
+    """Switches this console window to the star's font, at the size it had, for as long as Eustace runs.
+    Only a classic console window can be switched, only when the font is installed, and never when the star
+    is off. If the window ends up with any other font, the old one is put back. Returns whether it switched."""
+    if get_star_mode() == "off" or not _ui_enabled() or _console_is_hosted() or not os.path.isfile(_user_font_path()):
+        return False
+    before = _read_console_font()
+    if before is None or before.FaceName == STAR_FONT_FAMILY:
+        return False
+    wanted = _ConsoleFontInfoEx()
+    wanted.cbSize = ctypes.sizeof(wanted)
+    wanted.dwFontSize.Y = before.dwFontSize.Y  # same height; the width follows from the font
+    wanted.FontFamily, wanted.FontWeight, wanted.FaceName = _FIXED_TRUETYPE_FONT, before.FontWeight or 400, STAR_FONT_FAMILY
+    after = _read_console_font() if _set_console_font(wanted) else None
+    if after is not None and after.FaceName == STAR_FONT_FAMILY:
+        _CONSOLE_FONT_BEFORE[:] = [before]
+        return True
+    _set_console_font(before)  # the console accepts a name it cannot use and picks something else
+    return False
+
+
+def _restore_console_font() -> None:
+    """Puts back the font the window had before _adopt_star_font, if it switched."""
+    while _CONSOLE_FONT_BEFORE:
+        _set_console_font(_CONSOLE_FONT_BEFORE.pop())
+
+
+atexit.register(_restore_console_font)
+
+
 def _star_reason() -> tuple[bool, str]:
     """(whether the star can be shown, why), decided fresh so a font change takes effect at the next message."""
     mode = get_star_mode()
@@ -4561,8 +4610,8 @@ def _star_reason() -> tuple[bool, str]:
     face = _console_font_face()
     if face == STAR_FONT_FAMILY:
         return True, f"this window's font is {STAR_FONT_FAMILY}"
-    return False, (f"this window's font is {face or 'unknown'}; run  eustace --install-font  once, then pick "
-                   f"{STAR_FONT_FAMILY} under Properties > Font")
+    return False, (f"this window's font is {face or 'unknown'} and could not be switched to {STAR_FONT_FAMILY}; "
+                   "run  eustace --install-font  and start Eustace again")
 
 
 def _refresh_star() -> bool:
@@ -5583,6 +5632,7 @@ _COMMAND_ALIASES = {"/quit": "/exit", "exit": "/exit", "quit": "/exit"}
 
 
 def main():
+    _adopt_star_font()  # before anything is printed, so the banner is drawn once, in the font it will keep
     _init_client()
     cwd = os.getcwd()
     sessions = list_saved_sessions()
