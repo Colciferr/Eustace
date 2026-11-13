@@ -121,7 +121,20 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# 4. Global config
+# 4. Star font (your account only, no admin rights). Skipped when config.json says "star": "off"; never fatal.
+$bin = $null
+try { $bin = (& $py -m pipx environment --value PIPX_BIN_DIR 2>$null | Select-Object -Last 1) } catch { }
+$candidates = @()
+if ($bin) { $candidates += (Join-Path "$bin".Trim() "eustace.exe") }
+$candidates += (Join-Path $env:USERPROFILE ".local\bin\eustace.exe")
+$exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($exe) {
+    & $exe --install-font auto
+} else {
+    Write-Host "[..] Could not find eustace.exe to install the star font; run  eustace --install-font  later."
+}
+
+# 5. Global config
 $cfg = Join-Path $env:USERPROFILE ".eustace"
 New-Item -ItemType Directory -Force -Path $cfg | Out-Null
 $prompt = Join-Path $cfg "system_prompt.md"
@@ -135,4 +148,3 @@ if (-not (Test-Path $prompt)) {
 Write-Host ""
 Write-Host "Done. Open a NEW terminal and run:  eustace" -ForegroundColor Green
 Write-Host "It will ask for your GenAI.mil API key on first run and save it to $cfg\.env"
-Write-Host "Optional: eustace --install-font adds the font for the star on the Thinking line (your account only, no admin rights)."

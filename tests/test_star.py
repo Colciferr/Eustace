@@ -159,6 +159,15 @@ class FontFileTests(unittest.TestCase):
         private = [cp for cp in cmap if 0xE000 <= cp <= 0xF8FF]
         self.assertEqual(sorted(private), [ord(g) for g in GLYPHS])
 
+    def test_every_symbol_eustace_prints_is_in_the_font(self):
+        # Seven symbols used to be in neither Consolas nor Cascadia Mono and showed as boxes. Anything added to
+        # cli.py later has to be a character the font can draw.
+        cmap = Ttf(FONT).cmap()
+        with open(os.path.join(ROOT, "cli.py"), encoding="utf-8") as f:
+            used = {ch for ch in f.read() if ord(ch) > 126}
+        used.discard("\ufeff")  # a byte-order mark Eustace strips from files it reads; never printed
+        self.assertEqual(sorted(ch for ch in used if ord(ch) not in cmap), [])
+
     def test_the_font_and_license_are_installed_with_the_package(self):
         with open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8") as f:
             project = f.read()
@@ -291,6 +300,120 @@ class WhenTheStarShowsTests(unittest.TestCase):
                     self.assertEqual(cli._accent(), color)
         finally:
             cli.DEV_MODE = saved
+
+
+class FakeConsole:
+    """Stands in for the console's font calls. accepts: the font names it will switch to; any other request
+    leaves it on `fallback`, the way a real console answers a name it cannot use."""
+
+    def __init__(self, face="Consolas", height=16, weight=400, accepts=("Eustace Mono", "Consolas"), fallback="Courier New"):
+        self.face, self.height, self.weight, self.family = face, height, weight, 0x36
+        self.accepts, self.fallback, self.requests = accepts, fallback, []
+
+    def read(self):
+        info = cli._ConsoleFontInfoEx()
+        info.cbSize = cli.ctypes.sizeof(info)
+        info.FaceName, info.FontWeight, info.FontFamily = self.face, self.weight, self.family
+        info.dwFontSize.X, info.dwFontSize.Y = self.height // 2, self.height
+        return info
+
+    def set(self, info):
+        self.requests.append((info.FaceName, info.dwFontSize.X, info.dwFontSize.Y, info.FontWeight))
+        self.face = info.FaceName if info.FaceName in self.accepts else self.fallback
+        self.height, self.weight = info.dwFontSize.Y, info.FontWeight
+        return True
+
+
+class AdoptFontTests(unittest.TestCase):
+    """Eustace switches its own classic console window to the star font at startup and puts the old one back."""
+
+    @contextlib.contextmanager
+    def window(self, console=None, installed=True, mode=None):
+        console = console or FakeConsole()
+        with star_font(mode), tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"LOCALAPPDATA": tmp}):
+            if installed:
+                os.makedirs(os.path.dirname(cli._user_font_path()))
+                open(cli._user_font_path(), "wb").close()
+            cli._read_console_font, cli._set_console_font = console.read, console.set
+            cli._CONSOLE_FONT_BEFORE.clear()
+            try:
+                yield console
+            finally:
+                cli._CONSOLE_FONT_BEFORE.clear()
+
+    def test_it_switches_at_the_same_height_and_restores_exactly(self):
+        with self.window(FakeConsole(height=20, weight=700)) as console:
+            self.assertTrue(cli._adopt_star_font())
+            self.assertEqual(console.face, "Eustace Mono")
+            self.assertEqual(console.requests, [("Eustace Mono", 0, 20, 700)])
+            cli._restore_console_font()
+            self.assertEqual((console.face, console.height, console.weight), ("Consolas", 20, 700))
+            self.assertEqual(console.requests[-1], ("Consolas", 10, 20, 700))
+            cli._restore_console_font()  # registered with atexit; a second call changes nothing
+            self.assertEqual(len(console.requests), 2)
+
+    def test_the_star_is_on_once_the_window_has_switched(self):
+        with self.window() as console:
+            cli._console_font_face = lambda: console.face
+            self.assertFalse(cli._refresh_star())
+            cli._adopt_star_font()
+            self.assertTrue(cli._refresh_star())
+
+    def test_nothing_is_touched_when_it_should_not_switch(self):
+        cases = {
+            "star off": dict(mode="off"),
+            "font not installed": dict(installed=False),
+            "already the star font": dict(console=FakeConsole(face="Eustace Mono")),
+        }
+        for name, kwargs in cases.items():
+            with self.window(**kwargs) as console:
+                self.assertFalse(cli._adopt_star_font(), name)
+                self.assertEqual(console.requests, [], name)
+                cli._restore_console_font()
+                self.assertEqual(console.requests, [], name)
+        with self.window() as console:
+            cli._console_is_hosted = lambda: True
+            self.assertFalse(cli._adopt_star_font(), "hosted terminal")
+            self.assertEqual(console.requests, [])
+        with self.window() as console:
+            cli._ui_enabled = lambda: False
+            self.assertFalse(cli._adopt_star_font(), "plain prompt")
+            self.assertEqual(console.requests, [])
+        with self.window() as console:
+            cli._read_console_font = lambda: None
+            self.assertFalse(cli._adopt_star_font(), "font cannot be read")
+            self.assertEqual(console.requests, [])
+
+    def test_a_console_that_picks_some_other_font_gets_its_old_one_back(self):
+        with self.window(FakeConsole(accepts=("Consolas",))) as console:
+            self.assertFalse(cli._adopt_star_font())
+            self.assertEqual(console.face, "Consolas")
+            self.assertEqual([r[0] for r in console.requests], ["Eustace Mono", "Consolas"])
+            self.assertEqual(cli._CONSOLE_FONT_BEFORE, [])
+
+    def test_a_refused_call_changes_nothing(self):
+        with self.window() as console:
+            cli._set_console_font = lambda info: False
+            self.assertFalse(cli._adopt_star_font())
+            self.assertEqual((console.face, cli._CONSOLE_FONT_BEFORE), ("Consolas", []))
+
+    def test_on_also_switches_a_classic_window(self):
+        with self.window(mode="on") as console:
+            self.assertTrue(cli._adopt_star_font())
+
+    def test_startup_switches_before_anything_is_printed(self):
+        saved_init, saved_adopt = cli._init_client, cli._adopt_star_font
+        cli._init_client = lambda: None
+        seen = []
+        try:
+            with star_font() as pipe:
+                cli.client = ScriptedClient()
+                cli._adopt_star_font = lambda: seen.append(output())
+                pipe.send_text("/exit" + ENTER)
+                cli.main()
+        finally:
+            cli._init_client, cli._adopt_star_font = saved_init, saved_adopt
+        self.assertEqual(seen, [""])
 
 
 class PromptTests(unittest.TestCase):
@@ -514,7 +637,7 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(registry.values, {"Eustace Mono (TrueType)": (registry.REG_SZ, dest)})
             self.assertEqual(registry.opened, [("HKCU", r"Software\Microsoft\Windows NT\CurrentVersion\Fonts")])
             self.assertEqual(announced, [(dest, True)])
-            self.assertIn("Properties > Font > Eustace Mono", printed.getvalue())
+            self.assertIn("puts your font back when it exits", printed.getvalue())
             self.assertIn("--remove-font", printed.getvalue())
             self.assertNotIn("[!!]", printed.getvalue())
 
@@ -559,6 +682,62 @@ class InstallTests(unittest.TestCase):
     def test_the_source_checkout_copy_is_found_when_nothing_is_installed(self):
         with mock.patch.object(cli, "SHIPPED_FONT_PATH", os.path.join(ROOT, "nowhere", "x.ttf")):
             self.assertEqual(os.path.normcase(cli._star_font_source()), os.path.normcase(FONT))
+
+    def test_setup_and_updates_install_once_and_then_stay_silent(self):
+        with self.machine() as (dest, registry, announced, printed):
+            self.assertEqual(cli._install_star_font(brief=True), 0)
+            self.assertTrue(os.path.isfile(dest))
+            self.assertEqual(registry.values, {"Eustace Mono (TrueType)": (registry.REG_SZ, dest)})
+            first = printed.getvalue()
+            self.assertIn("puts your font back when it exits", first)
+            self.assertLessEqual(first.count("\n"), 2)
+            self.assertEqual(cli._install_star_font(brief=True), 0)
+            self.assertEqual(printed.getvalue(), first, "nothing more is printed once the font is in place")
+
+    def test_star_off_keeps_setup_and_updates_from_installing_but_not_the_explicit_flag(self):
+        with self.machine() as (dest, registry, announced, printed), tempfile.TemporaryDirectory() as home, \
+                mock.patch.object(cli, "_UPDATE_HOME", home):
+            for off in ("off", " OFF "):
+                with open(os.path.join(home, "config.json"), "w", encoding="utf-8") as f:
+                    json.dump({"star": off}, f)
+                self.assertEqual(cli._install_star_font(brief=True), 0)
+                self.assertFalse(os.path.exists(dest))
+                self.assertEqual((registry.values, announced, printed.getvalue()), ({}, [], ""))
+            self.assertEqual(cli._install_star_font(), 0)
+            self.assertTrue(os.path.isfile(dest))
+
+    def test_anything_but_off_does_not_opt_out(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.object(cli, "_UPDATE_HOME", home):
+            self.assertFalse(cli._star_opted_out())  # no config at all
+            for content in ('{"star": "auto"}', '{"star": "on"}', '{"star": false}', '{}', '[]', 'not json'):
+                with open(os.path.join(home, "config.json"), "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.assertFalse(cli._star_opted_out(), content)
+
+    def test_an_update_installs_the_font_and_survives_its_failure(self):
+        from _harness import sandbox as box
+        with box(), contextlib.redirect_stdout(io.StringIO()) as printed:
+            calls = []
+            cli._install_star_font = lambda brief=False: calls.append(brief) or 0
+            self.assertEqual(cli._post_update(["1.7.0", "-"]), 0)
+            self.assertEqual(calls, [True])
+
+            def broken(brief=False):
+                raise OSError("font folder is read-only")
+            cli._install_star_font = broken
+            self.assertEqual(cli._post_update(["1.7.0", "-"]), 0)
+            self.assertIn("font folder is read-only", printed.getvalue())
+
+    def test_setup_installs_the_font_through_the_installed_command(self):
+        with open(os.path.join(ROOT, "setup.ps1"), encoding="utf-8") as f:
+            setup = f.read()
+        self.assertIn("--install-font auto", setup)
+        self.assertLess(setup.index("pipx install"), setup.index("--install-font auto"))
+
+    def test_the_badges_use_only_plain_characters(self):
+        for badge, word in ((cli.AUTO_BADGE, "AUTO"), (cli.ADMIN_BADGE, "ADMIN")):
+            self.assertTrue(badge.isascii(), "the symbols used before showed as boxes in the console")
+            self.assertIn(word, badge)
 
     def test_remove_undoes_install(self):
         with self.machine() as (dest, registry, announced, printed):
@@ -659,7 +838,13 @@ try:
         return [ok, cli._console_font_face()]
     out["control"] = switch_to("Courier New")   # a stock font: shows this console can change fonts at all
     out["missing"] = switch_to("No Such Font")  # what the console does with a name it cannot use
-    out["set_ok"], out["face_after"] = switch_to(cli.STAR_FONT_FAMILY)
+    out["before_adopt"] = [cli._console_font_face(), cli._read_console_font().dwFontSize.Y]
+    out["adopted"] = cli._adopt_star_font()   # what Eustace does at startup
+    out["face_after"] = cli._console_font_face()
+    out["height_after"] = cli._read_console_font().dwFontSize.Y
+    out["star_on"] = cli._star_reason()
+    cli._restore_console_font()               # and at exit
+    out["restored"] = [cli._console_font_face(), cli._read_console_font().dwFontSize.Y]
     out["remove"] = cli._remove_star_font()
 except BaseException:
     import traceback
@@ -714,9 +899,13 @@ class RealConsoleTests(unittest.TestCase):
         self.assertFalse(self.result["hosted"])
         self.assertEqual(self.result["control"], [True, "Courier New"], "this console cannot change fonts at all")
         self.assertNotEqual(self.result["missing"][1], "No Such Font")
-        self.assertTrue(self.result["set_ok"])
-        self.assertEqual(self.result["face_after"], cli.STAR_FONT_FAMILY)
         self.assertNotEqual(self.result["face_before"], cli.STAR_FONT_FAMILY)
+        # Eustace's own startup switch and exit restore, on this real window
+        self.assertTrue(self.result["adopted"])
+        self.assertEqual(self.result["face_after"], cli.STAR_FONT_FAMILY)
+        self.assertEqual(self.result["height_after"], self.result["before_adopt"][1])
+        self.assertTrue(self.result["star_on"][0], self.result["star_on"][1])
+        self.assertEqual(self.result["restored"], self.result["before_adopt"])
 
     def test_windows_classifies_the_font_the_way_the_console_requires(self):
         value = self.result["gdi_pitch_and_family"]

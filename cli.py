@@ -39,7 +39,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 
 # When output is redirected to a file or pipe, Windows uses the ANSI code page, which cannot encode the symbols
 # printed here; degrade to "?" instead of crashing mid-turn.
@@ -223,6 +223,10 @@ def _post_update(args: list[str]) -> int:
         print(f"\n[ok] Eustace updated: v{old_version} -> v{VERSION}{at}")
     else:
         print(f"\n[ok] Eustace v{VERSION} is now at the newest commit{at}")
+    try:
+        _install_star_font(brief=True)  # the font travels with every version; an update keeps it current
+    except Exception as e:
+        print(f"[!!] Could not check the star font ({e}).")
 
     mine_path = os.path.join(_UPDATE_HOME, "system_prompt.md")
     mine, shipped = _persona_text(mine_path), _persona_text(SHIPPED_PROMPT_PATH)
@@ -312,9 +316,22 @@ def _same_file_bytes(a: str, b: str) -> bool:
         return False
 
 
-def _install_star_font() -> int:
+def _star_opted_out() -> bool:
+    """True when config.json says "star": "off": setup and updates then leave the font alone."""
+    try:
+        with open(os.path.join(_UPDATE_HOME, "config.json"), encoding="utf-8") as f:
+            value = json.load(f).get("star")
+        return isinstance(value, str) and value.strip().lower() == "off"
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _install_star_font(brief: bool = False) -> int:
     """eustace --install-font: copies the font into the user's own font folder, registers it under HKCU and
-    loads it. Returns the exit code."""
+    loads it. Returns the exit code. brief is how setup.ps1 and an update call it: nothing happens when the
+    user switched the star off, and nothing is printed when the font was already in place."""
+    if brief and _star_opted_out():
+        return 0
     src = _star_font_source()
     if src is None:
         print(f"[!!] The font file is missing from this install (expected {SHIPPED_FONT_PATH}).")
@@ -322,7 +339,8 @@ def _install_star_font() -> int:
     dest = _user_font_path()
     try:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        if not _same_file_bytes(src, dest):  # Windows will not overwrite a font a console window has loaded
+        copied = not _same_file_bytes(src, dest)
+        if copied:  # Windows will not overwrite a font a console window has loaded
             shutil.copyfile(src, dest)
     except OSError as e:
         print(f"[!!] Could not copy the font to {dest} ({e}).\n"
@@ -335,17 +353,22 @@ def _install_star_font() -> int:
         print(f"[!!] Copied the font to {dest}, but could not register it for your account ({e}).")
         return 1
     loaded = _announce_font(dest, add=True)
+    if brief:
+        if copied:
+            print(f"[ok] Star font installed for your account ({STAR_FONT_FAMILY}). Eustace switches its own window to\n"
+                  "     it while it runs and puts your font back when it exits.")
+        return 0
     print(f"[ok] {STAR_FONT_FAMILY} is installed for your account only (no admin rights used):\n     {dest}")
     if not loaded:
         print("[!!] Windows did not load it. A policy on this PC may block fonts that are not installed for all\n"
               "     users; the steps below will show whether it is available.")
     print(
-        "\nTo see the star, set the font of the window Eustace runs in:\n"
-        "  Windows PowerShell / Command Prompt window: open a NEW window, right-click its title bar >\n"
-        f"    Properties > Font > {STAR_FONT_FAMILY} > OK. Eustace notices by itself at the next prompt.\n"
+        "\nWhere the star shows:\n"
+        "  Windows PowerShell / Command Prompt window: nothing to do. Eustace switches its own window to the\n"
+        "    font when it starts and puts your font back when it exits.\n"
         f"  Windows Terminal: Settings > your profile > Appearance > Font face > {STAR_FONT_FAMILY}, then add\n"
         '    "star": "on"  to config.json in your .eustace folder (Eustace cannot read that terminal\'s font).\n'
-        f"The font is Cascadia Mono with the star added, so the window's text changes to that typeface.\n"
+        "The font is Cascadia Mono with the star added, so Eustace's window shows that typeface.\n"
         "Inside Eustace, /status says whether the star is on and why. Undo with  eustace --remove-font."
     )
     return 0
@@ -372,7 +395,97 @@ def _remove_star_font() -> int:
         print(f"[ok] {STAR_FONT_FAMILY} is no longer registered, but its file is still in use ({e}).\n"
               f"     Close the windows that use it, then delete {dest}")
         return 0
-    print(f"[ok] Removed {STAR_FONT_FAMILY}. Windows that still use it keep it until they are closed.")
+    print(f"[ok] Removed {STAR_FONT_FAMILY}. Windows that still use it keep it until they are closed.\n"
+          '     An update installs it again unless config.json in your .eustace folder has  "star": "off".')
+    return 0
+
+
+# --- Uninstall (eustace --uninstall) ---
+# Runs in its own console window after this process has exited, under the Python Eustace's environment was made
+# from: neither eustace.exe nor the environment's own python.exe can be deleted while it is running.
+# argv: pid to wait for, the uninstall command as JSON, the font file to delete ("" for none), what to tell the
+# user if the command fails.
+_UNINSTALL_HELPER = r"""
+import ctypes, datetime, json, os, subprocess, sys, time
+pid, command, font, hint = int(sys.argv[1]), json.loads(sys.argv[2]), sys.argv[3], sys.argv[4]
+try:
+    k32 = ctypes.windll.kernel32
+    handle = k32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if handle:
+        k32.WaitForSingleObject(handle, 60000)
+        k32.CloseHandle(handle)
+except Exception:
+    pass
+time.sleep(1)
+print("== Eustace uninstall ==")
+code = 1
+try:
+    code = subprocess.call(command)
+except OSError as e:
+    print("[!!] Could not start", command[0], "(%s)" % e)
+if font and os.path.exists(font):  # the window that asked for the uninstall may have been the one using it
+    try:
+        os.remove(font)
+    except OSError:
+        print("[..] The font file is still in use by an open window. Delete it later:", font)
+try:
+    with open(os.path.join(os.getcwd(), "uninstall.log"), "a", encoding="utf-8") as log:
+        log.write("%s exit=%d\n" % (datetime.datetime.now().isoformat(timespec="seconds"), code))
+except OSError:
+    pass
+print()
+if code == 0:
+    print("[ok] Eustace is uninstalled. Your settings folder was kept:", os.getcwd())
+else:
+    print("[!!] The uninstall command failed. " + hint)
+if not os.environ.get("EUSTACE_UPDATE_NO_PAUSE"):
+    try:
+        input("\nPress Enter to close this window.")
+    except EOFError:
+        pass
+sys.exit(code)
+"""
+
+
+def _uninstall_command() -> tuple[list[str], str]:
+    """(the command that removes this install, what to tell the user if it fails). An install made by setup.ps1
+    is a pipx environment and is removed whole, with its eustace.exe; any other install is removed with pip."""
+    if os.path.isfile(os.path.join(sys.prefix, "pipx_metadata.json")):
+        base = getattr(sys, "_base_executable", None) or sys.executable
+        return ([base, "-m", "pipx", "uninstall", _DIST_NAME],
+                f"Close every Eustace window and run:  pipx uninstall {_DIST_NAME}")
+    return ([sys.executable, "-m", "pip", "uninstall", "-y", _DIST_NAME],
+            f"Close every Eustace window and run:  python -m pip uninstall {_DIST_NAME}")
+
+
+def _uninstall(args: list[str]) -> int:
+    """eustace --uninstall [--yes]: removes the star font and the program. The settings folder (API key, config,
+    saved sessions, audit log) is never deleted. Returns the exit code."""
+    if "--yes" not in args:
+        try:
+            answer = input(f"Uninstall Eustace v{VERSION} and its font? Your settings folder is kept\n"
+                           f"({_UPDATE_HOME}: API key, config, saved sessions, audit log). [y/N] ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Nothing was changed.")
+            return 0
+    font = _user_font_path()
+    try:
+        _remove_star_font()
+    except Exception as e:
+        print(f"[!!] Could not remove the font ({e}); carrying on with the program.")
+    command, hint = _uninstall_command()
+    os.makedirs(_UPDATE_HOME, exist_ok=True)
+    try:
+        subprocess.Popen(
+            [command[0], "-c", _UNINSTALL_HELPER, str(os.getpid()), json.dumps(command), font, hint],
+            cwd=_UPDATE_HOME, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0), close_fds=True)
+    except OSError as e:
+        print(f"Uninstall failed: the uninstaller could not be started ({e}). {hint}")
+        return 1
+    print("Uninstalling in a new window. Close any other Eustace windows.\n"
+          f"Your settings folder is kept: {_UPDATE_HOME}")
     return 0
 
 
@@ -381,7 +494,7 @@ _ARGS = sys.argv[1:]
 if "--help" in _ARGS or "-h" in _ARGS:
     print(
         "usage: eustace [--auto] [--devmode] [--version] [--update [BRANCH|TAG|COMMIT]]\n"
-        "               [--install-font | --remove-font]\n\n"
+        "               [--install-font | --remove-font] [--uninstall [--yes]]\n\n"
         "  --auto      Start in auto mode: file reads, file writes and shell commands run without asking,\n"
         "              except shell commands on the deny-list. Shift+Tab or /auto switches it off.\n"
         "              Ignored when Eustace runs as Administrator (elevated).\n"
@@ -391,9 +504,12 @@ if "--help" in _ARGS or "-h" in _ARGS:
         "  --update    Install the newest commit on the main branch of the Eustace repository over this\n"
         "              install, in a new window. Name a branch, tag or full commit hash to get that instead:\n"
         "              eustace --update v1.5.0\n"
-        "  --install-font  Install the Eustace Mono font for your account (no admin rights). With it as the\n"
+        "  --install-font  Install the Eustace Mono font for your account (no admin rights; setup and updates\n"
+        "              already do this unless config.json has \"star\": \"off\"). With it as the\n"
         "              window's font, a star spins and bounces in front of \"Thinking...\" while Eustace works.\n"
         "  --remove-font   Remove that font again.\n"
+        "  --uninstall     Remove Eustace and its font, in a new window, after asking (--yes skips the question).\n"
+        "              Your .eustace folder (API key, config, saved sessions, audit log) is kept.\n"
     )
     raise SystemExit(0)
 if "--version" in _ARGS:
@@ -404,10 +520,12 @@ if "--post-update" in _ARGS:  # run by the update window, with the version it ju
 if "--update" in _ARGS:
     _rest = _ARGS[_ARGS.index("--update") + 1:]
     raise SystemExit(_self_update(_rest[:1] if _rest and not _rest[0].startswith("-") else []))
-if "--install-font" in _ARGS:
-    raise SystemExit(_install_star_font())
+if "--install-font" in _ARGS:  # "--install-font auto" is how setup.ps1 calls it
+    raise SystemExit(_install_star_font(brief=_ARGS[_ARGS.index("--install-font") + 1:][:1] == ["auto"]))
 if "--remove-font" in _ARGS:
     raise SystemExit(_remove_star_font())
+if "--uninstall" in _ARGS:
+    raise SystemExit(_uninstall(_ARGS))
 DEV_MODE = "--devmode" in _ARGS
 START_IN_AUTO_MODE = "--auto" in _ARGS
 
@@ -1127,7 +1245,7 @@ class CLIApprovalHandler:
         console.print(
             Panel(
                 body,
-                title=f"[bold yellow]⚠️  Approval Required: {escape(action_title)}[/bold yellow]",
+                title=f"[bold yellow]! Approval Required: {escape(action_title)}[/bold yellow]",
                 subtitle=None if interactive else keys,
                 border_style="yellow",
                 box=box.ROUNDED,
@@ -1185,10 +1303,10 @@ class CLIApprovalHandler:
         choice = _ask_menu("Do you want to proceed?", options, allow_view=can_view)
         if choice == "tell":
             self.last_feedback = _ask_line("What should Eustace do instead? ")
-            console.print(f"  [dim]✗ Denied{': ' + escape(_sanitize_for_display(self.last_feedback)) if self.last_feedback else ''}[/dim]")
+            console.print(f"  [dim]× Denied{': ' + escape(_sanitize_for_display(self.last_feedback)) if self.last_feedback else ''}[/dim]")
             return "no"
         console.print({"yes": "  [dim green]✓ Approved[/dim green]", "all": f"  [dim green]✓ Approved, and for further {escape(self.current_tool)} calls this turn[/dim green]",
-                       "view": "", None: "  [dim]✗ Denied[/dim]"}.get(choice, ""))
+                       "view": "", None: "  [dim]× Denied[/dim]"}.get(choice, ""))
         return choice or "no"
 
 
@@ -1286,7 +1404,7 @@ SHELL_DENY_PATTERNS: tuple[tuple[str, str], ...] = (
     (_alias("npx|pnpx|pipx|winget|choco|scoop|nuget") + r"|" + _alias(r"npm|pnpm|yarn") + r"\s+(install|i|ci|add|exec|x|"
      r"dlx|update|up|upgrade)\b|" + _alias(r"pip[0-9.]*") + r"\s+(install|download)\b|(?<![\w-])-m\s+(pip|ensurepip)\b|"
      + _alias("uv") + r"\s+(pip|tool|add|run)\b|(install|save|update)-(module|package|script|psresource)|"
-     r"dotnet\s+tool\s+install|git\s+clone|(?<![\w-])--((post-)?update|(install|remove)-font)(?![\w-])", "installs or downloads software"),
+     r"dotnet\s+tool\s+install|git\s+clone|(?<![\w-])--((post-)?update|(install|remove)-font|uninstall)(?![\w-])", "installs or downloads software"),
     (_alias(r"python[0-9.]*|pythonw|py|node") + r"[\"']?(\s+-[XW]\s*\S+|\s+-[\w.:-]+)*?\s+(-c|-e|-p|--eval|--print|-)"
      r"(?=\s|$|[\"'])", "runs inline code"),
     (r"(?<![\w-])-e(c|n|nc|ncodedcommand)?\s|frombase64string|invoke-expression|" + _alias("iex") + r"|\[scriptblock\]|"
@@ -1668,7 +1786,7 @@ def undo_last_turn() -> str | None:
     for line in done:
         console.print(f"  [green]✓ {escape(_visible_controls(line))}[/green]")
     for line in failed:
-        console.print(f"  [bold red]✗ {escape(_visible_controls(line))}[/bold red]")
+        console.print(f"  [bold red]× {escape(_visible_controls(line))}[/bold red]")
     if not done:
         return None
     return "The user ran /undo, which reverted these file changes: " + "; ".join(done) + "."
@@ -4013,7 +4131,7 @@ def _load_trusted_agent_md(path: str) -> str | None:
     console.print(
         Panel(
             escape(preview),
-            title=f"[bold yellow]⚠️  Untrusted instruction file: {escape(path)}[/bold yellow]",
+            title=f"[bold yellow]! Untrusted instruction file: {escape(path)}[/bold yellow]",
             subtitle=f"[dim]{len(raw)} bytes | sha256 {digest[:16]}... | will be loaded as system instructions[/dim]",
             border_style="yellow",
             box=box.ROUNDED,
@@ -4173,7 +4291,7 @@ def _confirm_skills(pending: list[dict]) -> list[dict]:
     console.print()
     console.print(Panel(
         escape(_visible_controls("\n".join(lines))),
-        title=f"[bold yellow]⚠️  {len(pending)} untrusted skill{'s' if len(pending) != 1 else ''}[/bold yellow]",
+        title=f"[bold yellow]! {len(pending)} untrusted skill{'s' if len(pending) != 1 else ''}[/bold yellow]",
         subtitle="[dim]a trusted skill's instructions are followed like AGENT.md; its scripts still ask before running[/dim]",
         border_style="yellow", box=box.ROUNDED, padding=(0, 1),
     ))
@@ -4465,6 +4583,10 @@ class _ConsoleFontInfoEx(ctypes.Structure):
 
 _kernel32.GetCurrentConsoleFontEx.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(_ConsoleFontInfoEx)]
 _kernel32.GetCurrentConsoleFontEx.restype = wintypes.BOOL
+_kernel32.SetCurrentConsoleFontEx.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(_ConsoleFontInfoEx)]
+_kernel32.SetCurrentConsoleFontEx.restype = wintypes.BOOL
+_FIXED_TRUETYPE_FONT = 0x36  # FF_MODERN | TMPF_VECTOR | TMPF_TRUETYPE
+_CONSOLE_FONT_BEFORE: list = []  # the font this window had when Eustace switched it; put back at exit
 _kernel32.GetConsoleWindow.argtypes = []
 _kernel32.GetConsoleWindow.restype = wintypes.HWND
 _user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
@@ -4489,16 +4611,31 @@ def get_star_mode() -> str:
     return value if value in ("auto", "on", "off") else "auto"
 
 
-def _console_font_face() -> str:
-    """The font this console window draws with ("" when it cannot be read)."""
+def _read_console_font():
+    """This console window's font as Windows describes it, or None when it cannot be read."""
     try:
         info = _ConsoleFontInfoEx()
         info.cbSize = ctypes.sizeof(info)
         if _kernel32.GetCurrentConsoleFontEx(_kernel32.GetStdHandle(_STD_OUTPUT_HANDLE), False, ctypes.byref(info)):
-            return info.FaceName
+            return info
     except Exception:
         pass
-    return ""
+    return None
+
+
+def _set_console_font(info) -> bool:
+    """Asks this console window to draw with the given font. The change lasts for the window's session only;
+    nothing is saved to the shortcut or the user's console defaults."""
+    try:
+        return bool(_kernel32.SetCurrentConsoleFontEx(_kernel32.GetStdHandle(_STD_OUTPUT_HANDLE), False, ctypes.byref(info)))
+    except Exception:
+        return False
+
+
+def _console_font_face() -> str:
+    """The font this console window draws with ("" when it cannot be read)."""
+    info = _read_console_font()
+    return info.FaceName if info is not None else ""
 
 
 def _console_window_class() -> str:
@@ -4521,6 +4658,36 @@ def _console_is_hosted() -> bool:
     return _console_window_class() != _CLASSIC_CONSOLE_WINDOW
 
 
+def _adopt_star_font() -> bool:
+    """Switches this console window to the star's font, at the size it had, for as long as Eustace runs.
+    Only a classic console window can be switched, only when the font is installed, and never when the star
+    is off. If the window ends up with any other font, the old one is put back. Returns whether it switched."""
+    if get_star_mode() == "off" or not _ui_enabled() or _console_is_hosted() or not os.path.isfile(_user_font_path()):
+        return False
+    before = _read_console_font()
+    if before is None or before.FaceName == STAR_FONT_FAMILY:
+        return False
+    wanted = _ConsoleFontInfoEx()
+    wanted.cbSize = ctypes.sizeof(wanted)
+    wanted.dwFontSize.Y = before.dwFontSize.Y  # same height; the width follows from the font
+    wanted.FontFamily, wanted.FontWeight, wanted.FaceName = _FIXED_TRUETYPE_FONT, before.FontWeight or 400, STAR_FONT_FAMILY
+    after = _read_console_font() if _set_console_font(wanted) else None
+    if after is not None and after.FaceName == STAR_FONT_FAMILY:
+        _CONSOLE_FONT_BEFORE[:] = [before]
+        return True
+    _set_console_font(before)  # the console accepts a name it cannot use and picks something else
+    return False
+
+
+def _restore_console_font() -> None:
+    """Puts back the font the window had before _adopt_star_font, if it switched."""
+    while _CONSOLE_FONT_BEFORE:
+        _set_console_font(_CONSOLE_FONT_BEFORE.pop())
+
+
+atexit.register(_restore_console_font)
+
+
 def _star_reason() -> tuple[bool, str]:
     """(whether the star can be shown, why), decided fresh so a font change takes effect at the next message."""
     mode = get_star_mode()
@@ -4536,8 +4703,8 @@ def _star_reason() -> tuple[bool, str]:
     face = _console_font_face()
     if face == STAR_FONT_FAMILY:
         return True, f"this window's font is {STAR_FONT_FAMILY}"
-    return False, (f"this window's font is {face or 'unknown'}; run  eustace --install-font  once, then pick "
-                   f"{STAR_FONT_FAMILY} under Properties > Font")
+    return False, (f"this window's font is {face or 'unknown'} and could not be switched to {STAR_FONT_FAMILY}; "
+                   "run  eustace --install-font  and start Eustace again")
 
 
 def _refresh_star() -> bool:
@@ -4742,7 +4909,7 @@ def run_agent_turn(messages: list[dict]):
             break
 
     except KeyboardInterrupt:
-        console.print("\n  [bold red]⏹ Stopped by user[/bold red]")
+        console.print("\n  [bold red]■ Stopped by user[/bold red]")
         if partial_reply:
             console.print(_render_markdown(partial_reply))
             console.print("[dim](partial reply)[/dim]")
@@ -4950,7 +5117,7 @@ def select_model_interactive(arg: str = "") -> str:
 
         for idx, (m_id, desc) in enumerate(models, start=1):
             active = " (active)" if m_id == MODEL else ""
-            mode = "⚡ Tools" if (DEV_MODE or m_id.endswith("-withtools")) else "💬 Chat only"
+            mode = "Tools" if (DEV_MODE or m_id.endswith("-withtools")) else "Chat only"
             style = "bold cyan" if m_id == MODEL else None
             tbl.add_row(str(idx), f"{escape(m_id)}{active}", mode, desc, style=style)
 
@@ -5002,8 +5169,8 @@ _UI_STYLE = {
     "menu.current": "bg:#1f3a3a #ffffff", "menu.meta": "#8f8f8f", "question": "bold", "current": "ansicyan",
     "auto": "bold ansiyellow", "admin": "bg:ansired #0c0c0c bold", "flash": "ansiyellow",
 }
-ADMIN_BADGE = " ⚠ ADMIN "
-AUTO_BADGE = "⏵⏵ AUTO "
+ADMIN_BADGE = " ! ADMIN "
+AUTO_BADGE = ">> AUTO "  # plain characters: the arrows used before are in neither Consolas nor Cascadia Mono
 
 
 def _ui_enabled() -> bool:
@@ -5091,7 +5258,7 @@ def _render_diff(rows: list[tuple], width: int) -> Text:
         out.append(f"{'':>{num_w}} {set_cell_size('before', col_w)} │ {'':>{num_w}} after\n", style="dim")
         for kind, old_no, old, new_no, new in rows:
             if kind == "sep":
-                out.append(f"{'':>{num_w}} {set_cell_size('⋯', col_w)} │ {'':>{num_w}} ⋯\n", style="dim")
+                out.append(f"{'':>{num_w}} {set_cell_size('…', col_w)} │ {'':>{num_w}} …\n", style="dim")
             elif kind == "note":
                 out.append(f"{'':>{num_w}} {old}\n", style="dim")
             else:
@@ -5108,7 +5275,7 @@ def _render_diff(rows: list[tuple], width: int) -> Text:
         pad = max(width - num_w - 3, 1)
         for kind, old_no, old, new_no, new in rows:
             if kind == "sep":
-                out.append(f"{'':>{num_w}}   ⋯\n", style="dim")
+                out.append(f"{'':>{num_w}}   …\n", style="dim")
             elif kind == "note":
                 out.append(f"{'':>{num_w}}   {old}\n", style="dim")
             elif kind == "ctx":
@@ -5558,6 +5725,7 @@ _COMMAND_ALIASES = {"/quit": "/exit", "exit": "/exit", "quit": "/exit"}
 
 
 def main():
+    _adopt_star_font()  # before anything is printed, so the banner is drawn once, in the font it will keep
     _init_client()
     cwd = os.getcwd()
     sessions = list_saved_sessions()
@@ -5578,7 +5746,7 @@ def main():
     else:
         title_line = f"[bold cyan]GenAI.mil CLI — Eustace v{VERSION}[/bold cyan] ([dim]{escape(MODEL)} | {len(TOOLS)} tools[/dim])\n"
     if ELEVATED:
-        title_line += ("[bold red]⚠  Running as Administrator (elevated)[/bold red]\n"
+        title_line += ("[bold red]!  Running as Administrator (elevated)[/bold red]\n"
                        "[red]   Everything Eustace runs gets admin rights. Auto mode is off for this session.[/red]\n")
     console.print(
         Panel.fit(
