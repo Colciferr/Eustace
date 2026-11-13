@@ -37,7 +37,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 # When output is redirected to a file or pipe, Windows uses the ANSI code page, which cannot encode the symbols
 # printed here; degrade to "?" instead of crashing mid-turn.
@@ -955,6 +955,9 @@ SHELL_DENY_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"icacls|takeown|set-acl", "changes permissions"),
     (r"stop-process|taskkill|" + _alias("kill"), "stops processes"),
     (r"invoke-item|" + _alias("ii"), "opens files with their default program"),
+    # COM reaches Outlook (mail, calendars) and the other Office programs without the Outlook tools' own approvals
+    (r"comobject|new-object\b[^|;\n]*?\s-c(o(m(o(b(j(e(c(t)?)?)?)?)?)?)?)?(?![\w-])|outlook\.application|"
+     r"gettypefromprogid|getactiveobject|activator\]|createobject|getobject\(", "drives another program through COM"),
     (r"startup|\$profile|currentversion\\run", "touches startup locations"),
     (r"git\s+(push|clean)|git\s+reset\s+--hard|git\s+checkout\s+--\s|git\s+branch\s+-d", "changes git history or remotes"),
     (r"agent\.md|system_prompt\.md|\.git[\\/]|\.github|\.eustace|\.agents[\\/]",
@@ -3036,66 +3039,339 @@ def list_inbox(
         return f"Error listing Outlook Inbox: {e}"
 
 
+_OL_FOLDER_CALENDAR = 9   # OlDefaultFolders.olFolderCalendar
+_OL_APPOINTMENT_ITEM = 1  # OlItemType.olAppointmentItem
+_OL_MODULE_CALENDAR = 1   # OlNavigationModuleType.olModuleCalendar
+_MAX_CALENDARS = 50       # discovery stops here, so a huge profile cannot stall a call
+_MAX_CALENDAR_EVENTS = 100
+_ALL_CALENDARS = {"all", "*"}
+_BUSY_MAP = {0: "Free", 1: "Tentative", 2: "Busy", 3: "Out of Office", 4: "Working Elsewhere"}
+
+
+def _com_items(collection):
+    """The members of a 1-based Outlook COM collection. A member that cannot be fetched is skipped."""
+    try:
+        count = int(collection.Count)
+    except Exception:
+        return
+    for i in range(1, count + 1):
+        try:
+            item = collection.Item(i)
+        except Exception:
+            continue
+        if item is not None:
+            yield item
+
+
+def _outlook_window(app):
+    """An open Outlook window (Explorer), or None. Never creates one: Folder.GetExplorer() would."""
+    try:
+        explorer = app.ActiveExplorer()
+        if explorer is not None:
+            return explorer
+    except Exception:
+        pass
+    try:
+        return next(_com_items(app.Explorers), None)
+    except Exception:
+        return None
+
+
+def _calendar_folders(app, ns) -> tuple[list[dict], list[str]]:
+    """Every calendar this Outlook profile can reach, the default calendar first, plus notes on what could not
+    be searched.
+
+    NameSpace.GetDefaultFolder(9) is only the calendar of the default mailbox. The others are found in two
+    places: the Calendar navigation pane (what the user sees in Outlook, including shared calendars), and each
+    store's own default calendar with its sub-calendars (shared and additional mailboxes). Only folder names,
+    paths and IDs are read here, none of which the Outlook Object Model Guard protects."""
+    cals: list[dict] = []
+    notes: list[str] = []
+
+    def same_folder(cal: dict, entry_id: str, path: str) -> bool:
+        if entry_id and cal["entry_id"]:
+            if cal["entry_id"] == entry_id:
+                return True
+            try:  # one folder can have a short-term and a long-term EntryID, which differ as strings
+                return bool(ns.CompareEntryIDs(cal["entry_id"], entry_id))
+            except Exception:
+                return False
+        return bool(path) and cal["path"] == path
+
+    def add(folder, source: str, nav_name: str = "", shown=None, error: str = "", is_default: bool = False):
+        entry_id = str(_safe_prop(folder, "EntryID", "")) if folder is not None else ""
+        path = str(_safe_prop(folder, "FolderPath", "")) if folder is not None else ""
+        if folder is not None and (entry_id or path):
+            for cal in cals:
+                if cal["folder"] is not None and same_folder(cal, entry_id, path):
+                    if source not in cal["sources"]:
+                        cal["sources"].append(source)
+                    cal["nav_name"] = cal["nav_name"] or nav_name
+                    if shown is not None:
+                        cal["shown"] = shown
+                    return
+        if len(cals) >= _MAX_CALENDARS:
+            if not any("more were not listed" in n for n in notes):
+                notes.append(f"Stopped at {_MAX_CALENDARS} calendars; more were not listed.")
+            return
+        folder_name = str(_safe_prop(folder, "Name", "")).strip() if folder is not None else ""
+        store_name = ""
+        if folder is not None:
+            try:
+                store_name = str(_safe_prop(folder.Store, "DisplayName", "")).strip()
+            except Exception:
+                pass
+        cals.append({"folder": folder, "nav_name": nav_name, "folder_name": folder_name, "store": store_name,
+                     "path": path, "entry_id": entry_id, "sources": [source], "shown": shown, "error": error,
+                     "default": is_default})
+
+    try:
+        add(ns.GetDefaultFolder(_OL_FOLDER_CALENDAR), "default", is_default=True)
+    except Exception as e:
+        notes.append(f"The default calendar could not be opened ({e}).")
+
+    window = _outlook_window(app) if app is not None else None
+    if window is None:
+        notes.append("No Outlook window is open, so the Calendar navigation pane (where calendars shared by other "
+                     "people are listed) could not be searched. Open Classic Outlook's main window and try again.")
+    else:
+        try:
+            module = window.NavigationPane.Modules.GetNavigationModule(_OL_MODULE_CALENDAR)
+            for group in _com_items(module.NavigationGroups):
+                for nav in _com_items(group.NavigationFolders):
+                    nav_name = str(_safe_prop(nav, "DisplayName", "")).strip()
+                    shown = _safe_prop(nav, "IsSelected", None)  # checked in the navigation pane
+                    shown = bool(shown) if isinstance(shown, (bool, int)) else None
+                    try:
+                        folder = nav.Folder
+                        if folder is None:
+                            raise RuntimeError("Outlook returned no folder")
+                    except Exception as e:  # a shared calendar whose owner or server cannot be reached right now
+                        add(None, "navigation pane", nav_name or "(unnamed calendar)", shown, error=str(e))
+                        continue
+                    add(folder, "navigation pane", nav_name, shown)
+        except Exception as e:
+            notes.append(f"The Calendar navigation pane could not be read ({e}).")
+
+    def walk(folder, depth: int):
+        if depth > 3:
+            return
+        try:
+            subfolders = folder.Folders
+        except Exception:
+            return
+        for sub in _com_items(subfolders):
+            if _safe_prop(sub, "DefaultItemType", None) == _OL_APPOINTMENT_ITEM:
+                add(sub, "mailbox")
+                walk(sub, depth + 1)
+
+    try:
+        stores = list(_com_items(ns.Stores))
+    except Exception as e:
+        stores = []
+        notes.append(f"The list of mailboxes could not be read ({e}).")
+    for store in stores:
+        try:
+            # Store.GetDefaultFolder returns None when the store has no calendar. (The NameSpace method of the
+            # same name can create a missing folder; this one does not.)
+            root = store.GetDefaultFolder(_OL_FOLDER_CALENDAR)
+        except Exception:
+            continue
+        if root is None:
+            continue
+        add(root, "mailbox")
+        walk(root, 1)
+
+    # One label per calendar, unique, which is what get_calendar(calendar=...) and the event tags use
+    used: set[str] = set()
+    default_store = next((c["store"] for c in cals if c["default"]), "")
+    for cal in cals:
+        label = cal["nav_name"] or cal["folder_name"] or "(unnamed calendar)"
+        if not cal["nav_name"] and cal["store"] and cal["store"] != default_store:
+            label = f"{cal['store']} / {label}"
+        base, n = label, 2
+        while label.casefold() in used:
+            label, n = f"{base} ({n})", n + 1
+        used.add(label.casefold())
+        cal["label"] = label
+    return cals, notes
+
+
+def _match_calendars(cals: list[dict], wanted: str) -> list[dict]:
+    """Calendars a name refers to. An exact name wins over a partial one; a mailbox name selects its calendars."""
+    q = " ".join(wanted.split()).casefold()
+    if not q:
+        return []
+
+    def names(cal):
+        return [n.casefold() for n in (cal["label"], cal["nav_name"], cal["folder_name"], cal["path"]) if n]
+
+    exact = [c for c in cals if q in names(c)]
+    if exact:
+        return exact
+    return [c for c in cals if any(q in n for n in names(c) + [c["store"].casefold()])]
+
+
+def _describe_calendars(cals: list[dict]) -> str:
+    rows = []
+    for i, cal in enumerate(cals, 1):
+        marks = "".join([" [default]" if cal["default"] else "",
+                         " [checked in Outlook]" if cal["shown"] else "",
+                         f" [UNREACHABLE: {cal['error']}]" if cal["folder"] is None else ""])
+        where = " | ".join(part for part in (f"mailbox: {cal['store']}" if cal["store"] else "",
+                                             f"path: {cal['path']}" if cal["path"] else "",
+                                             "found via: " + ", ".join(cal["sources"])) if part)
+        rows.append(f"{i}. {cal['label']}{marks}\n   {where}")
+    return "\n".join(rows)
+
+
+def _calendar_window(days_ahead: int, days_back: int):
+    now = datetime.now()
+    start_dt = (now - timedelta(days=max(0, min(days_back, 60)))).replace(hour=0, minute=0, second=0)
+    end_dt = (now + timedelta(days=max(1, min(days_ahead, 60)))).replace(hour=23, minute=59, second=59)
+    return start_dt, end_dt
+
+
+def _calendar_events(folder, start_dt, end_dt, limit: int) -> tuple[list[tuple[str, str]], int]:
+    """(start, line) for each appointment of one calendar folder that overlaps the window, and how many subjects
+    were withheld by the PHI guardrail. Raises if Outlook rejects the date filter."""
+    # Outlook only expands recurring meetings when the collection is sorted by Start *before*
+    # IncludeRecurrences is set, and the filter is applied last.
+    items = folder.Items
+    items.Sort("[Start]")
+    items.IncludeRecurrences = True
+
+    # Outlook Restrict filter uses US date format MM/DD/YYYY HH:MM AM/PM
+    start_str = start_dt.strftime("%m/%d/%Y %I:%M %p")
+    end_str = end_dt.strftime("%m/%d/%Y %I:%M %p")
+    # Overlap test, so a meeting already in progress at the start of the window is included
+    restriction = f"[End] >= '{start_str}' AND [Start] <= '{end_str}'"
+    try:
+        filtered = items.Restrict(restriction)
+    except Exception as e:
+        # Never fall back to the unfiltered collection: with recurrences expanded it has no end, and its
+        # first entries would be reported under the requested date range.
+        raise RuntimeError(f"the date filter was rejected ({e})")
+
+    events, withheld = [], 0
+    ev = filtered.GetFirst()
+    while ev is not None and len(events) < limit:
+        subj = str(_safe_prop(ev, "Subject", "(Untitled Event)")).strip()
+        start_val = str(_safe_prop(ev, "Start", ""))[:16]
+        end_val = str(_safe_prop(ev, "End", ""))[:16]
+        loc = str(_safe_prop(ev, "Location", "")).strip()
+        all_day = bool(_safe_prop(ev, "AllDayEvent", False))
+        busy_str = _BUSY_MAP.get(_safe_prop(ev, "BusyStatus", 2), "Busy")
+
+        # A shared calendar holds other people's entries; one that names PHI keeps its time and loses its text
+        if _check_phi_guardrail("calendar entry", f"{subj}\n{loc}"):
+            subj, loc, withheld = "[withheld: PHI marker in this entry]", "", withheld + 1
+
+        loc_str = f" @ {loc}" if loc else ""
+        all_day_str = " [ALL DAY]" if all_day else ""
+        events.append((start_val, f"- {start_val} to {end_val}{all_day_str} ({busy_str}): **{subj}**{loc_str}"))
+        ev = filtered.GetNext()
+    return events, withheld
+
+
+@tool("Listing Outlook calendars")
+def list_calendars() -> str:
+    """List every calendar in the user's Classic Outlook profile: their own, sub-calendars, shared mailboxes'
+    calendars, and calendars other people shared (for example a unit leave or plans calendar). Returns the
+    names to pass to `get_calendar(calendar=...)`. Names and locations only, no appointments."""
+    try:
+        gate = _dev_mode_gate("calendar names")
+        if gate:
+            return gate
+        app, ns = _get_outlook_ns()
+        cals, notes = _calendar_folders(app, ns)
+        if not cals:
+            return "Error listing Outlook calendars: none were found. " + " ".join(notes)
+        out = f"Outlook calendars ({len(cals)}):\n" + _describe_calendars(cals)
+        out += "\n\nPass a name (or part of one) as `calendar` to `get_calendar`, or \"all\" for every calendar."
+        if notes:
+            out += "\n\nNotes:\n" + "\n".join(f"- {n}" for n in notes)
+        return out
+    except Exception as e:
+        return f"Error listing Outlook calendars: {e}"
+
+
 @tool(
     "Checking Outlook Calendar",
     days_ahead="Number of days ahead from today to include (default 7).",
     days_back="Number of days in the past to include (default 0).",
+    calendar="Which calendar to read. Empty (default) is the user's own calendar. Otherwise a calendar or "
+             "mailbox name or part of one (for example \"SCXP Plans\"), or \"all\" for every calendar. "
+             "`list_calendars` shows the names.",
 )
-def get_calendar(days_ahead: int = 7, days_back: int = 0) -> str:
-    """Read the user's Classic Outlook Calendar appointments and meetings for today and upcoming/past days
-    (returns Subject, Start, End, Location, AllDayEvent, and BusyStatus)."""
+def get_calendar(days_ahead: int = 7, days_back: int = 0, calendar: str = "") -> str:
+    """Read appointments and meetings from the user's Classic Outlook calendars for today and upcoming/past days
+    (returns Subject, Start, End, Location, AllDayEvent, and BusyStatus). Reads the user's own calendar unless
+    `calendar` names a shared or additional one."""
     try:
         gate = _dev_mode_gate("calendar entries")
         if gate:
             return gate
-        _, ns = _get_outlook_ns()
-        cal_folder = ns.GetDefaultFolder(9)  # olFolderCalendar = 9
-        # Outlook only expands recurring meetings when the collection is sorted by Start *before*
-        # IncludeRecurrences is set, and the filter is applied last.
-        items = cal_folder.Items
-        items.Sort("[Start]")
-        items.IncludeRecurrences = True
+        app, ns = _get_outlook_ns()
+        start_dt, end_dt = _calendar_window(days_ahead, days_back)
+        span = f"{start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}"
+        wanted = str(calendar or "").strip()
 
-        now = datetime.now()
-        start_dt = (now - timedelta(days=max(0, min(days_back, 60)))).replace(hour=0, minute=0, second=0)
-        end_dt = (now + timedelta(days=max(1, min(days_ahead, 60)))).replace(hour=23, minute=59, second=59)
+        notes: list[str] = []  # what discovery could not search; reported only when nothing matches
+        if not wanted:
+            # The user's own calendar, without looking for any other: the common case stays one folder lookup
+            chosen = [{"folder": ns.GetDefaultFolder(_OL_FOLDER_CALENDAR), "label": "", "error": ""}]
+        else:
+            cals, notes = _calendar_folders(app, ns)
+            chosen = cals if wanted.casefold() in _ALL_CALENDARS else _match_calendars(cals, wanted)
+            if not chosen:
+                listing = _describe_calendars(cals) if cals else "(none found)"
+                return (f"Error reading Outlook Calendar: no calendar matches '{wanted}'. Available calendars:\n"
+                        f"{listing}" + ("\n\nNotes:\n" + "\n".join(f"- {n}" for n in notes) if notes else ""))
 
-        # Outlook Restrict filter uses US date format MM/DD/YYYY HH:MM AM/PM
-        start_str = start_dt.strftime("%m/%d/%Y %I:%M %p")
-        end_str = end_dt.strftime("%m/%d/%Y %I:%M %p")
-        # Overlap test, so a meeting already in progress at the start of the window is included
-        restriction = f"[End] >= '{start_str}' AND [Start] <= '{end_str}'"
+        tagged = len(chosen) > 1
+        events: list[tuple[str, str]] = []
+        failures: list[str] = []
+        withheld = 0
+        for cal in chosen:
+            name = cal["label"] or "Outlook Calendar"
+            if cal["folder"] is None:
+                failures.append(f"{name}: unreachable ({cal['error']})")
+                continue
+            try:
+                # one more than is shown, so a cut-off list can say that it was cut off
+                found, hidden = _calendar_events(cal["folder"], start_dt, end_dt, _MAX_CALENDAR_EVENTS + 1)
+            except Exception as e:  # one calendar that cannot be read must not hide the others
+                failures.append(f"{name}: {e}")
+                continue
+            withheld += hidden
+            events += [(start, f"{line} [{name}]" if tagged else line) for start, line in found]
 
-        try:
-            filtered = items.Restrict(restriction)
-        except Exception as e:
-            # Never fall back to the unfiltered collection: with recurrences expanded it has no end, and its
-            # first entries would be reported under the requested date range.
-            return f"Error reading Outlook Calendar: the date filter was rejected ({e})."
+        if failures and len(failures) == len(chosen):
+            return "Error reading Outlook Calendar: " + "; ".join(failures) + "."
 
-        events = []
-        BUSY_MAP = {0: "Free", 1: "Tentative", 2: "Busy", 3: "Out of Office", 4: "Working Elsewhere"}
+        events.sort(key=lambda pair: pair[0])  # stable, so each calendar's own order survives ties
+        truncated = len(events) > _MAX_CALENDAR_EVENTS
+        shown = events[:_MAX_CALENDAR_EVENTS]
 
-        ev = filtered.GetFirst()
-        while ev is not None and len(events) < 100:
-            subj = str(_safe_prop(ev, "Subject", "(Untitled Event)")).strip()
-            start_val = str(_safe_prop(ev, "Start", ""))[:16]
-            end_val = str(_safe_prop(ev, "End", ""))[:16]
-            loc = str(_safe_prop(ev, "Location", "")).strip()
-            all_day = bool(_safe_prop(ev, "AllDayEvent", False))
-            busy_code = _safe_prop(ev, "BusyStatus", 2)
-            busy_str = BUSY_MAP.get(busy_code, "Busy")
-
-            loc_str = f" @ {loc}" if loc else ""
-            all_day_str = " [ALL DAY]" if all_day else ""
-            events.append(f"- {start_val} to {end_val}{all_day_str} ({busy_str}): **{subj}**{loc_str}")
-            ev = filtered.GetNext()
-
-        if not events:
-            return f"No calendar events found between {start_dt.strftime('%Y-%m-%d')} and {end_dt.strftime('%Y-%m-%d')}."
-
-        header = f"Outlook Calendar ({start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}, {len(events)} events):\n"
-        return header + "\n".join(events)
+        which = ""
+        if tagged:
+            which = f" from {len(chosen)} calendars"
+        elif chosen[0]["label"]:
+            which = f" '{chosen[0]['label']}'"
+        tail = ""
+        if truncated:
+            tail += (f"\n[Showing the first {_MAX_CALENDAR_EVENTS} events. Use a shorter date range or a single "
+                     "calendar for the rest.]")
+        if withheld:
+            tail += f"\n[{withheld} entr{'y' if withheld == 1 else 'ies'} had the subject withheld: PHI is not processed.]"
+        if failures:
+            tail += "\nCould not read: " + "; ".join(failures) + "."
+        if not shown:
+            return (f"No calendar events found{which} between {start_dt.strftime('%Y-%m-%d')} and "
+                    f"{end_dt.strftime('%Y-%m-%d')}.") + tail
+        header = f"Outlook Calendar{which} ({span}, {len(shown)} events):\n"
+        return header + "\n".join(line for _, line in shown) + tail
     except Exception as e:
         return f"Error reading Outlook Calendar: {e}"
 

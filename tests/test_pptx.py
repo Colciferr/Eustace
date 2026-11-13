@@ -431,7 +431,8 @@ class BlockedLibraryTests(unittest.TestCase):
                                  lambda: cli.read_file("memo.docx")],
                 "Excel support": [lambda: cli.update_excel("book.xlsx", append_rows=[["b"]]),
                                   lambda: cli.read_file("book.xlsx")],
-                "Outlook support": [cli.list_inbox, cli.get_calendar],
+                "Outlook support": [cli.list_inbox, cli.get_calendar, cli.list_calendars,
+                                    lambda: cli.get_calendar(calendar="all")],
             }
             for feature, tools in calls.items():
                 for i, run in enumerate(tools):
