@@ -159,6 +159,15 @@ class FontFileTests(unittest.TestCase):
         private = [cp for cp in cmap if 0xE000 <= cp <= 0xF8FF]
         self.assertEqual(sorted(private), [ord(g) for g in GLYPHS])
 
+    def test_every_symbol_eustace_prints_is_in_the_font(self):
+        # Seven symbols used to be in neither Consolas nor Cascadia Mono and showed as boxes. Anything added to
+        # cli.py later has to be a character the font can draw.
+        cmap = Ttf(FONT).cmap()
+        with open(os.path.join(ROOT, "cli.py"), encoding="utf-8") as f:
+            used = {ch for ch in f.read() if ord(ch) > 126}
+        used.discard("\ufeff")  # a byte-order mark Eustace strips from files it reads; never printed
+        self.assertEqual(sorted(ch for ch in used if ord(ch) not in cmap), [])
+
     def test_the_font_and_license_are_installed_with_the_package(self):
         with open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8") as f:
             project = f.read()
@@ -611,9 +620,10 @@ class InstallTests(unittest.TestCase):
         self.assertIn("--install-font auto", setup)
         self.assertLess(setup.index("pipx install"), setup.index("--install-font auto"))
 
-    def test_the_auto_badge_uses_only_plain_characters(self):
-        self.assertTrue(cli.AUTO_BADGE.isascii(), "the arrows used before showed as boxes in the console")
-        self.assertIn("AUTO", cli.AUTO_BADGE)
+    def test_the_badges_use_only_plain_characters(self):
+        for badge, word in ((cli.AUTO_BADGE, "AUTO"), (cli.ADMIN_BADGE, "ADMIN")):
+            self.assertTrue(badge.isascii(), "the symbols used before showed as boxes in the console")
+            self.assertIn(word, badge)
 
     def test_remove_undoes_install(self):
         with self.machine() as (dest, registry, announced, printed):

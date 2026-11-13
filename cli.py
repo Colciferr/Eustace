@@ -1152,7 +1152,7 @@ class CLIApprovalHandler:
         console.print(
             Panel(
                 body,
-                title=f"[bold yellow]⚠️  Approval Required: {escape(action_title)}[/bold yellow]",
+                title=f"[bold yellow]! Approval Required: {escape(action_title)}[/bold yellow]",
                 subtitle=None if interactive else keys,
                 border_style="yellow",
                 box=box.ROUNDED,
@@ -1210,10 +1210,10 @@ class CLIApprovalHandler:
         choice = _ask_menu("Do you want to proceed?", options, allow_view=can_view)
         if choice == "tell":
             self.last_feedback = _ask_line("What should Eustace do instead? ")
-            console.print(f"  [dim]✗ Denied{': ' + escape(_sanitize_for_display(self.last_feedback)) if self.last_feedback else ''}[/dim]")
+            console.print(f"  [dim]× Denied{': ' + escape(_sanitize_for_display(self.last_feedback)) if self.last_feedback else ''}[/dim]")
             return "no"
         console.print({"yes": "  [dim green]✓ Approved[/dim green]", "all": f"  [dim green]✓ Approved, and for further {escape(self.current_tool)} calls this turn[/dim green]",
-                       "view": "", None: "  [dim]✗ Denied[/dim]"}.get(choice, ""))
+                       "view": "", None: "  [dim]× Denied[/dim]"}.get(choice, ""))
         return choice or "no"
 
 
@@ -1693,7 +1693,7 @@ def undo_last_turn() -> str | None:
     for line in done:
         console.print(f"  [green]✓ {escape(_visible_controls(line))}[/green]")
     for line in failed:
-        console.print(f"  [bold red]✗ {escape(_visible_controls(line))}[/bold red]")
+        console.print(f"  [bold red]× {escape(_visible_controls(line))}[/bold red]")
     if not done:
         return None
     return "The user ran /undo, which reverted these file changes: " + "; ".join(done) + "."
@@ -4038,7 +4038,7 @@ def _load_trusted_agent_md(path: str) -> str | None:
     console.print(
         Panel(
             escape(preview),
-            title=f"[bold yellow]⚠️  Untrusted instruction file: {escape(path)}[/bold yellow]",
+            title=f"[bold yellow]! Untrusted instruction file: {escape(path)}[/bold yellow]",
             subtitle=f"[dim]{len(raw)} bytes | sha256 {digest[:16]}... | will be loaded as system instructions[/dim]",
             border_style="yellow",
             box=box.ROUNDED,
@@ -4198,7 +4198,7 @@ def _confirm_skills(pending: list[dict]) -> list[dict]:
     console.print()
     console.print(Panel(
         escape(_visible_controls("\n".join(lines))),
-        title=f"[bold yellow]⚠️  {len(pending)} untrusted skill{'s' if len(pending) != 1 else ''}[/bold yellow]",
+        title=f"[bold yellow]! {len(pending)} untrusted skill{'s' if len(pending) != 1 else ''}[/bold yellow]",
         subtitle="[dim]a trusted skill's instructions are followed like AGENT.md; its scripts still ask before running[/dim]",
         border_style="yellow", box=box.ROUNDED, padding=(0, 1),
     ))
@@ -4767,7 +4767,7 @@ def run_agent_turn(messages: list[dict]):
             break
 
     except KeyboardInterrupt:
-        console.print("\n  [bold red]⏹ Stopped by user[/bold red]")
+        console.print("\n  [bold red]■ Stopped by user[/bold red]")
         if partial_reply:
             console.print(_render_markdown(partial_reply))
             console.print("[dim](partial reply)[/dim]")
@@ -4975,7 +4975,7 @@ def select_model_interactive(arg: str = "") -> str:
 
         for idx, (m_id, desc) in enumerate(models, start=1):
             active = " (active)" if m_id == MODEL else ""
-            mode = "⚡ Tools" if (DEV_MODE or m_id.endswith("-withtools")) else "💬 Chat only"
+            mode = "Tools" if (DEV_MODE or m_id.endswith("-withtools")) else "Chat only"
             style = "bold cyan" if m_id == MODEL else None
             tbl.add_row(str(idx), f"{escape(m_id)}{active}", mode, desc, style=style)
 
@@ -5027,7 +5027,7 @@ _UI_STYLE = {
     "menu.current": "bg:#1f3a3a #ffffff", "menu.meta": "#8f8f8f", "question": "bold", "current": "ansicyan",
     "auto": "bold ansiyellow", "admin": "bg:ansired #0c0c0c bold", "flash": "ansiyellow",
 }
-ADMIN_BADGE = " ⚠ ADMIN "
+ADMIN_BADGE = " ! ADMIN "
 AUTO_BADGE = ">> AUTO "  # plain characters: the arrows used before are in neither Consolas nor Cascadia Mono
 
 
@@ -5116,7 +5116,7 @@ def _render_diff(rows: list[tuple], width: int) -> Text:
         out.append(f"{'':>{num_w}} {set_cell_size('before', col_w)} │ {'':>{num_w}} after\n", style="dim")
         for kind, old_no, old, new_no, new in rows:
             if kind == "sep":
-                out.append(f"{'':>{num_w}} {set_cell_size('⋯', col_w)} │ {'':>{num_w}} ⋯\n", style="dim")
+                out.append(f"{'':>{num_w}} {set_cell_size('…', col_w)} │ {'':>{num_w}} …\n", style="dim")
             elif kind == "note":
                 out.append(f"{'':>{num_w}} {old}\n", style="dim")
             else:
@@ -5133,7 +5133,7 @@ def _render_diff(rows: list[tuple], width: int) -> Text:
         pad = max(width - num_w - 3, 1)
         for kind, old_no, old, new_no, new in rows:
             if kind == "sep":
-                out.append(f"{'':>{num_w}}   ⋯\n", style="dim")
+                out.append(f"{'':>{num_w}}   …\n", style="dim")
             elif kind == "note":
                 out.append(f"{'':>{num_w}}   {old}\n", style="dim")
             elif kind == "ctx":
@@ -5603,7 +5603,7 @@ def main():
     else:
         title_line = f"[bold cyan]GenAI.mil CLI — Eustace v{VERSION}[/bold cyan] ([dim]{escape(MODEL)} | {len(TOOLS)} tools[/dim])\n"
     if ELEVATED:
-        title_line += ("[bold red]⚠  Running as Administrator (elevated)[/bold red]\n"
+        title_line += ("[bold red]!  Running as Administrator (elevated)[/bold red]\n"
                        "[red]   Everything Eustace runs gets admin rights. Auto mode is off for this session.[/red]\n")
     console.print(
         Panel.fit(
