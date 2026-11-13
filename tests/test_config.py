@@ -61,6 +61,21 @@ class PersonaTests(unittest.TestCase):
         finally:
             cli.BUNDLED_PROMPT_PATH = saved
 
+    def test_the_copy_shipped_with_the_install_comes_after_both(self):
+        saved = cli.BUNDLED_PROMPT_PATH
+        try:
+            with sandbox() as (ws, home):
+                cli.BUNDLED_PROMPT_PATH = os.path.join(ws, "bundled.md")
+                os.makedirs(os.path.dirname(cli.SHIPPED_PROMPT_PATH))
+                with open(cli.SHIPPED_PROMPT_PATH, "w", encoding="utf-8") as f:
+                    f.write("shipped persona\n")
+                self.assertEqual(cli._load_persona(), "shipped persona")
+                with open(cli.BUNDLED_PROMPT_PATH, "w", encoding="utf-8") as f:
+                    f.write("bundled persona\n")
+                self.assertEqual(cli._load_persona(), "bundled persona")
+        finally:
+            cli.BUNDLED_PROMPT_PATH = saved
+
     def test_repo_ships_a_persona_file(self):
         self.assertTrue(os.path.isfile(cli.BUNDLED_PROMPT_PATH))
 
