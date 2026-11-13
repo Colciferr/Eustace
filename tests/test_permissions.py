@@ -91,6 +91,8 @@ class ShellDenyListTests(unittest.TestCase):
         "[Activator]::CreateInstance([type]::GetTypeFromProgID($n))",
         "[Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')",
         "[Microsoft.VisualBasic.Interaction]::CreateObject($n)", "Get-Process | % { 'Outlook.Application' }",
+        # Eustace replacing its own code is the user's call
+        "eustace --update", "eustace.exe --update shared-calendars", "python -m cli --post-update 1.6.0 -",
     ]
     ALLOWED = [
         "git status", "git log --oneline -5", "git diff", "pytest -q", "python -m unittest discover -s tests",
@@ -104,6 +106,7 @@ class ShellDenyListTests(unittest.TestCase):
         "New-Object System.Text.StringBuilder", "New-Object PSObject -Property @{ a = 1 }",
         "(New-Object System.Collections.ArrayList) -contains 3", "Get-Content outlook-notes.txt",
         "Get-Process outlook", "Get-ChildItem -Recurse -Filter *.com",
+        "eustace --version", "Get-Content update.log", "git remote update-ref",
     ]
 
     def setUp(self):

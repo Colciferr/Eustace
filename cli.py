@@ -47,22 +47,244 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# --- Self-update (eustace --update) ---
+# Defined and handled before anything below is configured, so an update still works when the config, the API key
+# or a dependency is broken. Nothing here is a model tool.
+UPDATE_REPO_URL = "https://github.com/Colciferr/eustace.git"
+UPDATE_DEFAULT_REF = "main"
+_DIST_NAME = "genai-cli"  # the name in pyproject.toml
+# system_prompt.md as installed with this version (pyproject.toml data-files). setup.ps1 copies the persona to
+# ~/.eustace once; this copy is what a later update compares that one against.
+SHIPPED_PROMPT_PATH = os.path.join(sys.prefix, "share", "eustace", "system_prompt.md")
+_UPDATE_HOME = os.path.join(os.path.expanduser("~"), ".eustace")
+_UPDATE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}")
+
+# Runs in its own console window after this process has exited: Windows will not replace eustace.exe while it
+# is running. argv: pid to wait for, pip requirement, old version, hash of the old shipped persona.
+_UPDATE_HELPER = r"""
+import ctypes, datetime, os, subprocess, sys, time
+pid, spec, old_version, old_hash = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+try:
+    k32 = ctypes.windll.kernel32
+    handle = k32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if handle:
+        k32.WaitForSingleObject(handle, 60000)
+        k32.CloseHandle(handle)
+except Exception:
+    pass
+time.sleep(1)
+os.environ.setdefault("PIP_DEFAULT_TIMEOUT", "180")  # the same patience setup.ps1 gives slow, scanned networks
+os.environ.setdefault("PIP_RETRIES", "10")
+print("== Eustace update ==")
+print("Installing", spec)
+pip = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check"]
+# 1. anything this version newly depends on, while the working install is still in place
+# 2. Eustace itself. pip leaves a package alone when its version number is unchanged, even for a newer commit,
+#    so the reinstall is forced (and limited to Eustace by --no-deps).
+code = 1
+for step in (pip + [spec], pip + ["--upgrade", "--force-reinstall", "--no-deps", spec]):
+    for attempt in range(3):
+        code = subprocess.call(step)
+        if code == 0:
+            break
+        time.sleep(3)
+    if code != 0:
+        break
+try:
+    with open(os.path.join(os.getcwd(), "update.log"), "a", encoding="utf-8") as log:
+        log.write("%s %s exit=%d\n" % (datetime.datetime.now().isoformat(timespec="seconds"), spec, code))
+except OSError:
+    pass
+if code == 0:
+    subprocess.call([sys.executable, "-m", "cli", "--post-update", old_version, old_hash])
+else:
+    print()
+    print("[!!] The update did not install. Eustace v%s is still in place." % old_version)
+    print("     Close every other Eustace window and run  eustace --update  again.")
+    print("     If the error above is a timeout, run it again: finished downloads are cached.")
+if not os.environ.get("EUSTACE_UPDATE_NO_PAUSE"):
+    try:
+        input("\nPress Enter to close this window.")
+    except EOFError:
+        pass
+sys.exit(code)
+"""
+
+
+def _installed_commit() -> str:
+    """The git commit this install was built from, or "" (installed from a folder, or run from a checkout)."""
+    try:
+        import importlib.metadata
+        info = json.loads(importlib.metadata.distribution(_DIST_NAME).read_text("direct_url.json") or "{}")
+        return str(info.get("vcs_info", {}).get("commit_id") or "")
+    except Exception:
+        return ""
+
+
+def _git_exe() -> str | None:
+    """git.exe from an absolute PATH folder. Windows looks in the current folder before PATH when a program is
+    started by bare name, and the current folder is whatever project Eustace was opened in."""
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        folder = folder.strip().strip('"')
+        if folder and os.path.isabs(folder):
+            for name in ("git.exe", "git"):
+                candidate = os.path.join(folder, name)
+                if os.path.isfile(candidate):
+                    return candidate
+    return None
+
+
+def _resolve_update_ref(ref: str) -> tuple[str, str]:
+    """(commit, description) for a branch, tag or full commit hash in the Eustace repository; RuntimeError
+    with a message for the user otherwise."""
+    if not _UPDATE_REF_RE.fullmatch(ref) or ".." in ref:
+        raise RuntimeError(f"'{ref}' is not a branch, tag or commit name.")
+    git = _git_exe()
+    if not git:
+        raise RuntimeError("git was not found on PATH. Install Git for Windows, or update by downloading the "
+                           "repository and running setup.ps1.")
+    try:
+        out = subprocess.run([git, "ls-remote", UPDATE_REPO_URL, f"refs/heads/{ref}", f"refs/tags/{ref}",
+                              f"refs/tags/{ref}^{{}}"], capture_output=True, text=True, timeout=60,
+                             cwd=os.path.dirname(git), stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{UPDATE_REPO_URL} did not answer within 60 seconds.")
+    except OSError as e:
+        raise RuntimeError(f"git could not be started ({e}).")
+    if out.returncode != 0:
+        reason = (out.stderr or "").strip().splitlines()[-1:] or ["no details"]
+        raise RuntimeError(f"could not reach {UPDATE_REPO_URL} ({reason[0]}).")
+    found = {}
+    for line in out.stdout.splitlines():
+        commit, _, name = line.partition("\t")
+        if re.fullmatch(r"[0-9a-f]{40}", commit) and name:
+            found[name.strip()] = commit
+    # an annotated tag lists its own object and, with ^{}, the commit it points at: the commit is the one to use
+    for name, kind in ((f"refs/heads/{ref}", "branch"), (f"refs/tags/{ref}^{{}}", "tag"), (f"refs/tags/{ref}", "tag")):
+        if name in found:
+            return found[name], f"{kind} {ref}"
+    if re.fullmatch(r"[0-9a-f]{40}", ref):
+        return ref, "commit"
+    raise RuntimeError(f"there is no branch or tag named '{ref}' in {UPDATE_REPO_URL}.")
+
+
+def _persona_text(path: str) -> str | None:
+    """A persona file's text with line endings and the BOM normalized, or None when it cannot be read."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return "\n".join(f.read().splitlines()).strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _persona_hash(text: str | None) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest() if text is not None else "-"
+
+
+def _self_update(args: list[str]) -> int:
+    """eustace --update [branch|tag|commit]: installs that commit of the repository over this install. Returns
+    the exit code."""
+    ref = args[0] if args else UPDATE_DEFAULT_REF
+    try:
+        commit, what = _resolve_update_ref(ref)
+    except RuntimeError as e:
+        print(f"Update failed: {e}")
+        return 1
+    have = _installed_commit()
+    print(f"Installed: Eustace v{VERSION} " + (f"(commit {have[:7]})" if have else "(installed from a folder; commit unknown)"))
+    print(f"Available: {what} at commit {commit[:7]}")
+    if have == commit:
+        print("Already up to date.")
+        return 0
+    os.makedirs(_UPDATE_HOME, exist_ok=True)
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c", _UPDATE_HELPER, str(os.getpid()), f"git+{UPDATE_REPO_URL}@{commit}", VERSION,
+             _persona_hash(_persona_text(SHIPPED_PROMPT_PATH))],
+            cwd=_UPDATE_HOME,  # not the project folder: pip starts git by bare name (see _git_exe)
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0), close_fds=True)
+    except OSError as e:
+        print(f"Update failed: the installer could not be started ({e}).")
+        return 1
+    print("Updating in a new window. Close any other Eustace windows, and start Eustace again when it finishes.")
+    return 0
+
+
+def _post_update(args: list[str]) -> int:
+    """Run by the update window with the new version: reports it, and offers the new system_prompt.md when this
+    version ships a different one. The user's copy in ~/.eustace is never replaced without a yes, unless it is
+    the previous version's copy with no changes of the user's own."""
+    old_version, old_shipped_hash = (list(args) + ["", "-"])[:2]
+    commit = _installed_commit()
+    at = f" (commit {commit[:7]})" if commit else ""
+    if old_version and old_version != VERSION:
+        print(f"\n[ok] Eustace updated: v{old_version} -> v{VERSION}{at}")
+    else:
+        print(f"\n[ok] Eustace v{VERSION} is now at the newest commit{at}")
+
+    mine_path = os.path.join(_UPDATE_HOME, "system_prompt.md")
+    mine, shipped = _persona_text(mine_path), _persona_text(SHIPPED_PROMPT_PATH)
+    if mine is None or shipped is None or mine == shipped or _persona_hash(shipped) == old_shipped_hash:
+        return 0  # no persona of the user's, nothing shipped, already the same, or unchanged by this update
+
+    def replace() -> bool:
+        try:
+            shutil.copyfile(SHIPPED_PROMPT_PATH, mine_path)
+            return True
+        except OSError as e:
+            print(f"[!!] Could not write {mine_path} ({e}).")
+            return False
+
+    if _persona_hash(mine) == old_shipped_hash:
+        if replace():
+            print(f"[ok] system_prompt.md updated to this version's (yours had no changes of your own): {mine_path}")
+        return 0
+
+    print(f"\nThis version ships a different system_prompt.md than yours ({mine_path}).")
+    print("Lines starting with - are only in yours; lines starting with + are only in the new one:\n")
+    for line in difflib.unified_diff(mine.splitlines(), shipped.splitlines(), "yours", "new", lineterm="", n=1):
+        print("  " + line)
+    try:
+        answer = input("\nReplace yours with the new one? Yours is kept as system_prompt.md.bak. [y/N] ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() in ("y", "yes"):
+        try:
+            shutil.copyfile(mine_path, mine_path + ".bak")
+        except OSError as e:
+            print(f"[!!] Could not write the backup ({e}); your file was left alone.")
+            return 0
+        if replace():
+            print("[ok] Replaced. Your previous file is system_prompt.md.bak.")
+    else:
+        print("Kept yours. The new one is at " + SHIPPED_PROMPT_PATH)
+    return 0
+
+
 # --- Command-line flags (read before any path or client is derived from them) ---
 _ARGS = sys.argv[1:]
 if "--help" in _ARGS or "-h" in _ARGS:
     print(
-        "usage: eustace [--auto] [--devmode] [--version]\n\n"
+        "usage: eustace [--auto] [--devmode] [--version] [--update [BRANCH|TAG|COMMIT]]\n\n"
         "  --auto      Start in auto mode: file reads, file writes and shell commands run without asking,\n"
         "              except shell commands on the deny-list. Shift+Tab or /auto switches it off.\n"
         "              Ignored when Eustace runs as Administrator (elevated).\n"
         "  --devmode   Use the PUBLIC Google Gemini API (GEMINI_API_KEY, config in ~/.eustace-dev)\n"
         "              for functional testing off DODIN. Synthetic test data only; never CUI/PII/PHI.\n"
         "  --version   Print the version and exit.\n"
+        "  --update    Install the newest commit on the main branch of the Eustace repository over this\n"
+        "              install, in a new window. Name a branch, tag or full commit hash to get that instead:\n"
+        "              eustace --update v1.5.0\n"
     )
     raise SystemExit(0)
 if "--version" in _ARGS:
     print(f"Eustace v{VERSION}")
     raise SystemExit(0)
+if "--post-update" in _ARGS:  # run by the update window, with the version it just installed
+    raise SystemExit(_post_update(_ARGS[_ARGS.index("--post-update") + 1:]))
+if "--update" in _ARGS:
+    _rest = _ARGS[_ARGS.index("--update") + 1:]
+    raise SystemExit(_self_update(_rest[:1] if _rest and not _rest[0].startswith("-") else []))
 DEV_MODE = "--devmode" in _ARGS
 START_IN_AUTO_MODE = "--auto" in _ARGS
 
@@ -940,7 +1162,7 @@ SHELL_DENY_PATTERNS: tuple[tuple[str, str], ...] = (
     (_alias("npx|pnpx|pipx|winget|choco|scoop|nuget") + r"|" + _alias(r"npm|pnpm|yarn") + r"\s+(install|i|ci|add|exec|x|"
      r"dlx|update|up|upgrade)\b|" + _alias(r"pip[0-9.]*") + r"\s+(install|download)\b|(?<![\w-])-m\s+(pip|ensurepip)\b|"
      + _alias("uv") + r"\s+(pip|tool|add|run)\b|(install|save|update)-(module|package|script|psresource)|"
-     r"dotnet\s+tool\s+install|git\s+clone", "installs or downloads software"),
+     r"dotnet\s+tool\s+install|git\s+clone|(?<![\w-])--(post-)?update(?![\w-])", "installs or downloads software"),
     (_alias(r"python[0-9.]*|pythonw|py|node") + r"[\"']?(\s+-[XW]\s*\S+|\s+-[\w.:-]+)*?\s+(-c|-e|-p|--eval|--print|-)"
      r"(?=\s|$|[\"'])", "runs inline code"),
     (r"(?<![\w-])-e(c|n|nc|ncodedcommand)?\s|frombase64string|invoke-expression|" + _alias("iex") + r"|\[scriptblock\]|"
@@ -3529,7 +3751,7 @@ FALLBACK_SYSTEM_PROMPT = (
 
 
 def _load_persona() -> str:
-    for path in (GLOBAL_PROMPT_PATH, BUNDLED_PROMPT_PATH):
+    for path in (GLOBAL_PROMPT_PATH, BUNDLED_PROMPT_PATH, SHIPPED_PROMPT_PATH):
         try:
             with open(path, "r", encoding="utf-8-sig") as f:
                 text = f.read().strip()
