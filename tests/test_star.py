@@ -293,7 +293,8 @@ class WhenTheStarShowsTests(unittest.TestCase):
                     style, char = cli._prompt_marker()[0]
                     self.assertEqual((style, char), (f"class:star-{color}", cli.STAR_IDLE))
                     self.assertEqual(cli._UI_STYLE[style.split(":")[1]], f"ansi{color}")
-                    self.assertEqual(sum(cell_len(t) for _, t in cli._prompt_marker()), 2)
+                    # the ">" stays, in its own style, directly in front of what is typed
+                    self.assertEqual(cli._prompt_marker()[1:], [("", " "), ("class:prompt", "> ")])
         finally:
             cli.DEV_MODE = saved
 
@@ -303,21 +304,27 @@ class WhenTheStarShowsTests(unittest.TestCase):
 
 
 class PromptTests(unittest.TestCase):
-    def test_the_sent_message_is_left_in_the_transcript_behind_a_star(self):
+    def test_the_sent_message_stays_in_the_transcript_behind_the_arrow_alone(self):
         with star_font() as pipe:
             pipe.send_text("what changed?" + ENTER)
             self.assertEqual(cli._read_user_input([{"role": "system", "content": "s"}]), "what changed?")
-            self.assertIn(f"{cli.STAR_IDLE} what changed?", output())
-            self.assertNotIn("> what changed?", output())
+            self.assertTrue(cli._STAR["on"])
+            self.assertIn("> what changed?", output())
+            self.assertFalse(any(g in output() for g in GLYPHS), "the star rests in the input box, not the transcript")
 
     def test_a_font_change_is_noticed_at_the_next_prompt(self):
         with star_font() as pipe:
             pipe.send_text("one" + ENTER + "two" + ENTER)
             cli._read_user_input([])
+            self.assertEqual(len(cli._prompt_marker()), 3)
             cli._console_font_face = lambda: "Consolas"
             cli._read_user_input([])
-            self.assertIn(f"{cli.STAR_IDLE} one", output())
-            self.assertIn("> two", output())
+            self.assertEqual(cli._prompt_marker(), [("class:prompt", "> ")])
+
+    def test_later_lines_of_a_message_line_up_under_the_first(self):
+        with star_font() as pipe:
+            pipe.send_text("one\x1b\rtwo" + ENTER)  # Alt+Enter adds a line
+            self.assertEqual(cli._read_user_input([]), "one\ntwo")
 
     def test_status_says_whether_the_star_is_on_and_why(self):
         with star_font():

@@ -4444,7 +4444,7 @@ def _ran_tool_calls(messages: list[dict], turn_start: int) -> list[str]:
     return lines
 
 
-# --- The star: prompt marker and "Thinking..." animation, drawn with glyphs only the Eustace Mono font has ---
+# --- The star: beside the prompt's ">" when idle, and the "Thinking..." animation, drawn with glyphs only the Eustace Mono font has ---
 # glyph = STAR_BASE + width index * len(STAR_HEIGHTS) + height index. These three constants are repeated in
 # tools/build_star_font.py, which draws the glyphs; tests/test_star.py holds the two copies and the font together.
 STAR_BASE = 0xE900
@@ -4541,8 +4541,10 @@ def _star_reason() -> tuple[bool, str]:
 
 
 def _prompt_marker() -> list[tuple[str, str]]:
-    """The two cells in front of the first line of the input box: the star when its font is in use, else '> '."""
-    return [(f"class:star-{_accent()}", STAR_IDLE), ("", " ")] if _STAR["on"] else [("class:prompt", "> ")]
+    """What stands in front of the first line of the input box: '> ', with the resting star before it when
+    the star's font is in use."""
+    arrow = [("class:prompt", "> ")]
+    return [(f"class:star-{_accent()}", STAR_IDLE), ("", " ")] + arrow if _STAR["on"] else arrow
 
 
 def _refresh_star() -> bool:
@@ -5303,7 +5305,8 @@ def _prompt_box(status_left: str, status_right: str) -> str:
         buf.delete() if buf.text else event.app.exit(exception=EOFError())
 
     def line_prefix(lineno, wrap_count):
-        return _prompt_marker() if lineno == 0 and wrap_count == 0 else [("", "  ")]
+        marker = _prompt_marker()
+        return marker if lineno == 0 and wrap_count == 0 else [("", " " * sum(cell_len(t) for _, t in marker))]
 
     def status():
         # The right side (token estimate) always stays visible; a long folder path loses its beginning instead
@@ -5373,8 +5376,7 @@ def _read_user_input(messages: list[dict]) -> str:
     console.print()
     text = _prompt_box(left, f"~{_short_count(_estimate_tokens(messages))} tokens")
     # The box erases itself; leave the message in the transcript the way a plain prompt would
-    marker = f"[{_accent()}]{STAR_IDLE}[/]" if _STAR["on"] else "[bold cyan]>[/bold cyan]"
-    console.print(f"{marker} " + escape(_sanitize_for_display(text)).replace("\n", "\n  "))
+    console.print("[bold cyan]>[/bold cyan] " + escape(_sanitize_for_display(text)).replace("\n", "\n  "))
     return text
 
 
