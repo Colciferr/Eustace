@@ -1,4 +1,4 @@
-"""The star: the font that carries it, the prompt marker, the thinking animation, and installing the font."""
+"""The star: the font that carries it, the thinking animation, and installing the font."""
 import contextlib
 import importlib.util
 import io
@@ -281,50 +281,38 @@ class WhenTheStarShowsTests(unittest.TestCase):
             k32.GetConsoleWindow.side_effect = OSError("no console")
             self.assertEqual(cli._console_window_class(), "")
 
-    def test_the_marker_follows_the_banner_color(self):
+    def test_the_accent_is_the_banner_border_color(self):
         saved = cli.DEV_MODE
         try:
-            with star_font():
-                cli._refresh_star()
+            with sandbox():
                 for elevated, dev, color in ((False, False, "cyan"), (False, True, "yellow"), (True, False, "red"),
-                                              (True, True, "red")):
+                                             (True, True, "red")):
                     cli.ELEVATED, cli.DEV_MODE = elevated, dev
                     self.assertEqual(cli._accent(), color)
-                    style, char = cli._prompt_marker()[0]
-                    self.assertEqual((style, char), (f"class:star-{color}", cli.STAR_IDLE))
-                    self.assertEqual(cli._UI_STYLE[style.split(":")[1]], f"ansi{color}")
-                    # the ">" stays, in its own style, directly in front of what is typed
-                    self.assertEqual(cli._prompt_marker()[1:], [("", " "), ("class:prompt", "> ")])
         finally:
             cli.DEV_MODE = saved
 
-    def test_without_the_star_the_marker_is_what_it_always_was(self):
-        with sandbox():
-            self.assertEqual(cli._prompt_marker(), [("class:prompt", "> ")])
-
 
 class PromptTests(unittest.TestCase):
-    def test_the_sent_message_stays_in_the_transcript_behind_the_arrow_alone(self):
+    def test_the_prompt_and_the_transcript_keep_the_arrow_and_never_show_the_star(self):
+        import inspect
+        self.assertIn('[("class:prompt", "> ")]', inspect.getsource(cli._prompt_box))
+        self.assertFalse(any(name.startswith("star") for name in cli._UI_STYLE))
         with star_font() as pipe:
             pipe.send_text("what changed?" + ENTER)
             self.assertEqual(cli._read_user_input([{"role": "system", "content": "s"}]), "what changed?")
             self.assertTrue(cli._STAR["on"])
             self.assertIn("> what changed?", output())
-            self.assertFalse(any(g in output() for g in GLYPHS), "the star rests in the input box, not the transcript")
+            self.assertFalse(any(g in output() for g in GLYPHS))
 
-    def test_a_font_change_is_noticed_at_the_next_prompt(self):
+    def test_a_font_change_is_noticed_at_the_next_message(self):
         with star_font() as pipe:
             pipe.send_text("one" + ENTER + "two" + ENTER)
             cli._read_user_input([])
-            self.assertEqual(len(cli._prompt_marker()), 3)
+            self.assertTrue(cli._STAR["on"])
             cli._console_font_face = lambda: "Consolas"
             cli._read_user_input([])
-            self.assertEqual(cli._prompt_marker(), [("class:prompt", "> ")])
-
-    def test_later_lines_of_a_message_line_up_under_the_first(self):
-        with star_font() as pipe:
-            pipe.send_text("one\x1b\rtwo" + ENTER)  # Alt+Enter adds a line
-            self.assertEqual(cli._read_user_input([]), "one\ntwo")
+            self.assertFalse(cli._STAR["on"])
 
     def test_status_says_whether_the_star_is_on_and_why(self):
         with star_font():

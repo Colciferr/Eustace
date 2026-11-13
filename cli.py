@@ -264,7 +264,7 @@ def _post_update(args: list[str]) -> int:
 
 
 # --- The star font (eustace --install-font / --remove-font) ---
-# The star in the prompt and on the "Thinking..." line is drawn with sixteen glyphs that only this font has: a
+# The star on the "Thinking..." line is drawn with sixteen glyphs that only this font has: a
 # console cell shows one character, and no standard character can turn or move inside its cell. The font is
 # Cascadia Mono plus those glyphs (tools/build_star_font.py, license in fonts/OFL.txt). Installing it is the
 # user's choice and needs no admin rights; without it Eustace looks exactly as it did before.
@@ -392,7 +392,7 @@ if "--help" in _ARGS or "-h" in _ARGS:
         "              install, in a new window. Name a branch, tag or full commit hash to get that instead:\n"
         "              eustace --update v1.5.0\n"
         "  --install-font  Install the Eustace Mono font for your account (no admin rights). With it as the\n"
-        "              window's font, the prompt marker becomes a star that spins while Eustace is thinking.\n"
+        "              window's font, a star spins and bounces in front of \"Thinking...\" while Eustace works.\n"
         "  --remove-font   Remove that font again.\n"
     )
     raise SystemExit(0)
@@ -4444,7 +4444,7 @@ def _ran_tool_calls(messages: list[dict], turn_start: int) -> list[str]:
     return lines
 
 
-# --- The star: beside the prompt's ">" when idle, and the "Thinking..." animation, drawn with glyphs only the Eustace Mono font has ---
+# --- The star: the "Thinking..." animation, drawn with glyphs only the Eustace Mono font has ---
 # glyph = STAR_BASE + width index * len(STAR_HEIGHTS) + height index. These three constants are repeated in
 # tools/build_star_font.py, which draws the glyphs; tests/test_star.py holds the two copies and the font together.
 STAR_BASE = 0xE900
@@ -4522,7 +4522,7 @@ def _console_is_hosted() -> bool:
 
 
 def _star_reason() -> tuple[bool, str]:
-    """(whether the star can be shown, why), decided fresh so a font change takes effect at the next prompt."""
+    """(whether the star can be shown, why), decided fresh so a font change takes effect at the next message."""
     mode = get_star_mode()
     if mode == "off":
         return False, 'switched off ("star": "off" in config.json)'
@@ -4538,13 +4538,6 @@ def _star_reason() -> tuple[bool, str]:
         return True, f"this window's font is {STAR_FONT_FAMILY}"
     return False, (f"this window's font is {face or 'unknown'}; run  eustace --install-font  once, then pick "
                    f"{STAR_FONT_FAMILY} under Properties > Font")
-
-
-def _prompt_marker() -> list[tuple[str, str]]:
-    """What stands in front of the first line of the input box: '> ', with the resting star before it when
-    the star's font is in use."""
-    arrow = [("class:prompt", "> ")]
-    return [(f"class:star-{_accent()}", STAR_IDLE), ("", " ")] + arrow if _STAR["on"] else arrow
 
 
 def _refresh_star() -> bool:
@@ -5008,7 +5001,6 @@ _UI_STYLE = {
     "frame.border": "#6a6a6a", "prompt": "bold ansicyan", "status": "#8f8f8f",
     "menu.current": "bg:#1f3a3a #ffffff", "menu.meta": "#8f8f8f", "question": "bold", "current": "ansicyan",
     "auto": "bold ansiyellow", "admin": "bg:ansired #0c0c0c bold", "flash": "ansiyellow",
-    "star-cyan": "ansicyan", "star-yellow": "ansiyellow", "star-red": "ansired",
 }
 ADMIN_BADGE = " ⚠ ADMIN "
 AUTO_BADGE = "⏵⏵ AUTO "
@@ -5305,8 +5297,7 @@ def _prompt_box(status_left: str, status_right: str) -> str:
         buf.delete() if buf.text else event.app.exit(exception=EOFError())
 
     def line_prefix(lineno, wrap_count):
-        marker = _prompt_marker()
-        return marker if lineno == 0 and wrap_count == 0 else [("", " " * sum(cell_len(t) for _, t in marker))]
+        return [("class:prompt", "> ")] if lineno == 0 and wrap_count == 0 else [("", "  ")]
 
     def status():
         # The right side (token estimate) always stays visible; a long folder path loses its beginning instead

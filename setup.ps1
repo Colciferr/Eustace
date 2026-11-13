@@ -135,4 +135,4 @@ if (-not (Test-Path $prompt)) {
 Write-Host ""
 Write-Host "Done. Open a NEW terminal and run:  eustace" -ForegroundColor Green
 Write-Host "It will ask for your GenAI.mil API key on first run and save it to $cfg\.env"
-Write-Host "Optional: eustace --install-font adds the font for the star prompt marker (your account only, no admin rights)."
+Write-Host "Optional: eustace --install-font adds the font for the star on the Thinking line (your account only, no admin rights)."
