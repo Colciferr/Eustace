@@ -163,6 +163,11 @@ class SelfUpdateTests(unittest.TestCase):
             self.assertIn("installed from a folder", p.out.getvalue())
             self.assertIn("tag v1.5.0", p.out.getvalue())
 
+    def test_a_commit_hash_is_reported_plainly(self):
+        with _patched() as p:
+            cli._self_update(["a" * 40])
+            self.assertIn("Available: commit aaaaaaa\n", p.out.getvalue())
+
     def test_a_name_that_cannot_be_resolved_fails_without_installing(self):
         with _patched() as p:
             self.assertEqual(cli._self_update(["nope"]), 1)

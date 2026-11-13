@@ -192,7 +192,7 @@ def _self_update(args: list[str]) -> int:
         return 1
     have = _installed_commit()
     print(f"Installed: Eustace v{VERSION} " + (f"(commit {have[:7]})" if have else "(installed from a folder; commit unknown)"))
-    print(f"Available: {what} at commit {commit[:7]}")
+    print(f"Available: {what} at commit {commit[:7]}" if what != "commit" else f"Available: commit {commit[:7]}")
     if have == commit:
         print("Already up to date.")
         return 0
