@@ -93,6 +93,8 @@ class ShellDenyListTests(unittest.TestCase):
         "[Microsoft.VisualBasic.Interaction]::CreateObject($n)", "Get-Process | % { 'Outlook.Application' }",
         # Eustace replacing its own code is the user's call
         "eustace --update", "eustace.exe --update shared-calendars", "python -m cli --post-update 1.6.0 -",
+        # installing a font writes to the user's registry hive and font folder
+        "eustace --install-font", "eustace.exe --remove-font", "python -m cli --install-font",
     ]
     ALLOWED = [
         "git status", "git log --oneline -5", "git diff", "pytest -q", "python -m unittest discover -s tests",
@@ -107,6 +109,7 @@ class ShellDenyListTests(unittest.TestCase):
         "(New-Object System.Collections.ArrayList) -contains 3", "Get-Content outlook-notes.txt",
         "Get-Process outlook", "Get-ChildItem -Recurse -Filter *.com",
         "eustace --version", "Get-Content update.log", "git remote update-ref",
+        "Get-Content install-font.log", "Get-ChildItem fonts", "eustace --install-fonts",
     ]
 
     def setUp(self):

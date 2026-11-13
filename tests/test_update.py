@@ -330,7 +330,7 @@ class ShippedPersonaTests(unittest.TestCase):
     def test_pyproject_ships_the_persona_where_the_code_looks_for_it(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as f:
-            self.assertIn('"share/eustace" = ["system_prompt.md"]', f.read())
+            self.assertIn('"share/eustace" = ["system_prompt.md", ', f.read())  # the star font follows it
         self.assertEqual(cli.SHIPPED_PROMPT_PATH, os.path.join(sys.prefix, "share", "eustace", "system_prompt.md"))
 
     def test_the_distribution_name_matches_pyproject(self):

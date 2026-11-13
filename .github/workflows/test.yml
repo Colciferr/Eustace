@@ -70,6 +70,23 @@ jobs:
           $again = (eustace --update $env:GITHUB_SHA) -join "`n"
           $again
           if ($again -notmatch "Already up to date") { exit 1 }
+      - name: eustace --install-font installs the shipped font for this user, and --remove-font removes it
+        shell: powershell
+        run: |
+          $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
+          eustace --install-font
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $file = "$env:LOCALAPPDATA\Microsoft\Windows\Fonts\EustaceMono-Regular.ttf"
+          if (-not (Test-Path $file)) { Write-Host "The font file was not copied."; exit 1 }
+          $key = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Fonts"
+          $registered = (Get-ItemProperty $key)."Eustace Mono (TrueType)"
+          if ($registered -ne $file) { Write-Host "Registered as '$registered'"; exit 1 }
+          Add-Type -AssemblyName System.Drawing
+          $families = (New-Object System.Drawing.Text.InstalledFontCollection).Families | ForEach-Object { $_.Name }
+          if ($families -notcontains "Eustace Mono") { Write-Host "Windows does not list the font."; exit 1 }
+          eustace --remove-font
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if ((Get-ItemProperty $key).PSObject.Properties.Name -contains "Eustace Mono (TrueType)") { exit 1 }
       - name: Report which Python the install used
         shell: powershell
         run: |
