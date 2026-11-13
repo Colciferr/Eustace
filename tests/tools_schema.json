@@ -444,8 +444,20 @@
   {
     "type": "function",
     "function": {
+      "name": "list_calendars",
+      "description": "List every calendar in the user's Classic Outlook profile: their own, sub-calendars, shared mailboxes' calendars, and calendars other people shared (for example a unit leave or plans calendar). Returns the names to pass to `get_calendar(calendar=...)`. Names and locations only, no appointments.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "get_calendar",
-      "description": "Read the user's Classic Outlook Calendar appointments and meetings for today and upcoming/past days (returns Subject, Start, End, Location, AllDayEvent, and BusyStatus).",
+      "description": "Read appointments and meetings from the user's Classic Outlook calendars for today and upcoming/past days (returns Subject, Start, End, Location, AllDayEvent, and BusyStatus). Reads the user's own calendar unless `calendar` names a shared or additional one.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -456,6 +468,10 @@
           "days_back": {
             "type": "integer",
             "description": "Number of days in the past to include (default 0)."
+          },
+          "calendar": {
+            "type": "string",
+            "description": "Which calendar to read. Empty (default) is the user's own calendar. Otherwise a calendar or mailbox name or part of one (for example \"SCXP Plans\"), or \"all\" for every calendar. `list_calendars` shows the names."
           }
         },
         "required": []

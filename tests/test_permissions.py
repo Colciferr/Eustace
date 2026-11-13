@@ -84,6 +84,15 @@ class ShellDenyListTests(unittest.TestCase):
         "C:\\Windows\\System32\\curl.exe http://x", "C:\\Python314\\python.exe -c 1",
         "& \"C:\\Program Files\\Python314\\python.exe\" -c \"1\"", ".\\node_modules\\.bin\\npx foo",
         "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command x", "/usr/bin/curl x",
+        # COM drives Outlook and Office directly, past the Outlook tools' own approvals
+        "$ol = New-Object -ComObject Outlook.Application", "new-object -com outlook.application",
+        "New-Object -c ('Out'+'look.Appli'+'cation')", "New-Object -ComObject:Excel.Application",
+        "New-Object -Strict -ComO $name", "$p = @{ComObject = $n}; New-Object @p",
+        "[Activator]::CreateInstance([type]::GetTypeFromProgID($n))",
+        "[Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')",
+        "[Microsoft.VisualBasic.Interaction]::CreateObject($n)", "Get-Process | % { 'Outlook.Application' }",
+        # Eustace replacing its own code is the user's call
+        "eustace --update", "eustace.exe --update shared-calendars", "python -m cli --post-update 1.6.0 -",
     ]
     ALLOWED = [
         "git status", "git log --oneline -5", "git diff", "pytest -q", "python -m unittest discover -s tests",
@@ -94,6 +103,10 @@ class ShellDenyListTests(unittest.TestCase):
         "py -3 build.py", "git pull", "git fetch origin", "node app.js", "Get-Content C:\\logs\\curl-output.txt",
         "Get-ChildItem C:\\tools\\rm\\x.txt", "Copy-Item .\\del\\a.txt b", "Get-Content docs/node.md",
         "python .\\tools\\py_helper.py",
+        "New-Object System.Text.StringBuilder", "New-Object PSObject -Property @{ a = 1 }",
+        "(New-Object System.Collections.ArrayList) -contains 3", "Get-Content outlook-notes.txt",
+        "Get-Process outlook", "Get-ChildItem -Recurse -Filter *.com",
+        "eustace --version", "Get-Content update.log", "git remote update-ref",
     ]
 
     def setUp(self):

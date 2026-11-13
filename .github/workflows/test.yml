@@ -50,6 +50,26 @@ jobs:
         run: |
           $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
           eustace --version
+      - name: eustace --update replaces the folder install with this commit
+        shell: powershell
+        env:
+          EUSTACE_UPDATE_NO_PAUSE: "1"   # the update window normally waits for Enter before closing
+        run: |
+          $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
+          eustace --update $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $log = "$env:USERPROFILE\.eustace\update.log"
+          for ($i = 0; $i -lt 120 -and -not (Test-Path $log); $i++) { Start-Sleep -Seconds 5 }
+          if (-not (Test-Path $log)) { Write-Host "The update window never finished."; exit 1 }
+          Get-Content $log
+          if (-not (Select-String -Path $log -Pattern "exit=0" -Quiet)) { exit 1 }
+          Start-Sleep -Seconds 10
+          eustace --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # the install now knows which commit it came from, so asking again installs nothing
+          $again = (eustace --update $env:GITHUB_SHA) -join "`n"
+          $again
+          if ($again -notmatch "Already up to date") { exit 1 }
       - name: Report which Python the install used
         shell: powershell
         run: |

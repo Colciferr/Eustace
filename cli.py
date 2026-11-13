@@ -37,7 +37,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 # When output is redirected to a file or pipe, Windows uses the ANSI code page, which cannot encode the symbols
 # printed here; degrade to "?" instead of crashing mid-turn.
@@ -47,22 +47,244 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# --- Self-update (eustace --update) ---
+# Defined and handled before anything below is configured, so an update still works when the config, the API key
+# or a dependency is broken. Nothing here is a model tool.
+UPDATE_REPO_URL = "https://github.com/Colciferr/eustace.git"
+UPDATE_DEFAULT_REF = "main"
+_DIST_NAME = "genai-cli"  # the name in pyproject.toml
+# system_prompt.md as installed with this version (pyproject.toml data-files). setup.ps1 copies the persona to
+# ~/.eustace once; this copy is what a later update compares that one against.
+SHIPPED_PROMPT_PATH = os.path.join(sys.prefix, "share", "eustace", "system_prompt.md")
+_UPDATE_HOME = os.path.join(os.path.expanduser("~"), ".eustace")
+_UPDATE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}")
+
+# Runs in its own console window after this process has exited: Windows will not replace eustace.exe while it
+# is running. argv: pid to wait for, pip requirement, old version, hash of the old shipped persona.
+_UPDATE_HELPER = r"""
+import ctypes, datetime, os, subprocess, sys, time
+pid, spec, old_version, old_hash = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+try:
+    k32 = ctypes.windll.kernel32
+    handle = k32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if handle:
+        k32.WaitForSingleObject(handle, 60000)
+        k32.CloseHandle(handle)
+except Exception:
+    pass
+time.sleep(1)
+os.environ.setdefault("PIP_DEFAULT_TIMEOUT", "180")  # the same patience setup.ps1 gives slow, scanned networks
+os.environ.setdefault("PIP_RETRIES", "10")
+print("== Eustace update ==")
+print("Installing", spec)
+pip = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check"]
+# 1. anything this version newly depends on, while the working install is still in place
+# 2. Eustace itself. pip leaves a package alone when its version number is unchanged, even for a newer commit,
+#    so the reinstall is forced (and limited to Eustace by --no-deps).
+code = 1
+for step in (pip + [spec], pip + ["--upgrade", "--force-reinstall", "--no-deps", spec]):
+    for attempt in range(3):
+        code = subprocess.call(step)
+        if code == 0:
+            break
+        time.sleep(3)
+    if code != 0:
+        break
+try:
+    with open(os.path.join(os.getcwd(), "update.log"), "a", encoding="utf-8") as log:
+        log.write("%s %s exit=%d\n" % (datetime.datetime.now().isoformat(timespec="seconds"), spec, code))
+except OSError:
+    pass
+if code == 0:
+    subprocess.call([sys.executable, "-m", "cli", "--post-update", old_version, old_hash])
+else:
+    print()
+    print("[!!] The update did not install. Eustace v%s is still in place." % old_version)
+    print("     Close every other Eustace window and run  eustace --update  again.")
+    print("     If the error above is a timeout, run it again: finished downloads are cached.")
+if not os.environ.get("EUSTACE_UPDATE_NO_PAUSE"):
+    try:
+        input("\nPress Enter to close this window.")
+    except EOFError:
+        pass
+sys.exit(code)
+"""
+
+
+def _installed_commit() -> str:
+    """The git commit this install was built from, or "" (installed from a folder, or run from a checkout)."""
+    try:
+        import importlib.metadata
+        info = json.loads(importlib.metadata.distribution(_DIST_NAME).read_text("direct_url.json") or "{}")
+        return str(info.get("vcs_info", {}).get("commit_id") or "")
+    except Exception:
+        return ""
+
+
+def _git_exe() -> str | None:
+    """git.exe from an absolute PATH folder. Windows looks in the current folder before PATH when a program is
+    started by bare name, and the current folder is whatever project Eustace was opened in."""
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        folder = folder.strip().strip('"')
+        if folder and os.path.isabs(folder):
+            for name in ("git.exe", "git"):
+                candidate = os.path.join(folder, name)
+                if os.path.isfile(candidate):
+                    return candidate
+    return None
+
+
+def _resolve_update_ref(ref: str) -> tuple[str, str]:
+    """(commit, description) for a branch, tag or full commit hash in the Eustace repository; RuntimeError
+    with a message for the user otherwise."""
+    if not _UPDATE_REF_RE.fullmatch(ref) or ".." in ref:
+        raise RuntimeError(f"'{ref}' is not a branch, tag or commit name.")
+    git = _git_exe()
+    if not git:
+        raise RuntimeError("git was not found on PATH. Install Git for Windows, or update by downloading the "
+                           "repository and running setup.ps1.")
+    try:
+        out = subprocess.run([git, "ls-remote", UPDATE_REPO_URL, f"refs/heads/{ref}", f"refs/tags/{ref}",
+                              f"refs/tags/{ref}^{{}}"], capture_output=True, text=True, timeout=60,
+                             cwd=os.path.dirname(git), stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{UPDATE_REPO_URL} did not answer within 60 seconds.")
+    except OSError as e:
+        raise RuntimeError(f"git could not be started ({e}).")
+    if out.returncode != 0:
+        reason = (out.stderr or "").strip().splitlines()[-1:] or ["no details"]
+        raise RuntimeError(f"could not reach {UPDATE_REPO_URL} ({reason[0]}).")
+    found = {}
+    for line in out.stdout.splitlines():
+        commit, _, name = line.partition("\t")
+        if re.fullmatch(r"[0-9a-f]{40}", commit) and name:
+            found[name.strip()] = commit
+    # an annotated tag lists its own object and, with ^{}, the commit it points at: the commit is the one to use
+    for name, kind in ((f"refs/heads/{ref}", "branch"), (f"refs/tags/{ref}^{{}}", "tag"), (f"refs/tags/{ref}", "tag")):
+        if name in found:
+            return found[name], f"{kind} {ref}"
+    if re.fullmatch(r"[0-9a-f]{40}", ref):
+        return ref, "commit"
+    raise RuntimeError(f"there is no branch or tag named '{ref}' in {UPDATE_REPO_URL}.")
+
+
+def _persona_text(path: str) -> str | None:
+    """A persona file's text with line endings and the BOM normalized, or None when it cannot be read."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return "\n".join(f.read().splitlines()).strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _persona_hash(text: str | None) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest() if text is not None else "-"
+
+
+def _self_update(args: list[str]) -> int:
+    """eustace --update [branch|tag|commit]: installs that commit of the repository over this install. Returns
+    the exit code."""
+    ref = args[0] if args else UPDATE_DEFAULT_REF
+    try:
+        commit, what = _resolve_update_ref(ref)
+    except RuntimeError as e:
+        print(f"Update failed: {e}")
+        return 1
+    have = _installed_commit()
+    print(f"Installed: Eustace v{VERSION} " + (f"(commit {have[:7]})" if have else "(installed from a folder; commit unknown)"))
+    print(f"Available: {what} at commit {commit[:7]}" if what != "commit" else f"Available: commit {commit[:7]}")
+    if have == commit:
+        print("Already up to date.")
+        return 0
+    os.makedirs(_UPDATE_HOME, exist_ok=True)
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c", _UPDATE_HELPER, str(os.getpid()), f"git+{UPDATE_REPO_URL}@{commit}", VERSION,
+             _persona_hash(_persona_text(SHIPPED_PROMPT_PATH))],
+            cwd=_UPDATE_HOME,  # not the project folder: pip starts git by bare name (see _git_exe)
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0), close_fds=True)
+    except OSError as e:
+        print(f"Update failed: the installer could not be started ({e}).")
+        return 1
+    print("Updating in a new window. Close any other Eustace windows, and start Eustace again when it finishes.")
+    return 0
+
+
+def _post_update(args: list[str]) -> int:
+    """Run by the update window with the new version: reports it, and offers the new system_prompt.md when this
+    version ships a different one. The user's copy in ~/.eustace is never replaced without a yes, unless it is
+    the previous version's copy with no changes of the user's own."""
+    old_version, old_shipped_hash = (list(args) + ["", "-"])[:2]
+    commit = _installed_commit()
+    at = f" (commit {commit[:7]})" if commit else ""
+    if old_version and old_version != VERSION:
+        print(f"\n[ok] Eustace updated: v{old_version} -> v{VERSION}{at}")
+    else:
+        print(f"\n[ok] Eustace v{VERSION} is now at the newest commit{at}")
+
+    mine_path = os.path.join(_UPDATE_HOME, "system_prompt.md")
+    mine, shipped = _persona_text(mine_path), _persona_text(SHIPPED_PROMPT_PATH)
+    if mine is None or shipped is None or mine == shipped or _persona_hash(shipped) == old_shipped_hash:
+        return 0  # no persona of the user's, nothing shipped, already the same, or unchanged by this update
+
+    def replace() -> bool:
+        try:
+            shutil.copyfile(SHIPPED_PROMPT_PATH, mine_path)
+            return True
+        except OSError as e:
+            print(f"[!!] Could not write {mine_path} ({e}).")
+            return False
+
+    if _persona_hash(mine) == old_shipped_hash:
+        if replace():
+            print(f"[ok] system_prompt.md updated to this version's (yours had no changes of your own): {mine_path}")
+        return 0
+
+    print(f"\nThis version ships a different system_prompt.md than yours ({mine_path}).")
+    print("Lines starting with - are only in yours; lines starting with + are only in the new one:\n")
+    for line in difflib.unified_diff(mine.splitlines(), shipped.splitlines(), "yours", "new", lineterm="", n=1):
+        print("  " + line)
+    try:
+        answer = input("\nReplace yours with the new one? Yours is kept as system_prompt.md.bak. [y/N] ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() in ("y", "yes"):
+        try:
+            shutil.copyfile(mine_path, mine_path + ".bak")
+        except OSError as e:
+            print(f"[!!] Could not write the backup ({e}); your file was left alone.")
+            return 0
+        if replace():
+            print("[ok] Replaced. Your previous file is system_prompt.md.bak.")
+    else:
+        print("Kept yours. The new one is at " + SHIPPED_PROMPT_PATH)
+    return 0
+
+
 # --- Command-line flags (read before any path or client is derived from them) ---
 _ARGS = sys.argv[1:]
 if "--help" in _ARGS or "-h" in _ARGS:
     print(
-        "usage: eustace [--auto] [--devmode] [--version]\n\n"
+        "usage: eustace [--auto] [--devmode] [--version] [--update [BRANCH|TAG|COMMIT]]\n\n"
         "  --auto      Start in auto mode: file reads, file writes and shell commands run without asking,\n"
         "              except shell commands on the deny-list. Shift+Tab or /auto switches it off.\n"
         "              Ignored when Eustace runs as Administrator (elevated).\n"
         "  --devmode   Use the PUBLIC Google Gemini API (GEMINI_API_KEY, config in ~/.eustace-dev)\n"
         "              for functional testing off DODIN. Synthetic test data only; never CUI/PII/PHI.\n"
         "  --version   Print the version and exit.\n"
+        "  --update    Install the newest commit on the main branch of the Eustace repository over this\n"
+        "              install, in a new window. Name a branch, tag or full commit hash to get that instead:\n"
+        "              eustace --update v1.5.0\n"
     )
     raise SystemExit(0)
 if "--version" in _ARGS:
     print(f"Eustace v{VERSION}")
     raise SystemExit(0)
+if "--post-update" in _ARGS:  # run by the update window, with the version it just installed
+    raise SystemExit(_post_update(_ARGS[_ARGS.index("--post-update") + 1:]))
+if "--update" in _ARGS:
+    _rest = _ARGS[_ARGS.index("--update") + 1:]
+    raise SystemExit(_self_update(_rest[:1] if _rest and not _rest[0].startswith("-") else []))
 DEV_MODE = "--devmode" in _ARGS
 START_IN_AUTO_MODE = "--auto" in _ARGS
 
@@ -940,7 +1162,7 @@ SHELL_DENY_PATTERNS: tuple[tuple[str, str], ...] = (
     (_alias("npx|pnpx|pipx|winget|choco|scoop|nuget") + r"|" + _alias(r"npm|pnpm|yarn") + r"\s+(install|i|ci|add|exec|x|"
      r"dlx|update|up|upgrade)\b|" + _alias(r"pip[0-9.]*") + r"\s+(install|download)\b|(?<![\w-])-m\s+(pip|ensurepip)\b|"
      + _alias("uv") + r"\s+(pip|tool|add|run)\b|(install|save|update)-(module|package|script|psresource)|"
-     r"dotnet\s+tool\s+install|git\s+clone", "installs or downloads software"),
+     r"dotnet\s+tool\s+install|git\s+clone|(?<![\w-])--(post-)?update(?![\w-])", "installs or downloads software"),
     (_alias(r"python[0-9.]*|pythonw|py|node") + r"[\"']?(\s+-[XW]\s*\S+|\s+-[\w.:-]+)*?\s+(-c|-e|-p|--eval|--print|-)"
      r"(?=\s|$|[\"'])", "runs inline code"),
     (r"(?<![\w-])-e(c|n|nc|ncodedcommand)?\s|frombase64string|invoke-expression|" + _alias("iex") + r"|\[scriptblock\]|"
@@ -955,6 +1177,9 @@ SHELL_DENY_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"icacls|takeown|set-acl", "changes permissions"),
     (r"stop-process|taskkill|" + _alias("kill"), "stops processes"),
     (r"invoke-item|" + _alias("ii"), "opens files with their default program"),
+    # COM reaches Outlook (mail, calendars) and the other Office programs without the Outlook tools' own approvals
+    (r"comobject|new-object\b[^|;\n]*?\s-c(o(m(o(b(j(e(c(t)?)?)?)?)?)?)?)?(?![\w-])|outlook\.application|"
+     r"gettypefromprogid|getactiveobject|activator\]|createobject|getobject\(", "drives another program through COM"),
     (r"startup|\$profile|currentversion\\run", "touches startup locations"),
     (r"git\s+(push|clean)|git\s+reset\s+--hard|git\s+checkout\s+--\s|git\s+branch\s+-d", "changes git history or remotes"),
     (r"agent\.md|system_prompt\.md|\.git[\\/]|\.github|\.eustace|\.agents[\\/]",
@@ -3036,66 +3261,339 @@ def list_inbox(
         return f"Error listing Outlook Inbox: {e}"
 
 
+_OL_FOLDER_CALENDAR = 9   # OlDefaultFolders.olFolderCalendar
+_OL_APPOINTMENT_ITEM = 1  # OlItemType.olAppointmentItem
+_OL_MODULE_CALENDAR = 1   # OlNavigationModuleType.olModuleCalendar
+_MAX_CALENDARS = 50       # discovery stops here, so a huge profile cannot stall a call
+_MAX_CALENDAR_EVENTS = 100
+_ALL_CALENDARS = {"all", "*"}
+_BUSY_MAP = {0: "Free", 1: "Tentative", 2: "Busy", 3: "Out of Office", 4: "Working Elsewhere"}
+
+
+def _com_items(collection):
+    """The members of a 1-based Outlook COM collection. A member that cannot be fetched is skipped."""
+    try:
+        count = int(collection.Count)
+    except Exception:
+        return
+    for i in range(1, count + 1):
+        try:
+            item = collection.Item(i)
+        except Exception:
+            continue
+        if item is not None:
+            yield item
+
+
+def _outlook_window(app):
+    """An open Outlook window (Explorer), or None. Never creates one: Folder.GetExplorer() would."""
+    try:
+        explorer = app.ActiveExplorer()
+        if explorer is not None:
+            return explorer
+    except Exception:
+        pass
+    try:
+        return next(_com_items(app.Explorers), None)
+    except Exception:
+        return None
+
+
+def _calendar_folders(app, ns) -> tuple[list[dict], list[str]]:
+    """Every calendar this Outlook profile can reach, the default calendar first, plus notes on what could not
+    be searched.
+
+    NameSpace.GetDefaultFolder(9) is only the calendar of the default mailbox. The others are found in two
+    places: the Calendar navigation pane (what the user sees in Outlook, including shared calendars), and each
+    store's own default calendar with its sub-calendars (shared and additional mailboxes). Only folder names,
+    paths and IDs are read here, none of which the Outlook Object Model Guard protects."""
+    cals: list[dict] = []
+    notes: list[str] = []
+
+    def same_folder(cal: dict, entry_id: str, path: str) -> bool:
+        if entry_id and cal["entry_id"]:
+            if cal["entry_id"] == entry_id:
+                return True
+            try:  # one folder can have a short-term and a long-term EntryID, which differ as strings
+                return bool(ns.CompareEntryIDs(cal["entry_id"], entry_id))
+            except Exception:
+                return False
+        return bool(path) and cal["path"] == path
+
+    def add(folder, source: str, nav_name: str = "", shown=None, error: str = "", is_default: bool = False):
+        entry_id = str(_safe_prop(folder, "EntryID", "")) if folder is not None else ""
+        path = str(_safe_prop(folder, "FolderPath", "")) if folder is not None else ""
+        if folder is not None and (entry_id or path):
+            for cal in cals:
+                if cal["folder"] is not None and same_folder(cal, entry_id, path):
+                    if source not in cal["sources"]:
+                        cal["sources"].append(source)
+                    cal["nav_name"] = cal["nav_name"] or nav_name
+                    if shown is not None:
+                        cal["shown"] = shown
+                    return
+        if len(cals) >= _MAX_CALENDARS:
+            if not any("more were not listed" in n for n in notes):
+                notes.append(f"Stopped at {_MAX_CALENDARS} calendars; more were not listed.")
+            return
+        folder_name = str(_safe_prop(folder, "Name", "")).strip() if folder is not None else ""
+        store_name = ""
+        if folder is not None:
+            try:
+                store_name = str(_safe_prop(folder.Store, "DisplayName", "")).strip()
+            except Exception:
+                pass
+        cals.append({"folder": folder, "nav_name": nav_name, "folder_name": folder_name, "store": store_name,
+                     "path": path, "entry_id": entry_id, "sources": [source], "shown": shown, "error": error,
+                     "default": is_default})
+
+    try:
+        add(ns.GetDefaultFolder(_OL_FOLDER_CALENDAR), "default", is_default=True)
+    except Exception as e:
+        notes.append(f"The default calendar could not be opened ({e}).")
+
+    window = _outlook_window(app) if app is not None else None
+    if window is None:
+        notes.append("No Outlook window is open, so the Calendar navigation pane (where calendars shared by other "
+                     "people are listed) could not be searched. Open Classic Outlook's main window and try again.")
+    else:
+        try:
+            module = window.NavigationPane.Modules.GetNavigationModule(_OL_MODULE_CALENDAR)
+            for group in _com_items(module.NavigationGroups):
+                for nav in _com_items(group.NavigationFolders):
+                    nav_name = str(_safe_prop(nav, "DisplayName", "")).strip()
+                    shown = _safe_prop(nav, "IsSelected", None)  # checked in the navigation pane
+                    shown = bool(shown) if isinstance(shown, (bool, int)) else None
+                    try:
+                        folder = nav.Folder
+                        if folder is None:
+                            raise RuntimeError("Outlook returned no folder")
+                    except Exception as e:  # a shared calendar whose owner or server cannot be reached right now
+                        add(None, "navigation pane", nav_name or "(unnamed calendar)", shown, error=str(e))
+                        continue
+                    add(folder, "navigation pane", nav_name, shown)
+        except Exception as e:
+            notes.append(f"The Calendar navigation pane could not be read ({e}).")
+
+    def walk(folder, depth: int):
+        if depth > 3:
+            return
+        try:
+            subfolders = folder.Folders
+        except Exception:
+            return
+        for sub in _com_items(subfolders):
+            if _safe_prop(sub, "DefaultItemType", None) == _OL_APPOINTMENT_ITEM:
+                add(sub, "mailbox")
+                walk(sub, depth + 1)
+
+    try:
+        stores = list(_com_items(ns.Stores))
+    except Exception as e:
+        stores = []
+        notes.append(f"The list of mailboxes could not be read ({e}).")
+    for store in stores:
+        try:
+            # Store.GetDefaultFolder returns None when the store has no calendar. (The NameSpace method of the
+            # same name can create a missing folder; this one does not.)
+            root = store.GetDefaultFolder(_OL_FOLDER_CALENDAR)
+        except Exception:
+            continue
+        if root is None:
+            continue
+        add(root, "mailbox")
+        walk(root, 1)
+
+    # One label per calendar, unique, which is what get_calendar(calendar=...) and the event tags use
+    used: set[str] = set()
+    default_store = next((c["store"] for c in cals if c["default"]), "")
+    for cal in cals:
+        label = cal["nav_name"] or cal["folder_name"] or "(unnamed calendar)"
+        if not cal["nav_name"] and cal["store"] and cal["store"] != default_store:
+            label = f"{cal['store']} / {label}"
+        base, n = label, 2
+        while label.casefold() in used:
+            label, n = f"{base} ({n})", n + 1
+        used.add(label.casefold())
+        cal["label"] = label
+    return cals, notes
+
+
+def _match_calendars(cals: list[dict], wanted: str) -> list[dict]:
+    """Calendars a name refers to. An exact name wins over a partial one; a mailbox name selects its calendars."""
+    q = " ".join(wanted.split()).casefold()
+    if not q:
+        return []
+
+    def names(cal):
+        return [n.casefold() for n in (cal["label"], cal["nav_name"], cal["folder_name"], cal["path"]) if n]
+
+    exact = [c for c in cals if q in names(c)]
+    if exact:
+        return exact
+    return [c for c in cals if any(q in n for n in names(c) + [c["store"].casefold()])]
+
+
+def _describe_calendars(cals: list[dict]) -> str:
+    rows = []
+    for i, cal in enumerate(cals, 1):
+        marks = "".join([" [default]" if cal["default"] else "",
+                         " [checked in Outlook]" if cal["shown"] else "",
+                         f" [UNREACHABLE: {cal['error']}]" if cal["folder"] is None else ""])
+        where = " | ".join(part for part in (f"mailbox: {cal['store']}" if cal["store"] else "",
+                                             f"path: {cal['path']}" if cal["path"] else "",
+                                             "found via: " + ", ".join(cal["sources"])) if part)
+        rows.append(f"{i}. {cal['label']}{marks}\n   {where}")
+    return "\n".join(rows)
+
+
+def _calendar_window(days_ahead: int, days_back: int):
+    now = datetime.now()
+    start_dt = (now - timedelta(days=max(0, min(days_back, 60)))).replace(hour=0, minute=0, second=0)
+    end_dt = (now + timedelta(days=max(1, min(days_ahead, 60)))).replace(hour=23, minute=59, second=59)
+    return start_dt, end_dt
+
+
+def _calendar_events(folder, start_dt, end_dt, limit: int) -> tuple[list[tuple[str, str]], int]:
+    """(start, line) for each appointment of one calendar folder that overlaps the window, and how many subjects
+    were withheld by the PHI guardrail. Raises if Outlook rejects the date filter."""
+    # Outlook only expands recurring meetings when the collection is sorted by Start *before*
+    # IncludeRecurrences is set, and the filter is applied last.
+    items = folder.Items
+    items.Sort("[Start]")
+    items.IncludeRecurrences = True
+
+    # Outlook Restrict filter uses US date format MM/DD/YYYY HH:MM AM/PM
+    start_str = start_dt.strftime("%m/%d/%Y %I:%M %p")
+    end_str = end_dt.strftime("%m/%d/%Y %I:%M %p")
+    # Overlap test, so a meeting already in progress at the start of the window is included
+    restriction = f"[End] >= '{start_str}' AND [Start] <= '{end_str}'"
+    try:
+        filtered = items.Restrict(restriction)
+    except Exception as e:
+        # Never fall back to the unfiltered collection: with recurrences expanded it has no end, and its
+        # first entries would be reported under the requested date range.
+        raise RuntimeError(f"the date filter was rejected ({e})")
+
+    events, withheld = [], 0
+    ev = filtered.GetFirst()
+    while ev is not None and len(events) < limit:
+        subj = str(_safe_prop(ev, "Subject", "(Untitled Event)")).strip()
+        start_val = str(_safe_prop(ev, "Start", ""))[:16]
+        end_val = str(_safe_prop(ev, "End", ""))[:16]
+        loc = str(_safe_prop(ev, "Location", "")).strip()
+        all_day = bool(_safe_prop(ev, "AllDayEvent", False))
+        busy_str = _BUSY_MAP.get(_safe_prop(ev, "BusyStatus", 2), "Busy")
+
+        # A shared calendar holds other people's entries; one that names PHI keeps its time and loses its text
+        if _check_phi_guardrail("calendar entry", f"{subj}\n{loc}"):
+            subj, loc, withheld = "[withheld: PHI marker in this entry]", "", withheld + 1
+
+        loc_str = f" @ {loc}" if loc else ""
+        all_day_str = " [ALL DAY]" if all_day else ""
+        events.append((start_val, f"- {start_val} to {end_val}{all_day_str} ({busy_str}): **{subj}**{loc_str}"))
+        ev = filtered.GetNext()
+    return events, withheld
+
+
+@tool("Listing Outlook calendars")
+def list_calendars() -> str:
+    """List every calendar in the user's Classic Outlook profile: their own, sub-calendars, shared mailboxes'
+    calendars, and calendars other people shared (for example a unit leave or plans calendar). Returns the
+    names to pass to `get_calendar(calendar=...)`. Names and locations only, no appointments."""
+    try:
+        gate = _dev_mode_gate("calendar names")
+        if gate:
+            return gate
+        app, ns = _get_outlook_ns()
+        cals, notes = _calendar_folders(app, ns)
+        if not cals:
+            return "Error listing Outlook calendars: none were found. " + " ".join(notes)
+        out = f"Outlook calendars ({len(cals)}):\n" + _describe_calendars(cals)
+        out += "\n\nPass a name (or part of one) as `calendar` to `get_calendar`, or \"all\" for every calendar."
+        if notes:
+            out += "\n\nNotes:\n" + "\n".join(f"- {n}" for n in notes)
+        return out
+    except Exception as e:
+        return f"Error listing Outlook calendars: {e}"
+
+
 @tool(
     "Checking Outlook Calendar",
     days_ahead="Number of days ahead from today to include (default 7).",
     days_back="Number of days in the past to include (default 0).",
+    calendar="Which calendar to read. Empty (default) is the user's own calendar. Otherwise a calendar or "
+             "mailbox name or part of one (for example \"SCXP Plans\"), or \"all\" for every calendar. "
+             "`list_calendars` shows the names.",
 )
-def get_calendar(days_ahead: int = 7, days_back: int = 0) -> str:
-    """Read the user's Classic Outlook Calendar appointments and meetings for today and upcoming/past days
-    (returns Subject, Start, End, Location, AllDayEvent, and BusyStatus)."""
+def get_calendar(days_ahead: int = 7, days_back: int = 0, calendar: str = "") -> str:
+    """Read appointments and meetings from the user's Classic Outlook calendars for today and upcoming/past days
+    (returns Subject, Start, End, Location, AllDayEvent, and BusyStatus). Reads the user's own calendar unless
+    `calendar` names a shared or additional one."""
     try:
         gate = _dev_mode_gate("calendar entries")
         if gate:
             return gate
-        _, ns = _get_outlook_ns()
-        cal_folder = ns.GetDefaultFolder(9)  # olFolderCalendar = 9
-        # Outlook only expands recurring meetings when the collection is sorted by Start *before*
-        # IncludeRecurrences is set, and the filter is applied last.
-        items = cal_folder.Items
-        items.Sort("[Start]")
-        items.IncludeRecurrences = True
+        app, ns = _get_outlook_ns()
+        start_dt, end_dt = _calendar_window(days_ahead, days_back)
+        span = f"{start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}"
+        wanted = str(calendar or "").strip()
 
-        now = datetime.now()
-        start_dt = (now - timedelta(days=max(0, min(days_back, 60)))).replace(hour=0, minute=0, second=0)
-        end_dt = (now + timedelta(days=max(1, min(days_ahead, 60)))).replace(hour=23, minute=59, second=59)
+        notes: list[str] = []  # what discovery could not search; reported only when nothing matches
+        if not wanted:
+            # The user's own calendar, without looking for any other: the common case stays one folder lookup
+            chosen = [{"folder": ns.GetDefaultFolder(_OL_FOLDER_CALENDAR), "label": "", "error": ""}]
+        else:
+            cals, notes = _calendar_folders(app, ns)
+            chosen = cals if wanted.casefold() in _ALL_CALENDARS else _match_calendars(cals, wanted)
+            if not chosen:
+                listing = _describe_calendars(cals) if cals else "(none found)"
+                return (f"Error reading Outlook Calendar: no calendar matches '{wanted}'. Available calendars:\n"
+                        f"{listing}" + ("\n\nNotes:\n" + "\n".join(f"- {n}" for n in notes) if notes else ""))
 
-        # Outlook Restrict filter uses US date format MM/DD/YYYY HH:MM AM/PM
-        start_str = start_dt.strftime("%m/%d/%Y %I:%M %p")
-        end_str = end_dt.strftime("%m/%d/%Y %I:%M %p")
-        # Overlap test, so a meeting already in progress at the start of the window is included
-        restriction = f"[End] >= '{start_str}' AND [Start] <= '{end_str}'"
+        tagged = len(chosen) > 1
+        events: list[tuple[str, str]] = []
+        failures: list[str] = []
+        withheld = 0
+        for cal in chosen:
+            name = cal["label"] or "Outlook Calendar"
+            if cal["folder"] is None:
+                failures.append(f"{name}: unreachable ({cal['error']})")
+                continue
+            try:
+                # one more than is shown, so a cut-off list can say that it was cut off
+                found, hidden = _calendar_events(cal["folder"], start_dt, end_dt, _MAX_CALENDAR_EVENTS + 1)
+            except Exception as e:  # one calendar that cannot be read must not hide the others
+                failures.append(f"{name}: {e}")
+                continue
+            withheld += hidden
+            events += [(start, f"{line} [{name}]" if tagged else line) for start, line in found]
 
-        try:
-            filtered = items.Restrict(restriction)
-        except Exception as e:
-            # Never fall back to the unfiltered collection: with recurrences expanded it has no end, and its
-            # first entries would be reported under the requested date range.
-            return f"Error reading Outlook Calendar: the date filter was rejected ({e})."
+        if failures and len(failures) == len(chosen):
+            return "Error reading Outlook Calendar: " + "; ".join(failures) + "."
 
-        events = []
-        BUSY_MAP = {0: "Free", 1: "Tentative", 2: "Busy", 3: "Out of Office", 4: "Working Elsewhere"}
+        events.sort(key=lambda pair: pair[0])  # stable, so each calendar's own order survives ties
+        truncated = len(events) > _MAX_CALENDAR_EVENTS
+        shown = events[:_MAX_CALENDAR_EVENTS]
 
-        ev = filtered.GetFirst()
-        while ev is not None and len(events) < 100:
-            subj = str(_safe_prop(ev, "Subject", "(Untitled Event)")).strip()
-            start_val = str(_safe_prop(ev, "Start", ""))[:16]
-            end_val = str(_safe_prop(ev, "End", ""))[:16]
-            loc = str(_safe_prop(ev, "Location", "")).strip()
-            all_day = bool(_safe_prop(ev, "AllDayEvent", False))
-            busy_code = _safe_prop(ev, "BusyStatus", 2)
-            busy_str = BUSY_MAP.get(busy_code, "Busy")
-
-            loc_str = f" @ {loc}" if loc else ""
-            all_day_str = " [ALL DAY]" if all_day else ""
-            events.append(f"- {start_val} to {end_val}{all_day_str} ({busy_str}): **{subj}**{loc_str}")
-            ev = filtered.GetNext()
-
-        if not events:
-            return f"No calendar events found between {start_dt.strftime('%Y-%m-%d')} and {end_dt.strftime('%Y-%m-%d')}."
-
-        header = f"Outlook Calendar ({start_dt.strftime('%Y-%m-%d')} to {end_dt.strftime('%Y-%m-%d')}, {len(events)} events):\n"
-        return header + "\n".join(events)
+        which = ""
+        if tagged:
+            which = f" from {len(chosen)} calendars"
+        elif chosen[0]["label"]:
+            which = f" '{chosen[0]['label']}'"
+        tail = ""
+        if truncated:
+            tail += (f"\n[Showing the first {_MAX_CALENDAR_EVENTS} events. Use a shorter date range or a single "
+                     "calendar for the rest.]")
+        if withheld:
+            tail += f"\n[{withheld} entr{'y' if withheld == 1 else 'ies'} had the subject withheld: PHI is not processed.]"
+        if failures:
+            tail += "\nCould not read: " + "; ".join(failures) + "."
+        if not shown:
+            return (f"No calendar events found{which} between {start_dt.strftime('%Y-%m-%d')} and "
+                    f"{end_dt.strftime('%Y-%m-%d')}.") + tail
+        header = f"Outlook Calendar{which} ({span}, {len(shown)} events):\n"
+        return header + "\n".join(line for _, line in shown) + tail
     except Exception as e:
         return f"Error reading Outlook Calendar: {e}"
 
@@ -3253,7 +3751,7 @@ FALLBACK_SYSTEM_PROMPT = (
 
 
 def _load_persona() -> str:
-    for path in (GLOBAL_PROMPT_PATH, BUNDLED_PROMPT_PATH):
+    for path in (GLOBAL_PROMPT_PATH, BUNDLED_PROMPT_PATH, SHIPPED_PROMPT_PATH):
         try:
             with open(path, "r", encoding="utf-8-sig") as f:
                 text = f.read().strip()
