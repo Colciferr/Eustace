@@ -12,9 +12,9 @@ function Refresh-Path {
                 [Environment]::GetEnvironmentVariable("PATH", "User")
 }
 
-# Eustace is installed on this Python version. Compiled packages are built per Python version, and on managed
-# networks the builds for a just-released Python may not be trusted yet, so everyone gets the same known-good one.
-$PreferredPython = "3.14"
+# Any Python 3.11 or later will do. This version is installed only when none is found.
+$MinPython = [version]"3.11"
+$InstallPython = "3.13"
 
 function Get-PythonInfo {
     # Runs one candidate interpreter and returns its version and full path, or nothing if it is missing or broken.
@@ -35,18 +35,17 @@ function Get-PythonInfo {
 }
 
 function Find-Python {
-    # The preferred version if any known location has it; otherwise the newest other Python that is 3.11 or later.
-    $tag = $PreferredPython.Replace(".", "")
-    $found = @(
-        Get-PythonInfo "py" @("-$PreferredPython")
-        Get-PythonInfo "python"
-        Get-PythonInfo (Join-Path $env:LOCALAPPDATA "Programs\Python\Python$tag\python.exe")
-        Get-PythonInfo (Join-Path $env:LOCALAPPDATA "Python\pythoncore-$PreferredPython-64\python.exe")
-        Get-PythonInfo (Join-Path $env:ProgramFiles "Python$tag\python.exe")
-    ) | Where-Object { $_ -and $_.Version -ge [version]"3.11" }
-    $exact = $found | Where-Object { $_.Version -eq [version]$PreferredPython } | Select-Object -First 1
-    if ($exact) { return $exact }
-    return $found | Sort-Object Version -Descending | Select-Object -First 1
+    # The python on PATH if it is new enough; then the py launcher's newest; then the newest in the usual folders.
+    $first = @(Get-PythonInfo "python"; Get-PythonInfo "py" @("-3")) |
+        Where-Object { $_ -and $_.Version -ge $MinPython } | Select-Object -First 1
+    if ($first) { return $first }
+    $folders = @(
+        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python3*\python.exe")
+        (Join-Path $env:LOCALAPPDATA "Python\pythoncore-3*\python.exe")
+        (Join-Path $env:ProgramFiles "Python3*\python.exe")
+    )
+    $found = @(Get-ChildItem $folders -ErrorAction SilentlyContinue | ForEach-Object { Get-PythonInfo $_.FullName })
+    return $found | Where-Object { $_ -and $_.Version -ge $MinPython } | Sort-Object Version -Descending | Select-Object -First 1
 }
 
 function Test-Quiet {
@@ -74,28 +73,21 @@ if (-not $env:PIP_RETRIES) { $env:PIP_RETRIES = "10" }
 Write-Host "== Eustace setup ==" -ForegroundColor Cyan
 Write-Host "Source: $here"
 
-# 1. Python (the preferred version; installed for this user if missing)
+# 1. Python (any 3.11 or later; installed for this user if there is none)
 $python = Find-Python
-if (-not $python -or $python.Version -ne [version]$PreferredPython) {
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        Write-Host "[..] Installing Python $PreferredPython via winget (user scope)..." -ForegroundColor Yellow
-        winget install -e --id "Python.Python.$PreferredPython" --scope user --accept-package-agreements --accept-source-agreements
-        Refresh-Path
-        $python = Find-Python
-    }
+if (-not $python -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+    Write-Host "[..] No Python 3.11+ found. Installing Python $InstallPython via winget (user scope)..." -ForegroundColor Yellow
+    winget install -e --id "Python.Python.$InstallPython" --scope user --accept-package-agreements --accept-source-agreements
+    Refresh-Path
+    $python = Find-Python
 }
 if (-not $python) {
     Write-Host "[!!] No Python 3.11+ found and it could not be installed automatically." -ForegroundColor Red
-    Write-Host "     Install Python $PreferredPython from the Software Center or python.org, then re-run this script."
+    Write-Host "     Install Python 3.11 or later from the Software Center or python.org, then re-run this script."
     exit 1
 }
 $py = $python.Path
-if ($python.Version -eq [version]$PreferredPython) {
-    Write-Host "[ok] Python $($python.Version) at $py"
-} else {
-    Write-Host "[!!] Python $PreferredPython is not available; continuing with Python $($python.Version) at $py" -ForegroundColor Yellow
-    Write-Host "     If Eustace later reports blocked or missing modules, install Python $PreferredPython and re-run this script." -ForegroundColor Yellow
-}
+Write-Host "[ok] Python $($python.Version) at $py"
 
 # 2. pipx (run through the chosen interpreter, so nothing depends on which python is first on PATH)
 if (Test-Quiet { & $py -m pipx --version }) {
