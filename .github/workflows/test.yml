@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ['3.11', '3.14']
+        python: ['3.11', '3.14', '3.15']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        path-python: ['3.11', '3.14']
+        path-python: ['3.11', '3.14', '3.15']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

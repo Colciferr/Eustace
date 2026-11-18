@@ -14,7 +14,7 @@ function Refresh-Path {
 
 # Any Python 3.11 or later will do. This version is installed only when none is found.
 $MinPython = [version]"3.11"
-$InstallPython = "3.13"
+$InstallPython = "3.15"
 
 function Get-PythonInfo {
     # Runs one candidate interpreter and returns its version and full path, or nothing if it is missing or broken.
