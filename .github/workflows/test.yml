@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ['3.11', '3.14']
+        python: ['3.11', '3.14', '3.15']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,12 +26,12 @@ jobs:
 
   setup-script:
     # Runs the real installer under Windows PowerShell 5.1 on a Python that has no pipx yet.
-    # 3.14 on PATH is the normal case; 3.12 on PATH makes the installer go and get its preferred version.
+    # Whatever Python 3.11+ is on PATH is the one the install should use, oldest and newest supported alike.
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        path-python: ['3.14', '3.12']
+        path-python: ['3.11', '3.14', '3.15']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -100,11 +100,14 @@ jobs:
           eustace --remove-font
           if ($LASTEXITCODE -ne 0) { exit 1 }
           if ((Get-ItemProperty $key).PSObject.Properties.Name -contains "Eustace Mono (TrueType)") { exit 1 }
-      - name: Report which Python the install used
+      - name: The install used the Python on PATH
         shell: powershell
         run: |
-          Get-ChildItem "$env:USERPROFILE\pipx\venvs", "$env:LOCALAPPDATA\pipx\pipx\venvs" -ErrorAction SilentlyContinue |
-            ForEach-Object { Get-Content (Join-Path $_.FullName "pyvenv.cfg") }
+          $venvs = (python -m pipx environment --value PIPX_LOCAL_VENVS | Select-Object -Last 1).Trim()
+          $cfg = Get-Content (Join-Path $venvs "genai-cli\pyvenv.cfg")
+          $cfg
+          $want = [regex]::Escape("${{ matrix.path-python }}.")
+          if (-not ($cfg | Where-Object { $_ -match "^version(_info)?\s*=\s*$want" })) { Write-Host "Expected Python ${{ matrix.path-python }}."; exit 1 }
       - name: eustace --uninstall removes the program and the font, and keeps the settings folder
         shell: powershell
         env:
